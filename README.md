@@ -41,6 +41,16 @@ python3 main.py
 - Search limited to 100 results to avoid GUI stalls.
 - Lowercased keys computed once during indexing.
 
+## Dataset used for testing purpose : 
+- I have used original Linux kernal source code and original python source code as it has bunch of files 
+- Linux kernel source (almost 90k files)
+
+    `git clone https://github.com/python/cpython.git test_python`
+- Python standard library
+
+    `git clone https://github.com/python/cpython.git test_python`
+
+
 ## Future Enhancements
 - Persist index to disk
 - Incremental updates (FS watchers)
