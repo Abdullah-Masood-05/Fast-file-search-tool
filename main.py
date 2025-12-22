@@ -15,8 +15,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QDir
 from PyQt6.QtGui import QAction, QFileSystemModel, QCursor, QGuiApplication
 
-# 1. LOGIC LAYER: IR INDEXER (Now supports Folders & Frequency Sorting)
-
+# ==============================================================================
+# 1. LOGIC LAYER: IR INDEXER
+# ==============================================================================
 
 class IndexerWorker(QThread):
     progress_update = pyqtSignal(int)
@@ -28,7 +29,7 @@ class IndexerWorker(QThread):
         self.root_path = ""
         self.doc_store = {}
         self.inverted_index = defaultdict(set)
-        self.extension_counts = Counter() # Track frequency
+        self.extension_counts = Counter()
         self.is_running = False
 
     def prepare(self, path):
@@ -47,7 +48,6 @@ class IndexerWorker(QThread):
         return f"{size_bytes:.1f} TB"
 
     def index_item(self, name, full_path, count, is_folder=False):
-        """Helper to index a single item (file or folder)"""
         try:
             stats = os.stat(full_path)
             doc_id = count
@@ -60,7 +60,6 @@ class IndexerWorker(QThread):
                 if not ext: ext = "File"
                 size_str = self.format_size(stats.st_size)
 
-            # Update Extension Frequency
             self.extension_counts[ext] += 1
             
             self.doc_store[doc_id] = {
@@ -73,7 +72,6 @@ class IndexerWorker(QThread):
                 'is_folder': is_folder
             }
 
-            # Trigram Indexing
             trigrams = self.generate_trigrams(name)
             for gram in trigrams:
                 self.inverted_index[gram].add(doc_id)
@@ -95,13 +93,11 @@ class IndexerWorker(QThread):
             for root, dirs, files in os.walk(self.root_path):
                 if not self.is_running: break
 
-                # 1. Index Folders
                 for d_name in dirs:
                     full_path = os.path.join(root, d_name)
                     if self.index_item(d_name, full_path, count, is_folder=True):
                         count += 1
 
-                # 2. Index Files
                 for f_name in files:
                     full_path = os.path.join(root, f_name)
                     if self.index_item(f_name, full_path, count, is_folder=False):
@@ -117,58 +113,72 @@ class IndexerWorker(QThread):
         duration = time.time() - start_time
         self.finished_indexing.emit(count, duration)
 
-    def search_index(self, query, extension_filter=None):
+    def search_index(self, query, manual_ext_input=None, dropdown_filter=None):
+        """
+        Refined Search Logic:
+        1. manual_ext_input: User typed "png" or ".py" (Highest Priority)
+        2. dropdown_filter: User selected from list (Lower Priority)
+        """
         if not query: return []
         query = query.lower()
 
-        # IR Search Logic
+        # 1. Candidate Retrieval
         trigrams = self.generate_trigrams(query)
         if not trigrams: return []
         
-        # Sort trigrams by rarity
         sorted_grams = sorted(trigrams, key=lambda t: len(self.inverted_index.get(t, [])))
-        
-        # Intersection
         candidate_ids = self.inverted_index.get(sorted_grams[0], set()).copy()
+        
         for gram in sorted_grams[1:]:
             if not candidate_ids: break
             candidate_ids &= self.inverted_index.get(gram, set())
+
+        # 2. Prepare Extension Logic
+        target_extensions = set()
+        
+        # Priority A: Manual Input Box (e.g. "py, png")
+        if manual_ext_input:
+            parts = manual_ext_input.lower().replace(" ", "").split(",")
+            for p in parts:
+                if not p.startswith("."): p = "." + p
+                target_extensions.add(p)
+        
+        # Priority B: Dropdown (only if manual input is empty)
+        elif dropdown_filter and dropdown_filter != "All Types":
+            target_extensions.add(dropdown_filter)
 
         results = []
         for doc_id in candidate_ids:
             doc = self.doc_store[doc_id]
             
-            # Filter Logic
-            if extension_filter and extension_filter != "All Types":
-                # Special handling for Folder filter if needed, or exact ext match
-                if doc['ext'] != extension_filter: continue
+            # Filter Check
+            if target_extensions:
+                # If we have filters, the doc must match one of them
+                if doc['ext'] not in target_extensions:
+                    continue
             
-            # Verification
+            # Verification Check
             if query in doc['lower_name']:
                 results.append(doc)
 
-        # Ranking: Exact matches first, then shortest names
         results.sort(key=lambda x: (len(x['name']), x['name']))
         return results
 
     def get_sorted_extensions(self):
-        # Sort by Count (Descending), then Alphabetical
-        # Returns list of strings like [".pdf", ".txt", "Folder"]
         sorted_exts = sorted(self.extension_counts.items(), key=lambda item: (-item[1], item[0]))
         return [item[0] for item in sorted_exts]
 
 
-# 2. UI LAYER: PRO UX FEATURES
-
-
+# ==============================================================================
+# 2. UI LAYER
+# ==============================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        self.setWindowTitle("Fast File Search & Explorer Pro")
+        self.setWindowTitle("Fast File Search & Explorer Pro V4")
         self.resize(1100, 750)
         
-        # Logic
         self.indexer = IndexerWorker()
         self.indexer.progress_update.connect(self.update_progress)
         self.indexer.finished_indexing.connect(self.indexing_finished)
@@ -194,66 +204,77 @@ class MainWindow(QMainWindow):
         self.btn_select.clicked.connect(self.select_folder)
         
         self.lbl_path = QLabel("No folder selected")
-        self.lbl_path.setStyleSheet("color: #555; font-style: italic;")
+        self.lbl_path.setStyleSheet("color: #888; font-style: italic;")
         
         header.addWidget(self.btn_select)
         header.addWidget(self.lbl_path)
         header.addStretch()
         self.layout.addLayout(header)
 
-        # 2. Search & Filter
+        # 2. Search & Filter Bar
         search_box = QHBoxLayout()
+        
+        # A. Main Search Input
         self.input_search = QLineEdit()
-        self.input_search.setPlaceholderText("Search files & folders...")
+        self.input_search.setPlaceholderText("Search filename...")
         self.input_search.setMinimumHeight(35)
-        self.input_search.setStyleSheet("border: 1px solid #ccc; border-radius: 5px; padding: 5px; font-size: 13px;")
+        self.input_search.setStyleSheet("border: 1px solid #444; border-radius: 5px; padding: 5px; font-size: 13px; background-color: #222; color: #FFF;")
         self.input_search.textChanged.connect(self.on_search_text_change)
         
+        # B. NEW: Manual Extension Input
+        self.input_ext = QLineEdit()
+        self.input_ext.setPlaceholderText("Ext (e.g. py, png)")
+        self.input_ext.setMinimumHeight(35)
+        self.input_ext.setFixedWidth(120)
+        self.input_ext.setStyleSheet("border: 1px solid #444; border-radius: 5px; padding: 5px; font-size: 13px; background-color: #222; color: #8F8;")
+        self.input_ext.textChanged.connect(self.on_search_text_change)
+        
+        # C. Dropdown (Sorted by frequency)
         self.combo_filter = QComboBox()
         self.combo_filter.addItems(["All Types"])
         self.combo_filter.setMinimumHeight(35)
         self.combo_filter.setMinimumWidth(150)
         self.combo_filter.currentTextChanged.connect(self.on_search_text_change)
         
+        # Add to layout
         search_box.addWidget(QLabel("Search:"))
-        search_box.addWidget(self.input_search)
-        search_box.addWidget(self.combo_filter)
+        search_box.addWidget(self.input_search, stretch=4) # Takes most space
+        search_box.addWidget(QLabel("Ext:"))
+        search_box.addWidget(self.input_ext, stretch=1)    # Takes little space
+        search_box.addWidget(self.combo_filter, stretch=1)
+        
         self.layout.addLayout(search_box)
 
         # 3. Stacked Views
         self.stack = QStackedWidget()
         
-        # VIEW 0: Empty Placeholder (Clean Start)
+        # View 0: Empty
         self.empty_view = QLabel("Select a folder to view contents and start indexing.")
         self.empty_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty_view.setStyleSheet("color: #888; font-size: 16px;")
+        self.empty_view.setStyleSheet("color: #666; font-size: 16px;")
         
-        # VIEW 1: Browser (QTreeView)
+        # View 1: Browser
         self.file_model = QFileSystemModel()
         self.file_model.setFilter(QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot)
         self.browser_view = QTreeView()
         self.browser_view.setModel(self.file_model)
         self.browser_view.setAlternatingRowColors(True)
         self.browser_view.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        
-        # Context Menu for Browser
         self.browser_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.browser_view.customContextMenuRequested.connect(self.open_context_menu_browser)
         
-        # VIEW 2: Search Results (QTreeWidget)
+        # View 2: Search Results
         self.search_view = QTreeWidget()
         self.search_view.setHeaderLabels(["Name", "Type", "Size", "Date Modified", "Full Path"])
         self.search_view.setAlternatingRowColors(True)
         self.search_view.setRootIsDecorated(False)
         self.search_view.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        
-        # Context Menu for Search
         self.search_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.search_view.customContextMenuRequested.connect(self.open_context_menu_search)
 
-        self.stack.addWidget(self.empty_view)   # Index 0
-        self.stack.addWidget(self.browser_view) # Index 1
-        self.stack.addWidget(self.search_view)  # Index 2
+        self.stack.addWidget(self.empty_view)
+        self.stack.addWidget(self.browser_view)
+        self.stack.addWidget(self.search_view)
         
         self.layout.addWidget(self.stack)
 
@@ -264,7 +285,7 @@ class MainWindow(QMainWindow):
         self.layout.addWidget(self.progress_bar)
         
         self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+        self.status_label.setStyleSheet("color: #888; font-size: 11px;")
         self.layout.addWidget(self.status_label)
 
     # --- ACTIONS ---
@@ -274,11 +295,8 @@ class MainWindow(QMainWindow):
         if folder:
             self.current_folder = folder
             self.lbl_path.setText(folder)
-            
-            # Switch to Browser View
             self.stack.setCurrentIndex(1)
             
-            # Set Root Path for Model AND View (Fixes the root drive issue)
             root_index = self.file_model.setRootPath(folder)
             self.browser_view.setRootIndex(root_index)
             
@@ -286,11 +304,11 @@ class MainWindow(QMainWindow):
 
     def start_indexing(self, folder):
         self.input_search.clear()
+        self.input_ext.clear()
         self.btn_select.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0) 
         self.status_label.setText("Indexing files & folders...")
-        
         self.indexer.prepare(folder)
         self.indexer.start()
 
@@ -302,7 +320,6 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.status_label.setText(f"Indexed {count} items in {duration:.2f}s")
         
-        # Populate Filters (Sorted by Frequency)
         sorted_exts = self.indexer.get_sorted_extensions()
         self.combo_filter.clear()
         self.combo_filter.addItem("All Types")
@@ -315,34 +332,62 @@ class MainWindow(QMainWindow):
 
     def on_search_text_change(self):
         query = self.input_search.text().strip()
+        manual_ext = self.input_ext.text().strip()
         
-        if not query:
-            # Show Browser if folder selected, else Empty
+        # Logic: If main query is empty, allow browser mode (unless Ext filter is active)
+        if not query and not manual_ext:
             if self.current_folder:
                 self.stack.setCurrentIndex(1) 
             else:
                 self.stack.setCurrentIndex(0)
             return
 
-        # Show Search Results
+        # Show Search Mode
         self.stack.setCurrentIndex(2)
         if not self.indexer.doc_store: return
         
+        # If query is empty but Extension is provided, we can't do Trigram search on ""
+        # So we trick it: if query is empty, we search for everything (this might be slow for 100k files)
+        # Better approach: Enforce at least 1 char in Main Search OR just scan extension lists
+        # For performance, let's require at least 1 char in search box OR implement full-scan fallback
+        
         start = time.time()
-        results = self.indexer.search_index(query, self.combo_filter.currentText())
+        
+        if not query:
+            # Fallback: User typed extension but no name. 
+            # We must scan all files matching extension. 
+            # This skips the trigram index and scans the doc_store directly (slower but acceptable for this case)
+            results = []
+            target_exts = [e if e.startswith(".") else "."+e for e in manual_ext.lower().split(",")] if manual_ext else []
+            
+            for doc in self.indexer.doc_store.values():
+                if target_exts:
+                    if doc['ext'] in target_exts:
+                        results.append(doc)
+            results.sort(key=lambda x: len(x['name']))
+            
+        else:
+            # Normal Fast Search
+            results = self.indexer.search_index(
+                query, 
+                manual_ext_input=manual_ext, 
+                dropdown_filter=self.combo_filter.currentText()
+            )
+            
         dur = (time.time() - start) * 1000
         
         self.search_view.clear()
         items = []
-        for doc in results[:100]:
+        # Limit to 500 results to prevent UI freeze if query is too broad
+        for doc in results[:500]:
             item = QTreeWidgetItem([doc['name'], doc['ext'], doc['size'], doc['date'], doc['path']])
-            item.setData(0, Qt.ItemDataRole.UserRole, doc['path']) # Store path
+            item.setData(0, Qt.ItemDataRole.UserRole, doc['path'])
             items.append(item)
             
         self.search_view.addTopLevelItems(items)
         self.status_label.setText(f"Found {len(results)} matches in {dur:.2f} ms")
 
-    # --- CONTEXT MENUS (RIGHT CLICK) ---
+    # --- CONTEXT MENU LOGIC ---
 
     def open_context_menu_browser(self, position):
         index = self.browser_view.indexAt(position)
@@ -358,13 +403,10 @@ class MainWindow(QMainWindow):
 
     def show_context_menu(self, path, position, parent_widget):
         menu = QMenu()
-        
-        # 1. Copy Path
         action_copy = QAction("Copy File Path", self)
         action_copy.triggered.connect(lambda: self.copy_to_clipboard(path))
         menu.addAction(action_copy)
         
-        # 2. Reveal
         action_reveal = QAction("Reveal in File Manager", self)
         action_reveal.triggered.connect(lambda: self.reveal_file(path))
         menu.addAction(action_reveal)
@@ -372,26 +414,25 @@ class MainWindow(QMainWindow):
         menu.exec(parent_widget.mapToGlobal(position))
 
     def copy_to_clipboard(self, path):
-        clipboard = QGuiApplication.clipboard()
-        clipboard.setText(path)
+        QGuiApplication.clipboard().setText(path)
         self.status_label.setText("Path copied to clipboard")
 
     def reveal_file(self, path):
         if not os.path.exists(path): return
-        
         system_name = platform.system()
         try:
-            if system_name == 'Darwin': # macOS
+            if system_name == 'Darwin':
                 subprocess.call(['open', '-R', path])
             elif system_name == 'Windows':
                 subprocess.Popen(f'explorer /select,"{os.path.normpath(path)}"')
-            else: # Linux
+            else:
                 subprocess.call(['xdg-open', os.path.dirname(path)])
-        except Exception as e:
-            print(f"Error revealing: {e}")
+        except Exception: pass
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # Force Fusion theme for consistent dark mode look
+    app.setStyle("Fusion") 
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
