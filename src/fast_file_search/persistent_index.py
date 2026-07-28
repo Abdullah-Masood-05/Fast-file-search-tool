@@ -178,23 +178,21 @@ class PersistentIndex:
 
                 trigrams = set(self._generate_trigrams(name))
                 for gram in trigrams:
-                    trig_cur = conn.execute(
+                    conn.execute(
                         "INSERT OR IGNORE INTO trigrams (trigram) VALUES (?)",
                         (gram,),
                     )
-                    if trig_cur.lastrowid is not None:
-                        trigram_id = trig_cur.lastrowid
-                    else:
-                        row = conn.execute(
-                            "SELECT id FROM trigrams WHERE trigram = ?", (gram,)
-                        ).fetchone()
-                        trigram_id = row["id"] if row else None
-                    if trigram_id is not None:
+                    row = conn.execute(
+                        "SELECT id FROM trigrams WHERE trigram = ?", (gram,)
+                    ).fetchone()
+                    if row:
+                        trigram_id = row["id"]
                         conn.execute(
                             "INSERT OR IGNORE INTO file_trigrams (file_id, trigram_id) VALUES (?, ?)",
                             (file_id, trigram_id),
                         )
                 conn.commit()
+
             except Exception:
                 conn.rollback()
                 raise
@@ -284,12 +282,20 @@ class PersistentIndex:
             return None
         return dict(row)
 
-    def search_trigram(self, query: str) -> List[dict]:
+    def search_trigram(self, query: str, limit: int = 1000) -> List[dict]:
+        """Search using trigram index, with SQL LIKE fallback for robustness."""
         conn = self._get_conn()
-        trigrams = self._generate_trigrams(query)
-        if not trigrams:
+        query_lower = query.lower().strip()
+        if not query_lower:
             return []
 
+        trigrams = self._generate_trigrams(query_lower)
+
+        # If query is too short for trigrams (< 3 chars), go straight to LIKE
+        if not trigrams:
+            return self._search_like(query_lower, limit)
+
+        # Trigram intersection search
         sorted_grams = sorted(
             trigrams,
             key=lambda t: conn.execute(
@@ -319,13 +325,29 @@ class PersistentIndex:
             ids = {r["file_id"] for r in rows}
             candidate_ids &= ids
 
-        query_lower = query.lower()
         results = []
         for fid in candidate_ids:
             row = conn.execute("SELECT * FROM files WHERE id = ?", (fid,)).fetchone()
             if row and query_lower in row["name"].lower():
                 results.append(dict(row))
+                if len(results) >= limit:
+                    break
+
+        # Fallback: if trigram search returned nothing, try SQL LIKE
+        if not results:
+            results = self._search_like(query_lower, limit)
+
         return results
+
+    def _search_like(self, query_lower: str, limit: int = 1000) -> List[dict]:
+        """Fallback search using SQL LIKE on the name column."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM files WHERE LOWER(name) LIKE ? LIMIT ?",
+            (f"%{query_lower}%", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
 
     def update_metadata(self, key: str, value: str) -> None:
         conn = self._get_conn()
