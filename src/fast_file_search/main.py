@@ -24,10 +24,16 @@ def main():
     window = MainWindow()
     
     # Set main window icon if available
-    icon_path = Path(__file__).parents[2] / "files.ico"
-    if icon_path.exists():
+    icon_path = None
+    for p in Path(__file__).parents:
+        if (p / "files.ico").exists():
+            icon_path = p / "files.ico"
+            break
+            
+    if icon_path:
         from PyQt6.QtGui import QIcon
         app.setWindowIcon(QIcon(str(icon_path)))
+
         
     window.show()
     sys.exit(app.exec())

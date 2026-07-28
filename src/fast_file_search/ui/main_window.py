@@ -702,14 +702,20 @@ class MainWindow(QMainWindow):
         self.tray_icon.setToolTip("Fast File Search Pro")
         
         # Set system icon
-        icon_path = Path(__file__).parents[2] / "files.ico"
-        if icon_path.exists():
+        icon_path = None
+        for p in Path(__file__).parents:
+            if (p / "files.ico").exists():
+                icon_path = p / "files.ico"
+                break
+                
+        if icon_path:
             icon = QIcon(str(icon_path))
             self.tray_icon.setIcon(icon)
             self.setWindowIcon(icon)
             self.title_bar.icon_label.setPixmap(icon.pixmap(20, 20))
         else:
             self.tray_icon.setIcon(QIcon.fromTheme("system-search"))
+
 
         # Tray Context Menu
         menu = QMenu()
