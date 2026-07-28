@@ -1,58 +1,82 @@
-# Fast File Search Tool
+<div align="center">
+  <img src="files.ico" width="128" height="128" alt="Fast File Search Pro Icon">
+  
+  # Fast File Search Pro
 
-High-performance file search using IR techniques. Built with Python standard library and PyQt6.
+  [![Language](https://img.shields.io/badge/language-Python-blue)](#)
+  [![GUI](https://img.shields.io/badge/GUI-PyQt6-brightgreen)](#)
+  [![License](https://img.shields.io/badge/license-MIT-green)](#)
+  [![Builder](https://img.shields.io/badge/build-uv-blueviolet)](#)
 
-## Features
-- Recursively index folders; build in-memory inverted index
-- Metadata: path, name, extension, size, modified-time
-- Real-time, case-insensitive substring search
-- Ranking: exact > starts-with > contains
-- File type filters (extensions)
-- Limits results to 100 for responsiveness
-- Progress and timing metrics
+  A high-performance desktop file search utility built with Python and PyQt6.
+</div>
 
-## Requirements
-- Python 3.8+
-- PyQt6
+---
 
-## Run
+## What it is
 
+Fast File Search Pro is a local search application that indexes your directories into a SQLite database. It uses SQL queries, trigram matching, and directory monitoring to provide search results as you type.
+
+### Features
+* **SQL Trigram Search**: Searches are backed by a persistent SQLite trigram index.
+* **Complex Queries**: Supports boolean operators (`AND`, `OR`, `NOT`), file extension filters (`ext:py`), and size ranges (`size:>10mb` or `size:1kb..50kb`).
+* **Real-time Monitoring**: Integrates `watchdog` to detect file creations, deletions, and modifications in indexed directories.
+* **Responsive GUI**: Uses background thread execution for searches and indexing, keeping the user interface active during large scans.
+* **Typing Autocomplete**: Provides fast prefix suggestions in the search bar.
+* **Preview Panel**: Displays contents of text and image files, with metadata and background MD5/SHA256 hash calculation.
+* **Theme Support**: Includes dark and light mode stylesheet options.
+
+---
+
+## Installation & Setup
+
+### Prerequisites
+* Python 3.10 or later
+* [uv](https://github.com/astral-sh/uv) (recommended package coordinator)
+
+### Run Locally
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/yourusername/fast-file-search-pro.git
+   cd Fast-file-search-tool
+   ```
+
+2. **Sync dependencies**
+   ```bash
+   uv sync
+   ```
+
+3. **Start the application**
+   ```bash
+   uv run python main.py
+   ```
+
+---
+
+## Running Tests
+
+Run the test suite with `pytest`:
 ```bash
-pip install PyQt6
+uv run pytest tests/ -v
 ```
 
+---
+
+## Packaging as an Executable
+
+To compile the application into a standalone executable using `Nuitka`:
+
 ```bash
-python3 main.py
+uv run nuitka main.py \
+  --standalone \
+  --plugin-enable=pyqt6 \
+  --windows-console-mode=disable \
+  --windows-icon-from-ico=files.ico
 ```
 
-## Usage
-- Click "Select Folder" and choose a directory to index.
-- Start typing in the search box; results update live.
-- Toggle extension filters to refine results.
-- Double-click a result to open it in the default app.
+---
 
-## Notes
-- Handles permission errors by skipping unreadable files.
-- Index built in memory for speed; no persistence (optional future work).
+## License
 
-
-## Performance Tips
-- Indexing shows progress every 1000 files.
-- Search limited to 100 results to avoid GUI stalls.
-- Lowercased keys computed once during indexing.
-
-## Dataset used for testing purpose : 
-- I have used original Linux kernal source code and original python source code as it has bunch of files 
-- Linux kernel source (almost 90k files)
-
-    `git clone https://github.com/python/cpython.git test_python`
-- Python standard library
-
-    `git clone https://github.com/python/cpython.git test_python`
-
-
-## Future Enhancements
-- Persist index to disk
-- Incremental updates (FS watchers)
-- Wildcards and boolean queries
-- Icons, more filters, open containing folder
+This project is licensed under the MIT License.
