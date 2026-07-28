@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fast-file-search-tool"
+version = "1.0.0"
+description = "High-performance file search using IR techniques with PyQt6 GUI"
+requires-python = ">=3.8"
+authors = [{name = "Abdullah Masood"}]
+license = {text = "MIT"}
+dependencies = ["PyQt6>=6.0.0"]
+
+# FIX: Tell Hatchling exactly which files to include
+[tool.hatch.build.targets.wheel]
+packages = ["."]  # Include the current directory
+include = ["*.py", "*.md", "*.txt"]  # Explicit file patterns
+
+[tool.uv]
+dev-dependencies = ["pytest>=7.0.0", "black>=22.0.0"]
