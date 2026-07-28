@@ -943,11 +943,12 @@ class AboutDialog(QDialog):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
-        desc = QLabel("High-performance desktop file search tool featuring SQLite Persistent Indexing, Trigram searching, content extraction, and Watchdog real-time file updates.")
+        desc = QLabel("A local file search utility that indexes your folders in the background using SQLite trigrams. Includes real-time directory monitoring and advanced size and extension filters.")
         desc.setWordWrap(True)
         desc.setFont(QFont("Segoe UI", 10))
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(desc)
+
 
         details = QLabel("Version: 1.0.0\nFramework: PyQt6 (Qt 6)\nLicense: MIT License")
         details.setFont(QFont("Segoe UI", 9.5))
