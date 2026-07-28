@@ -6,3 +6,5 @@ __pycache__/
 /main.onefile-build
 *.exe
 /.venv
+setup.iss
+
