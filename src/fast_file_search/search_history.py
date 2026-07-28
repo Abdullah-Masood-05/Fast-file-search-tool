@@ -57,6 +57,25 @@ class SearchHistory:
                 created_at REAL NOT NULL
             );"""
         )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS favorites (
+                path TEXT PRIMARY KEY,
+                created_at REAL NOT NULL
+            );"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS tags (
+                path TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                PRIMARY KEY (path, tag)
+            );"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS notes (
+                path TEXT PRIMARY KEY,
+                note TEXT NOT NULL
+            );"""
+        )
         self._conn.commit()
 
     def add_search(self, query: str, result_count: int = 0) -> None:
@@ -129,6 +148,68 @@ class SearchHistory:
         ).fetchall()
         return [(r["query"], r["cnt"]) for r in rows]
 
+    def add_favorite(self, path: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO favorites (path, created_at) VALUES (?, ?)",
+                (path, time.time()),
+            )
+            self._conn.commit()
+
+    def remove_favorite(self, path: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM favorites WHERE path = ?", (path,)
+            )
+            self._conn.commit()
+
+    def is_favorite(self, path: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM favorites WHERE path = ?", (path,)
+        ).fetchone()
+        return row is not None
+
+    def get_favorites(self) -> List[str]:
+        rows = self._conn.execute(
+            "SELECT path FROM favorites ORDER BY created_at DESC"
+        ).fetchall()
+        return [r["path"] for r in rows]
+
+    def add_tag(self, path: str, tag: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO tags (path, tag) VALUES (?, ?)",
+                (path, tag),
+            )
+            self._conn.commit()
+
+    def remove_tag(self, path: str, tag: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM tags WHERE path = ? AND tag = ?", (path, tag)
+            )
+            self._conn.commit()
+
+    def get_tags(self, path: str) -> List[str]:
+        rows = self._conn.execute(
+            "SELECT tag FROM tags WHERE path = ? ORDER BY tag ASC", (path,)
+        ).fetchall()
+        return [r["tag"] for r in rows]
+
+    def set_note(self, path: str, note: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO notes (path, note) VALUES (?, ?)",
+                (path, note),
+            )
+            self._conn.commit()
+
+    def get_note(self, path: str) -> str:
+        row = self._conn.execute(
+            "SELECT note FROM notes WHERE path = ?", (path,)
+        ).fetchone()
+        return row["note"] if row else ""
+
     def close(self) -> None:
         self._conn.close()
 
@@ -136,41 +217,35 @@ class SearchHistory:
 class Autocomplete:
     def __init__(self, persistent_index: Optional[PersistentIndex] = None):
         self.index = persistent_index or PersistentIndex()
-        self._freq_cache: Dict[str, int] = {}
-        self._last_build: float = 0
-        self._cache_ttl: float = 60.0
-        self._lock = threading.RLock()
 
-    def _build_freq_cache(self) -> None:
-        now = time.time()
-        if now - self._last_build < self._cache_ttl and self._freq_cache:
-            return
-        freq: Counter = Counter()
-        for f in self.index.iter_all_files():
-            name = f.get("name", "")
-            if name:
-                freq[name] += 1
-        self._freq_cache = dict(freq)
-        self._last_build = now
-
-    def suggest(self, prefix: str, limit: int = 10, context_path: Optional[str] = None) -> List[str]:
-        if not prefix:
+    def suggest(self, prefix: str, limit: int = 8) -> List[str]:
+        """Fast SQL-backed autocomplete suggestions."""
+        p_clean = prefix.strip().lower()
+        if not p_clean:
             return []
-        self._build_freq_cache()
-        prefix_lower = prefix.lower()
-        seen: Set[str] = set()
-        scored: List[tuple[str, int, int]] = []
 
-        for name, freq in self._freq_cache.items():
-            if name.lower().startswith(prefix_lower) and name not in seen:
-                seen.add(name)
-                scored.append((name, freq, 0))
-            elif prefix_lower in name.lower() and name not in seen:
-                seen.add(name)
-                scored.append((name, freq, 1))
+        try:
+            conn = self.index._get_conn()
+            # 1. Prefix matches first
+            rows = conn.execute(
+                "SELECT DISTINCT name FROM files WHERE LOWER(name) LIKE ? LIMIT ?",
+                (f"{p_clean}%", limit)
+            ).fetchall()
+            results = [r["name"] for r in rows]
 
-        scored.sort(key=lambda x: (x[2], -x[1], x[0]))
-        return [s[0] for s in scored[:limit]]
+            # 2. Substring matches if limit not reached
+            if len(results) < limit:
+                needed = limit - len(results)
+                c_rows = conn.execute(
+                    "SELECT DISTINCT name FROM files WHERE LOWER(name) LIKE ? AND LOWER(name) NOT LIKE ? LIMIT ?",
+                    (f"%{p_clean}%", f"{p_clean}%", needed)
+                ).fetchall()
+                results.extend([r["name"] for r in c_rows])
+
+            return results
+        except Exception:
+            return []
+
 
     def context_suggest(self, prefix: str, current_path: str, limit: int = 10) -> List[str]:
         if not prefix:

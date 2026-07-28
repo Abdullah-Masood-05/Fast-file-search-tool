@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import time
+
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -160,24 +162,30 @@ class LRUCache:
     def __init__(self, maxsize: int = 128):
         self._maxsize = maxsize
         self._cache: OrderedDict = OrderedDict()
+        self._lock = threading.Lock()
 
     def get(self, key: str) -> Optional[object]:
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
-        return None
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            return None
 
     def put(self, key: str, value: object) -> None:
-        self._cache[key] = value
-        self._cache.move_to_end(key)
-        if len(self._cache) > self._maxsize:
-            self._cache.popitem(last=False)
+        with self._lock:
+            self._cache[key] = value
+            self._cache.move_to_end(key)
+            if len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
 
     def invalidate(self) -> None:
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
 
     def remove(self, key: str) -> None:
-        self._cache.pop(key, None)
+        with self._lock:
+            self._cache.pop(key, None)
+
 
 
 class SearchEngine:
@@ -333,15 +341,21 @@ class SearchEngine:
 
         candidates = self._collect_candidates(query)
         now = time.time()
-        all_files = list(self.index.iter_all_files())
-        total_files = len(all_files)
+        
+        try:
+            conn = self.index._get_conn()
+            row = conn.execute("SELECT COUNT(*) FROM files").fetchone()
+            total_files = row[0] if row else len(candidates)
+        except Exception:
+            total_files = len(candidates)
 
         term_freq_map: Dict[str, int] = defaultdict(int)
-        for f in all_files:
+        for f in candidates:
             name_lower = f.get("name", "").lower()
             for t in query.terms:
                 if t.lower() in name_lower:
                     term_freq_map[t.lower()] += 1
+
 
         scored: List[SearchResult] = []
         seen: Set[str] = set()
@@ -412,12 +426,23 @@ class SearchEngine:
         return resp
 
     def _collect_candidates(self, query: SearchQuery) -> List[dict]:
-        if query.terms or query.exact_phrase:
-            search_text = " ".join(query.terms)
-            if query.exact_phrase:
-                search_text = f"{search_text} {query.exact_phrase}"
-            return self.index.search_trigram(search_text.strip())
-        return list(self.index.iter_all_files())
+        terms = list(query.terms)
+        if query.exact_phrase:
+            terms.append(query.exact_phrase)
+        if not terms:
+            return list(self.index.iter_all_files())
+
+        candidates_map: Dict[str, dict] = {}
+        for t in terms:
+            clean_t = t.strip()
+            if not clean_t:
+                continue
+            matches = self.index.search_trigram(clean_t)
+            for item in matches:
+                candidates_map[item["path"]] = item
+
+        return list(candidates_map.values())
+
 
     def _suggest_correction(self, query: SearchQuery) -> Optional[str]:
         all_names: List[str] = []
