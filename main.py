@@ -1,5 +1,7 @@
 import sys
 import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+
 import time
 import subprocess
 import datetime
@@ -14,6 +16,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QStackedWidget, QTreeView, QMenu)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QDir
 from PyQt6.QtGui import QAction, QFileSystemModel, QCursor, QGuiApplication
+
+from fast_file_search.search import SearchEngine
 
 # 1. LOGIC LAYER: IR INDEXER (Now supports Folders & Frequency Sorting)
 
@@ -317,26 +321,30 @@ class MainWindow(QMainWindow):
         query = self.input_search.text().strip()
         
         if not query:
-            # Show Browser if folder selected, else Empty
             if self.current_folder:
                 self.stack.setCurrentIndex(1) 
             else:
                 self.stack.setCurrentIndex(0)
             return
 
-        # Show Search Results
         self.stack.setCurrentIndex(2)
         if not self.indexer.doc_store: return
         
         start = time.time()
-        results = self.indexer.search_index(query, self.combo_filter.currentText())
+        engine = SearchEngine()
+        results = engine.search(
+            query,
+            self.indexer.doc_store,
+            self.indexer.inverted_index,
+            extension_filter=self.combo_filter.currentText(),
+        )
         dur = (time.time() - start) * 1000
         
         self.search_view.clear()
         items = []
         for doc in results[:100]:
             item = QTreeWidgetItem([doc['name'], doc['ext'], doc['size'], doc['date'], doc['path']])
-            item.setData(0, Qt.ItemDataRole.UserRole, doc['path']) # Store path
+            item.setData(0, Qt.ItemDataRole.UserRole, doc['path'])
             items.append(item)
             
         self.search_view.addTopLevelItems(items)
