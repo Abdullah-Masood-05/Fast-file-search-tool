@@ -18,6 +18,8 @@ from .widgets import ExportDialog
 from ..search_history import SearchHistory, Autocomplete, SearchRecommender
 from ..search import SearchResult, SearchResponse
 from ..utils.file_utils import format_size
+from ..utils.platform_utils import open_file_manager
+
 
 
 
@@ -602,15 +604,8 @@ class SearchView(QWidget):
         clipboard.setText(text)
 
     def reveal_path(self, path):
-        import platform
-        import subprocess
-        system = platform.system()
-        if system == "Windows":
-            subprocess.Popen(f'explorer /select,"{os.path.normpath(path)}"')
-        elif system == "Darwin":
-            subprocess.call(["open", "-R", path])
-        else:
-            subprocess.call(["xdg-open", os.path.dirname(path)])
+        open_file_manager(path)
+
 
     def toggle_favorite(self, item: SearchResultItem):
         path = item.result.path

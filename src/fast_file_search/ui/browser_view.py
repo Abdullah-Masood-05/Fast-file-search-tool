@@ -199,12 +199,15 @@ class BreadcrumbBar(QWidget):
         parts = norm_path.split(os.sep)
         
         accum_path = ""
+        is_windows = platform.system() == "Windows"
         for i, part in enumerate(parts):
             if not part:
                 continue
             
-            if i == 0 and platform.system() == "Windows" and ":" in part:
+            if i == 0 and is_windows and ":" in part:
                 accum_path = part + os.sep
+            elif not accum_path and not is_windows:
+                accum_path = os.sep + part
             else:
                 accum_path = os.path.join(accum_path, part)
 
@@ -212,6 +215,7 @@ class BreadcrumbBar(QWidget):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda checked, p=accum_path: self.path_selected.emit(p))
             self.buttons_layout.addWidget(btn)
+
 
             if i < len(parts) - 1:
                 sep = QLabel("›")
