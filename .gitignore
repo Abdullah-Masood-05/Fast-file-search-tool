@@ -7,4 +7,9 @@ __pycache__/
 *.exe
 /.venv
 setup.iss
+v100_notes.md
+v110_notes.md
+pr_body.md
+
+
 
