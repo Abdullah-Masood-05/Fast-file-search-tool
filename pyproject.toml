@@ -47,8 +47,8 @@ fast-search = "fast_file_search.main:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "nuitka>=1.0.0",
     "pytest>=7.0.0",
     "pytest-qt>=4.0.0",
