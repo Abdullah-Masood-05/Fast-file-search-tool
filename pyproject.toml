@@ -1,20 +1,75 @@
+[project]
+name = "fast-file-search-pro"
+version = "1.0.0"
+description = "Fast File Search Pro - High-performance file search with PyQt6 GUI"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "Abdullah Masood", email = "your.email@example.com"},
+]
+license = {text = "MIT"}
+keywords = ["file-search", "search", "pyqt6", "indexing", "watchdog"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Desktop Environment :: File Managers",
+]
+dependencies = [
+    "PyQt6>=6.0.0",
+    "watchdog>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "nuitka>=1.0.0",
+    "pytest>=7.0.0",
+    "pytest-qt>=4.0.0",
+    "black>=22.0.0",
+    "mypy>=0.990",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/fast-file-search-pro"
+Repository = "https://github.com/yourusername/fast-file-search-pro.git"
+Issues = "https://github.com/yourusername/fast-file-search-pro/issues"
+
+[project.scripts]
+fast-search = "fast_file_search.main:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[project]
-name = "fast-file-search-tool"
-version = "1.0.0"
-description = "High-performance file search using IR techniques with PyQt6 GUI"
-requires-python = ">=3.8"
-authors = [{name = "Abdullah Masood"}]
-license = {text = "MIT"}
-dependencies = ["PyQt6>=6.0.0"]
-
-# FIX: Tell Hatchling exactly which files to include
-[tool.hatch.build.targets.wheel]
-packages = ["."]  # Include the current directory
-include = ["*.py", "*.md", "*.txt"]  # Explicit file patterns
-
 [tool.uv]
-dev-dependencies = ["pytest>=7.0.0", "black>=22.0.0"]
+dev-dependencies = [
+    "nuitka>=1.0.0",
+    "pytest>=7.0.0",
+    "pytest-qt>=4.0.0",
+    "black>=22.0.0",
+    "mypy>=0.990",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fast_file_search"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
