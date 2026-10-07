@@ -1,20 +1,21 @@
 from __future__ import annotations
 
-import json
+import html
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import List, Optional
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
     QTreeWidget, QTreeWidgetItem, QMenu, QMessageBox, QListWidget,
-    QInputDialog, QFileDialog, QHeaderView, QFrame
+    QInputDialog, QFileDialog, QHeaderView, QFrame, QApplication
 )
 import threading
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QUrl, QEvent, QThread, QTimer, pyqtSlot
 from PyQt6.QtGui import QIcon, QAction, QGuiApplication, QDesktopServices, QCursor, QFont
 
 from .widgets import ExportDialog
+from ..persistent_index import PersistentIndex
 from ..search_history import SearchHistory, Autocomplete, SearchRecommender
 from ..search import SearchResult, SearchResponse
 from ..utils.file_utils import format_size
@@ -25,7 +26,13 @@ from ..utils.platform_utils import open_file_manager
 
 class SearchResultItem(QTreeWidgetItem):
     """Custom QTreeWidgetItem that sorts columns numerically or chronologically."""
-    def __init__(self, parent: QTreeWidget, result: SearchResult, history_mgr: SearchHistory):
+    def __init__(
+        self,
+        parent: Optional[QTreeWidget],
+        result: SearchResult,
+        history_mgr: SearchHistory,
+        is_favorite: Optional[bool] = None,
+    ):
         # Format date nicely
         import datetime
         try:
@@ -33,27 +40,37 @@ class SearchResultItem(QTreeWidgetItem):
         except Exception:
             date_str = "--"
 
-        # Star favorite status indicator
-        is_fav = history_mgr.is_favorite(result.path)
+        # Star favorite status indicator (callers can pass a precomputed value to avoid a
+        # database round-trip per row).
+        is_fav = history_mgr.is_favorite(result.path) if is_favorite is None else is_favorite
         star_prefix = "⭐ " if is_fav else ""
 
-        super().__init__(parent, [
+        columns = [
             star_prefix + result.name,
             result.extension,
             format_size(result.size) if not result.is_folder else "Folder",
             date_str,
             result.path,
             f"{result.score:.2f}"
-        ])
+        ]
+        # Attaching to the tree here *and* via addTopLevelItems() later makes Qt re-index every
+        # item (quadratic); bulk callers pass parent=None and add the items in one call.
+        if parent is None:
+            super().__init__(columns)
+        else:
+            super().__init__(parent, columns)
         self.result = result
         self.history_mgr = history_mgr
 
     def __lt__(self, other: QTreeWidgetItem) -> bool:
-        if not isinstance(other, SearchResultItem):
+        tree = self.treeWidget()
+        if not isinstance(other, SearchResultItem) or tree is None:
             return super().__lt__(other)
-        
-        column = self.treeWidget().sortColumn()
-        if column == 2:  # Size column
+
+        column = tree.sortColumn()
+        if column == 0:  # Name: ignore the favorite star and letter case
+            return self.result.name.lower() < other.result.name.lower()
+        elif column == 2:  # Size column
             s1 = -1 if self.result.is_folder else self.result.size
             s2 = -1 if other.result.is_folder else other.result.size
             return s1 < s2
@@ -61,7 +78,7 @@ class SearchResultItem(QTreeWidgetItem):
             return self.result.modified < other.result.modified
         elif column == 5:  # Score
             return self.result.score < other.result.score
-        
+
         return super().__lt__(other)
 
 
@@ -69,7 +86,7 @@ class SuggestionsListPopup(QListWidget):
     """A floating list widget popup for query suggestions."""
     suggestion_selected = pyqtSignal(str)
 
-    def __init__(self, parent: QWidget = None):
+    def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         # ToolTip stays on top without stealing focus; WA_ShowWithoutActivating
         # prevents the popup from ever grabbing window activation away from
@@ -136,11 +153,21 @@ class SuggestionWorkerThread(QThread):
         self.autocomplete = autocomplete
         self.query = ""
         self._mutex = threading.Lock()
+        self._active = False  # True while run() may still consume self.query
+        self._stopping = False
 
     def fetch(self, query: str):
         with self._mutex:
+            if self._stopping:
+                return
             self.query = query
-        if not self.isRunning():
+            need_start = not self._active
+            if need_start:
+                self._active = True
+        if need_start:
+            # The previous run() has already decided to exit (it cleared _active under the
+            # mutex), so this only waits for the OS thread to wind down.
+            self.wait()
             self.start()
 
     def run(self):
@@ -148,13 +175,32 @@ class SuggestionWorkerThread(QThread):
             with self._mutex:
                 q = self.query
                 self.query = ""
-            if not q:
-                break
+                if not q:
+                    # Decide to exit atomically with the emptiness check, otherwise a fetch()
+                    # arriving in between would see "running" and its query would be lost.
+                    self._active = False
+                    self._release_connection()
+                    return
             try:
                 results = self.autocomplete.suggest(q, limit=6)
             except Exception:
                 results = []
             self.suggestions_ready.emit(q, results)
+
+    def _release_connection(self) -> None:
+        """Close this worker thread's read-only DB connection once it goes idle."""
+        release = getattr(getattr(self.autocomplete, "index", None), "release_thread_connection", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                pass
+
+    def shutdown(self):
+        with self._mutex:
+            self._stopping = True
+            self.query = ""
+        self.wait(3000)
 
 
 class SearchView(QWidget):
@@ -163,20 +209,28 @@ class SearchView(QWidget):
     search_triggered = pyqtSignal(str)
     file_selected = pyqtSignal(str)  # Emits selected file path
 
-    def __init__(self, parent=None, history_mgr: Optional[SearchHistory] = None):
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        history_mgr: Optional[SearchHistory] = None,
+        persistent_index: Optional[PersistentIndex] = None,
+    ):
         super().__init__(parent)
         self.history_mgr = history_mgr or SearchHistory()
-        self.autocomplete = Autocomplete()
-        self.recommender = SearchRecommender()
+        # Share the application's index when one is supplied (otherwise each helper opens
+        # the default on-disk index on its own).
+        self.index = persistent_index
+        self.autocomplete = Autocomplete(persistent_index)
+        self.recommender = SearchRecommender(persistent_index)
 
         # Layout
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(10)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(10)
 
         # 1. Search Bar & Suggestions layout
         self.search_bar_layout = QHBoxLayout()
-        
+
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search by name, path, extension, or boolean filters (e.g. name:report AND size:>10mb)...")
         self.search_input.setFixedHeight(34)
@@ -191,11 +245,8 @@ class SearchView(QWidget):
         self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clear_btn.setStyleSheet("border: none; background: transparent; color: #999; font-size: 11px;")
         self.clear_btn.clicked.connect(self.clear_search)
-        
-        self.search_input.resizeEvent = lambda event: self.clear_btn.move(
-            self.search_input.width() - 25, 
-            (self.search_input.height() - self.clear_btn.height()) // 2
-        )
+
+        self._position_clear_button()
 
         # Actions Bar
         self.fav_filter_active = False
@@ -210,7 +261,7 @@ class SearchView(QWidget):
         self.export_btn.clicked.connect(self.export_results)
         self.search_bar_layout.addWidget(self.export_btn)
 
-        self.layout.addLayout(self.search_bar_layout)
+        self.main_layout.addLayout(self.search_bar_layout)
 
         # Suggestions list popup
         self.suggestions_popup = SuggestionsListPopup()
@@ -233,7 +284,7 @@ class SearchView(QWidget):
         self.dym_lbl.setVisible(False)
         self.dym_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dym_lbl.linkActivated.connect(self.apply_dym_correction)
-        self.layout.addWidget(self.dym_lbl)
+        self.main_layout.addWidget(self.dym_lbl)
 
         # 2. Results Table View
         self.results_tree = QTreeWidget()
@@ -242,18 +293,20 @@ class SearchView(QWidget):
         self.results_tree.setAlternatingRowColors(True)
         self.results_tree.setSortingEnabled(True)
         self.results_tree.setRootIsDecorated(False)
+        self.results_tree.setUniformRowHeights(True)  # lets Qt skip per-row size hints
         self.results_tree.setFont(QFont("Segoe UI", 10))
         self.results_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        
+
         # Stretch sections
         header = self.results_tree.header()
+        assert header is not None
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
-        
+
         header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         header.customContextMenuRequested.connect(self.open_header_menu)
 
@@ -262,10 +315,26 @@ class SearchView(QWidget):
         self.results_tree.itemSelectionChanged.connect(self._on_selection_changed)
         self.results_tree.customContextMenuRequested.connect(self.open_context_menu)
 
-        self.layout.addWidget(self.results_tree)
+        self.main_layout.addWidget(self.results_tree)
 
         self.raw_results: List[SearchResult] = []
         self.apply_theme(False)
+
+        # Never let Qt destroy the suggestion QThread while it is still running.
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.shutdown)
+
+    def shutdown(self) -> None:
+        """Stop background workers; safe to call more than once."""
+        self.debounce_timer.stop()
+        self.suggestion_thread.shutdown()
+
+    def _position_clear_button(self) -> None:
+        self.clear_btn.move(
+            self.search_input.width() - 25,
+            (self.search_input.height() - self.clear_btn.height()) // 2,
+        )
 
     def apply_theme(self, is_dark: bool):
         self.suggestions_popup.apply_theme(is_dark)
@@ -394,21 +463,37 @@ class SearchView(QWidget):
 
     def set_results(self, response: SearchResponse):
         """Display search results inside tree widget."""
-        self.results_tree.clear()
-        self.raw_results = response.results
-        
-        self.results_tree.setSortingEnabled(False)
-        
-        items = []
-        for r in response.results:
-            items.append(SearchResultItem(self.results_tree, r, self.history_mgr))
-            
-        self.results_tree.addTopLevelItems(items)
-        self.results_tree.setSortingEnabled(True)
-        self.results_tree.sortByColumn(5, Qt.SortOrder.DescendingOrder)
+        tree = self.results_tree
+        tree.setUpdatesEnabled(False)
+        try:
+            tree.clear()
+            self.raw_results = list(response.results)
 
-        if response.did_you_mean:
-            self.dym_lbl.setText(f"Did you mean: <a href='{response.did_you_mean}' style='color: #007AFF;'>{response.did_you_mean}</a>?")
+            tree.setSortingEnabled(False)
+
+            # One query for all favourites instead of one per result row.
+            favorites = set(self.history_mgr.get_favorites())
+            items = [
+                SearchResultItem(None, r, self.history_mgr, is_favorite=r.path in favorites)
+                for r in response.results
+            ]
+            tree.addTopLevelItems(items)
+            tree.setSortingEnabled(True)
+            tree.sortByColumn(5, Qt.SortOrder.DescendingOrder)
+            self.filter_visible_items()
+        finally:
+            tree.setUpdatesEnabled(True)
+
+        error = getattr(response, "error", None)
+        if error:
+            self.dym_lbl.setTextFormat(Qt.TextFormat.PlainText)
+            self.dym_lbl.setText(error)
+            self.dym_lbl.setVisible(True)
+        elif response.did_you_mean:
+            # The suggestion is a file name: escape it before it goes into rich text / an href.
+            safe = html.escape(response.did_you_mean, quote=True)
+            self.dym_lbl.setTextFormat(Qt.TextFormat.RichText)
+            self.dym_lbl.setText(f"Did you mean: <a href='{safe}' style='color: #007AFF;'>{safe}</a>?")
             self.dym_lbl.setVisible(True)
         else:
             self.dym_lbl.setVisible(False)
@@ -419,12 +504,12 @@ class SearchView(QWidget):
 
     def filter_visible_items(self):
         """Show only favorites if toggled."""
+        favorites = set(self.history_mgr.get_favorites()) if self.fav_filter_active else set()
         for i in range(self.results_tree.topLevelItemCount()):
             item = self.results_tree.topLevelItem(i)
             if isinstance(item, SearchResultItem):
                 if self.fav_filter_active:
-                    is_fav = self.history_mgr.is_favorite(item.result.path)
-                    item.setHidden(not is_fav)
+                    item.setHidden(item.result.path not in favorites)
                 else:
                     item.setHidden(False)
 
@@ -432,12 +517,13 @@ class SearchView(QWidget):
         if not self.raw_results:
             QMessageBox.warning(self, "Export Results", "No results available to export.")
             return
-        
+
         dialog = ExportDialog(self)
         dialog.set_results([r.to_dict() for r in self.raw_results])
         dialog.exec()
 
     def apply_suggestion(self, text):
+        self.debounce_timer.stop()
         self.search_input.blockSignals(True)
         self.search_input.setText(text)
         self.search_input.blockSignals(False)
@@ -445,7 +531,10 @@ class SearchView(QWidget):
         self.suggestions_popup.hide()
 
     def apply_dym_correction(self, text):
+        self.debounce_timer.stop()
+        self.search_input.blockSignals(True)
         self.search_input.setText(text)
+        self.search_input.blockSignals(False)
         self.search_triggered.emit(text)
 
     def _on_text_changed(self, text):
@@ -472,7 +561,7 @@ class SearchView(QWidget):
         if suggestions:
             self.suggestions_popup.clear()
             self.suggestions_popup.addItems(suggestions)
-            
+
             gp = self.search_input.mapToGlobal(QPoint(0, self.search_input.height()))
             popup_h = min(180, len(suggestions) * 28 + 10)
             self.suggestions_popup.setGeometry(gp.x(), gp.y(), self.search_input.width(), popup_h)
@@ -495,10 +584,14 @@ class SearchView(QWidget):
                     if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
                         cur_row = self.suggestions_popup.currentRow()
                         count = self.suggestions_popup.count()
+                        if count == 0:
+                            return False
                         if key == Qt.Key.Key_Down:
                             new_row = (cur_row + 1) % count
+                        elif cur_row < 0:
+                            new_row = count - 1
                         else:
-                            new_row = (cur_row - 1 + count) % count
+                            new_row = (cur_row - 1) % count
                         self.suggestions_popup.setCurrentRow(new_row)
                         return True
                     elif key in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
@@ -509,14 +602,18 @@ class SearchView(QWidget):
                     elif key == Qt.Key.Key_Escape:
                         self.suggestions_popup.hide()
                         return True
-                
+
                 if event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+                    # A pending debounce would pop the suggestions up again after the search.
+                    self.debounce_timer.stop()
                     self.search_triggered.emit(self.search_input.text().strip())
                     self.suggestions_popup.hide()
                     return True
-                    
+
             elif event.type() == QEvent.Type.FocusOut:
                 QTimer.singleShot(250, self._check_focus_out)
+            elif event.type() == QEvent.Type.Resize:
+                self._position_clear_button()
 
         return super().eventFilter(obj, event)
 
@@ -536,8 +633,9 @@ class SearchView(QWidget):
 
     def open_header_menu(self, position):
         header = self.results_tree.header()
+        assert header is not None
         menu = QMenu(self)
-        
+
         for i in range(self.results_tree.columnCount()):
             col_name = self.results_tree.headerItem().text(i)
             action = QAction(col_name, self)
@@ -545,14 +643,14 @@ class SearchView(QWidget):
             action.setChecked(not header.isSectionHidden(i))
             action.triggered.connect(lambda checked, idx=i: header.setSectionHidden(idx, not checked))
             menu.addAction(action)
-            
+
         menu.exec(header.mapToGlobal(position))
 
     def open_context_menu(self, position):
         item = self.results_tree.itemAt(position)
         if not item or not isinstance(item, SearchResultItem):
             return
-            
+
         path = item.result.path
         is_starred = self.history_mgr.is_favorite(path)
 
@@ -615,7 +713,7 @@ class SearchView(QWidget):
         else:
             self.history_mgr.add_favorite(path)
             item.setText(0, "⭐ " + item.result.name)
-            
+
         self.filter_visible_items()
 
     def manage_tags(self, path):
@@ -634,25 +732,38 @@ class SearchView(QWidget):
         if ok:
             self.history_mgr.set_note(path, text.strip())
 
+    def _forget_in_index(self, path: str) -> None:
+        """Drop a deleted path from the search index so it does not reappear in results."""
+        index = self.index or getattr(self.autocomplete, "index", None)
+        if index is None:
+            return
+        try:
+            index.remove_file(path)
+        except Exception:
+            pass
+
     def delete_file(self, item: SearchResultItem):
         path = item.result.path
         reply = QMessageBox.question(
-            self, "Confirm Delete", 
+            self, "Confirm Delete",
             f"Are you sure you want to permanently delete this file from disk?\n\n{path}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
             try:
-                if os.path.isdir(path):
+                if os.path.isdir(path) and not os.path.islink(path):
                     import shutil
                     shutil.rmtree(path)
                 else:
                     os.remove(path)
-                
+
                 root = self.results_tree.invisibleRootItem()
-                root.removeChild(item)
-                
+                if root is not None:
+                    root.removeChild(item)
+                self.raw_results = [r for r in self.raw_results if r.path != path]
+                self._forget_in_index(path)
+
                 QMessageBox.information(self, "Deleted", "File was deleted successfully.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to delete file: {e}")

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import os
-import platform
-import subprocess
-from pathlib import Path
+from collections import Counter
+from pathlib import Path, PurePath
 from typing import List, Optional
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
     QTreeView, QMenu, QMessageBox, QFrame, QHeaderView, QStyledItemDelegate,
-    QFileDialog
+    QFileDialog, QProgressDialog, QApplication
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QUrl, QDir
 from PyQt6.QtGui import QIcon, QAction, QGuiApplication, QFileSystemModel, QPainter, QColor, QDesktopServices
@@ -23,12 +22,12 @@ class IndexStatusDelegate(QStyledItemDelegate):
         super().__init__(parent)
         self.get_status_callback = get_status_callback
 
-    def paint(self, painter: QPainter, option, index):
+    def paint(self, painter: Optional[QPainter], option, index):
         # Paint default item first
         super().paint(painter, option, index)
 
         # Draw a status indicator dot in the first column next to directory items
-        if index.column() == 0:
+        if painter is not None and index.column() == 0:
             status = self.get_status_callback(index)
             if status:
                 color_map = {
@@ -37,19 +36,19 @@ class IndexStatusDelegate(QStyledItemDelegate):
                     "excluded": QColor("#F44336"),  # Crimson Red
                 }
                 color = color_map.get(status, QColor("#9E9E9E"))
-                
+
                 painter.save()
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing)
                 painter.setBrush(color)
                 painter.setPen(Qt.PenStyle.NoPen)
-                
+
                 # Right aligned inside the cell
                 r = option.rect
                 dot_size = 7
                 painter.drawEllipse(
-                    r.right() - 20, 
-                    r.top() + (r.height() - dot_size) // 2, 
-                    dot_size, 
+                    r.right() - 20,
+                    r.top() + (r.height() - dot_size) // 2,
+                    dot_size,
                     dot_size
                 )
                 painter.restore()
@@ -57,23 +56,26 @@ class IndexStatusDelegate(QStyledItemDelegate):
 
 class BreadcrumbBar(QWidget):
     """Path breadcrumb navigation bar with clickable segments, folder chooser, and recent dropdown."""
-    path_selected = pyqtSignal(str)
+    path_selected = pyqtSignal(str)   # navigate only (crumb click / recent entry)
+    folder_chosen = pyqtSignal(str)   # explicit "Select Folder" pick (navigate and index)
+
+    MAX_RECENT = 15
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_path = ""
         self.is_dark = False
-        
-        self.layout = QHBoxLayout(self)
-        self.layout.setContentsMargins(4, 4, 4, 4)
-        self.layout.setSpacing(6)
+
+        self.main_layout = QHBoxLayout(self)
+        self.main_layout.setContentsMargins(4, 4, 4, 4)
+        self.main_layout.setSpacing(6)
 
         # Select Folder Button
         self.select_folder_btn = QPushButton("📁 Select Folder")
         self.select_folder_btn.setToolTip("Choose a folder from your disk to browse and index")
         self.select_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.select_folder_btn.clicked.connect(self._on_select_folder_clicked)
-        self.layout.addWidget(self.select_folder_btn)
+        self.main_layout.addWidget(self.select_folder_btn)
 
         # Recent items dropdown
         self.recent_combo = QComboBox()
@@ -81,30 +83,32 @@ class BreadcrumbBar(QWidget):
         self.recent_combo.setToolTip("Recent folders history")
         self.recent_combo.addItem("🕒")
         self.recent_combo.activated.connect(self._on_recent_selected)
-        self.layout.addWidget(self.recent_combo)
+        self.main_layout.addWidget(self.recent_combo)
 
         # Container for breadcrumb buttons
         self.buttons_container = QWidget()
         self.buttons_layout = QHBoxLayout(self.buttons_container)
         self.buttons_layout.setContentsMargins(0, 0, 0, 0)
         self.buttons_layout.setSpacing(2)
-        self.layout.addWidget(self.buttons_container)
+        self.main_layout.addWidget(self.buttons_container)
 
-        self.layout.addStretch()
+        self.main_layout.addStretch()
 
         # Copy current path button
         self.copy_btn = QPushButton("📋")
         self.copy_btn.setFixedSize(30, 28)
         self.copy_btn.setToolTip("Copy folder path to clipboard")
         self.copy_btn.clicked.connect(self.copy_current_path)
-        self.layout.addWidget(self.copy_btn)
+        self.main_layout.addWidget(self.copy_btn)
 
         self.apply_theme(False)
 
     def _on_select_folder_clicked(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder to Browse & Index")
         if folder:
-            self.path_selected.emit(folder)
+            # Qt hands back forward slashes on Windows; use the native form so the same
+            # folder is never stored under two spellings.
+            self.folder_chosen.emit(os.path.normpath(folder))
 
     def apply_theme(self, is_dark: bool):
         self.is_dark = is_dark
@@ -183,39 +187,34 @@ class BreadcrumbBar(QWidget):
             return
         self.current_path = path
 
-        # Update combo box recent history list safely
+        # Update combo box recent history list safely (bounded; index 0 is the clock icon)
         self.recent_combo.blockSignals(True)
         if path not in [self.recent_combo.itemText(i) for i in range(self.recent_combo.count())]:
             self.recent_combo.addItem(path)
+            while self.recent_combo.count() > self.MAX_RECENT + 1:
+                self.recent_combo.removeItem(1)
         self.recent_combo.setCurrentIndex(0)
         self.recent_combo.blockSignals(False)
 
         # Clear old buttons
         for i in reversed(range(self.buttons_layout.count())):
-            self.buttons_layout.itemAt(i).widget().setParent(None)
+            item = self.buttons_layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
 
-        # Rebuild breadcrumb buttons
-        norm_path = os.path.normpath(path)
-        parts = norm_path.split(os.sep)
-        
-        accum_path = ""
-        is_windows = platform.system() == "Windows"
+        # Rebuild breadcrumb buttons. PurePath.parts understands drives ("C:\\"), UNC shares
+        # ("\\\\server\\share\\") and the POSIX root ("/") for the platform we run on.
+        parts = PurePath(os.path.normpath(path)).parts
         for i, part in enumerate(parts):
-            if not part:
-                continue
-            
-            if i == 0 and is_windows and ":" in part:
-                accum_path = part + os.sep
-            elif not accum_path and not is_windows:
-                accum_path = os.sep + part
-            else:
-                accum_path = os.path.join(accum_path, part)
+            target = str(PurePath(*parts[: i + 1]))
+            label = part.rstrip("\\/") or part
 
-            btn = QPushButton(part)
+            btn = QPushButton(label)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda checked, p=accum_path: self.path_selected.emit(p))
+            btn.clicked.connect(lambda checked=False, p=target: self.path_selected.emit(p))
             self.buttons_layout.addWidget(btn)
-
 
             if i < len(parts) - 1:
                 sep = QLabel("›")
@@ -246,28 +245,36 @@ class BrowserView(QFrame):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setObjectName("BrowserView")
 
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(5)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(5)
+        # Folders dragged in from the OS file manager are handled by dropEvent() below.
+        self.setAcceptDrops(True)
 
         # 1. Breadcrumb Bar
         self.breadcrumb_bar = BreadcrumbBar()
-        self.breadcrumb_bar.path_selected.connect(self._on_folder_explicitly_selected)
-        self.layout.addWidget(self.breadcrumb_bar)
+        # Clicking a crumb / recent entry only navigates; only the explicit "Select Folder"
+        # button adds a folder to the index (otherwise clicking "C:" would index a whole drive).
+        self.breadcrumb_bar.path_selected.connect(self.navigate_to_path)
+        self.breadcrumb_bar.folder_chosen.connect(self._on_folder_explicitly_selected)
+        self.main_layout.addWidget(self.breadcrumb_bar)
 
         # 2. File System Model & Tree View
         self.file_model = QFileSystemModel()
         self.file_model.setFilter(QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot)
-        
+
         self.tree_view = QTreeView()
         self.tree_view.setModel(self.file_model)
         self.tree_view.setAlternatingRowColors(True)
         self.tree_view.setDragEnabled(True)
-        self.tree_view.setAcceptDrops(True)
-        self.tree_view.setDropIndicatorShown(True)
-        
+        # The tree must not accept drops itself: the (read-only) model would reject them and
+        # Qt would never offer the event to this widget.
+        self.tree_view.setAcceptDrops(False)
+        self.tree_view.setDropIndicatorShown(False)
+
         # Apply header formatting
         header = self.tree_view.header()
+        assert header is not None
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
@@ -283,7 +290,7 @@ class BrowserView(QFrame):
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.open_context_menu)
 
-        self.layout.addWidget(self.tree_view)
+        self.main_layout.addWidget(self.tree_view)
 
         # Custom presets state
         self.current_preset = "Detailed"
@@ -369,22 +376,34 @@ class BrowserView(QFrame):
         self.path_changed.emit(path)
         self.select_folder.emit(path)  # Tells MainWindow to add to index_paths and index
 
+    @staticmethod
+    def _norm(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path)).replace("\\", "/")
+
     def get_folder_indexing_status(self, index) -> Optional[str]:
         """Calculates color state for index mapping indicator."""
-        path = self.file_model.filePath(index)
-        if not path or not os.path.isdir(path):
+        if not self.file_model.isDir(index):  # cached by the model; no syscall per repaint
             return None
+        path = self.file_model.filePath(index)
+        if not path:
+            return None
+        norm = self._norm(path)
 
-        # Excluded check
+        # Excluded check (blank patterns would otherwise match every path)
         for pat in config_manager.config.exclude_patterns:
-            if pat in path:
+            if pat and (pat in path or self._norm(pat) in norm):
                 return "excluded"
 
         # Fully indexed check
+        prefix = norm.rstrip("/") + "/"
         for ip in config_manager.config.index_paths:
-            if Path(path) == Path(ip) or Path(ip) in Path(path).parents:
+            if not ip:
+                continue
+            ip_norm = self._norm(ip)
+            ip_prefix = ip_norm.rstrip("/") + "/"
+            if norm == ip_norm or prefix.startswith(ip_prefix):
                 return "indexed"
-            if Path(path) in Path(ip).parents:
+            if ip_prefix.startswith(prefix):
                 return "partial"
 
         return None
@@ -411,7 +430,8 @@ class BrowserView(QFrame):
         """Show/hide columns dynamically based on presets."""
         self.current_preset = preset_name
         header = self.tree_view.header()
-        
+        assert header is not None
+
         if preset_name == "Minimal":
             header.setSectionHidden(1, True)
             header.setSectionHidden(2, True)
@@ -429,7 +449,7 @@ class BrowserView(QFrame):
         index = self.tree_view.indexAt(position)
         if not index.isValid():
             return
-            
+
         path = self.file_model.filePath(index)
         is_dir = os.path.isdir(path)
 
@@ -449,11 +469,11 @@ class BrowserView(QFrame):
             menu.addAction(exclude_act)
 
             menu.addSeparator()
-            
+
             stats_act = QAction("Show folder stats...", self)
             stats_act.triggered.connect(lambda: self.show_folder_stats(path))
             menu.addAction(stats_act)
-            
+
             menu.addSeparator()
 
         preset_menu = menu.addMenu("Column Preset")
@@ -474,47 +494,80 @@ class BrowserView(QFrame):
 
     def show_folder_stats(self, path: str):
         """Walk path to count sizes/types and display properties."""
-        p = Path(path)
         total_size = 0
         file_count = 0
-        extensions = []
-        
+        ext_counter: Counter = Counter()
+        cancelled = False
+
+        # The walk runs on the GUI thread, so keep the event loop alive and let the user
+        # cancel instead of freezing the window on huge trees.
+        progress = QProgressDialog("Scanning folder...", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Folder Statistics")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(400)
+
         try:
-            for root, dirs, files in os.walk(path):
+            for root, dirs, files in os.walk(path, onerror=lambda e: None):
                 for f in files:
                     file_count += 1
                     fp = os.path.join(root, f)
                     try:
                         total_size += os.path.getsize(fp)
-                        extensions.append(Path(fp).suffix.lower())
+                        ext_counter[os.path.splitext(f)[1].lower()] += 1
                     except OSError:
                         pass
+                    if file_count % 500 == 0:
+                        progress.setLabelText(f"Scanning folder... {file_count} files")
+                        QApplication.processEvents()
+                        if progress.wasCanceled():
+                            cancelled = True
+                            break
+                if cancelled:
+                    break
         except Exception as e:
+            progress.cancel()
             QMessageBox.critical(self, "Error", f"Could not read directory statistics: {e}")
             return
+        progress.cancel()
 
-        from collections import Counter
-        ext_count = Counter(extensions).most_common(5)
-        ext_str = ", ".join([f"{ext} ({cnt})" for ext, cnt in ext_count])
+        ext_count = ext_counter.most_common(5)
+        ext_str = ", ".join([f"{ext or '(none)'} ({cnt})" for ext, cnt in ext_count])
 
         from ..utils.file_utils import format_size
         QMessageBox.information(
             self, "Folder Statistics",
             f"Path: {path}\n"
-            f"Total Files: {file_count}\n"
+            f"Total Files: {file_count}{' (scan cancelled, partial)' if cancelled else ''}\n"
             f"Total Size: {format_size(total_size)}\n"
             f"Top Extensions: {ext_str or 'None'}"
         )
 
     # --- DRAG AND DROP ---
 
+    @staticmethod
+    def _dropped_folders(event) -> List[str]:
+        mime = event.mimeData()
+        if mime is None or not mime.hasUrls():
+            return []
+        paths = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
+        return [p for p in paths if p and os.path.isdir(p)]
+
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
+        if self._dropped_folders(event):
             event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._dropped_folders(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dropEvent(self, event):
-        urls = event.mimeData().urls()
-        folders = [u.toLocalFile() for u in urls if os.path.isdir(u.toLocalFile())]
+        folders = [os.path.normpath(p) for p in self._dropped_folders(event)]
         if folders:
             self.folders_dropped.emit(folders)
             event.acceptProposedAction()
+        else:
+            event.ignore()

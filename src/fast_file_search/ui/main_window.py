@@ -10,12 +10,12 @@ from typing import List, Optional
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QStatusBar, QProgressBar, QLabel, QSystemTrayIcon, QMenu,
-    QMessageBox, QApplication
+    QMessageBox, QApplication, QLineEdit, QTextEdit, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QSize, QPoint
 from PyQt6.QtGui import QIcon, QAction, QKeySequence, QShortcut, QCursor, QGuiApplication
 
-from .widgets import CustomTitleBar, FilterPanel, PreviewPanel, SettingsDialog, AboutDialog
+from .widgets import CustomTitleBar, FilterPanel, PreviewPanel, SettingsDialog, AboutDialog, app_icon
 from .search_view import SearchView, SearchResultItem
 from .browser_view import BrowserView
 from ..config import config_manager
@@ -23,53 +23,82 @@ from ..persistent_index import PersistentIndex
 from ..search import SearchEngine
 from ..search_history import SearchHistory
 from ..file_watcher import FileWatcher
-from ..indexer import IndexStats
+from ..indexer import IndexStats, Indexer
+from ..config import AppConfig
+from ..utils.file_utils import ExcludeMatcher
 
 
 class IndexerThread(QThread):
-    """QThread to perform full or incremental background indexing."""
-    progress = pyqtSignal(int, int)  # processed, total
-    finished = pyqtSignal(object)    # Emits IndexStats
+    """QThread that brings the persistent index up to date in the background.
+
+    By default it performs an *incremental* update (only new/changed/deleted
+    entries are touched, the on-disk index from previous runs is reused). Pass
+    ``force_rebuild=True`` to re-read every entry of the given roots.
+    """
+    progress = pyqtSignal(int, int)  # processed, total (total == 0: unknown)
+    done = pyqtSignal(object)        # Emits IndexStats
     error = pyqtSignal(str)
 
-    def __init__(self, index_paths: List[str], persistent_index: PersistentIndex, exclude_patterns: List[str]):
+    def __init__(
+        self,
+        index_paths: List[str],
+        persistent_index: PersistentIndex,
+        exclude_patterns: List[str],
+        force_rebuild: bool = False,
+        index_content: bool = False,
+    ):
         super().__init__()
-        self.index_paths = index_paths
+        self.index_paths = list(index_paths)
         self.persistent_index = persistent_index
-        self.exclude_patterns = exclude_patterns
-        self.indexer = None
+        self.exclude_patterns = list(exclude_patterns)
+        self.force_rebuild = force_rebuild
+
+        cfg = AppConfig()
+        cfg.index_paths = self.index_paths
+        cfg.exclude_patterns = self.exclude_patterns
+        cfg.index_content = index_content
+        # Created up front so stop() can never race with thread start-up.
+        self.indexer = Indexer(config=cfg, persistent_index=persistent_index)
+        self.indexer.on_progress(lambda p, t: self.progress.emit(p, t))
 
     def run(self):
         try:
-            from ..indexer import Indexer
-            from ..config import AppConfig
-            
-            cfg = AppConfig()
-            cfg.index_paths = self.index_paths
-            cfg.exclude_patterns = self.exclude_patterns
-
-            self.indexer = Indexer(config=cfg, persistent_index=self.persistent_index)
-            self.indexer.on_progress(lambda p, t: self.progress.emit(p, t))
-            
-            stats = None
-            # Process indexing sequentially for all folders in settings
+            combined = IndexStats()
+            succeeded = 0
+            failures: List[str] = []
             for path in self.index_paths:
-                if not self.indexer._is_running and stats is not None:
+                if self.indexer.stopped:
                     break
-                stats = self.indexer.incremental_update(path)
-
-            self.finished.emit(stats)
+                try:
+                    if self.force_rebuild:
+                        stats = self.indexer.index_path(path)
+                    else:
+                        stats = self.indexer.incremental_update(path)
+                    combined.merge(stats)
+                    succeeded += 1
+                except Exception as e:  # one bad/unplugged root must not stop the others
+                    failures.append(f"{path}: {e}")
+            if failures and succeeded == 0 and not self.indexer.stopped:
+                self.error.emit("; ".join(failures))
+            else:
+                combined.errors += len(failures)
+                self.done.emit(combined)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            # This thread is about to end: release its SQLite read connection.
+            try:
+                self.persistent_index.release_thread_connection()
+            except Exception:
+                pass
 
     def stop(self):
-        if self.indexer:
-            self.indexer.stop()
+        self.indexer.stop()
 
 
 class SearchWorker(QThread):
     """QThread to perform search operations off the main GUI thread."""
-    finished = pyqtSignal(object, str)  # SearchResponse, raw_query
+    results_ready = pyqtSignal(object, str)  # SearchResponse, raw_query
     error = pyqtSignal(str)
 
     def __init__(self, search_engine, raw_query: str, extended_query: str, filters: dict, max_results: int, index_paths: list):
@@ -83,27 +112,32 @@ class SearchWorker(QThread):
 
     def run(self):
         try:
-            import re
-            import os
+            try:
+                regex = re.compile(self.filters["regex"], re.IGNORECASE) if self.filters["regex"] else None
+            except re.error as exc:
+                self.error.emit(f"Invalid regular expression: {exc}")
+                return
+            excludes = ExcludeMatcher(self.filters["exclude_patterns"])
+
             # Persistent db search
             resp = self.search_engine.search_persistent(self.extended_query, page_size=self.max_results)
 
+            if getattr(resp, "error", None):
+                self.error.emit(str(resp.error))
+                return
+
             # If DB returned nothing, try live filesystem fallback
-            if resp.total_count == 0 and self.index_paths:
+            # (plain substring only, so skip it for regex/wildcard/operator queries)
+            plain = not any(c in self.extended_query for c in "*?:\"") and not self.extended_query.lower().startswith("re:")
+            if resp.total_count == 0 and self.index_paths and plain:
                 resp = self._filesystem_fallback_search(self.raw_query, self.max_results)
 
             # Post filter for date & regex
             filtered_results = []
             for r in resp.results:
-                if self.filters["regex"]:
-                    if not re.search(self.filters["regex"], r.path, re.IGNORECASE):
-                        continue
-                skip = False
-                for p in self.filters["exclude_patterns"]:
-                    if p in r.path:
-                        skip = True
-                        break
-                if skip:
+                if regex is not None and not regex.search(r.path):
+                    continue
+                if excludes and excludes.matches_path(r.path):
                     continue
                 if self.filters["date_range"]:
                     lo, hi = self.filters["date_range"]
@@ -115,9 +149,16 @@ class SearchWorker(QThread):
 
             resp.results = filtered_results
             resp.total_count = len(filtered_results)
-            self.finished.emit(resp, self.raw_query)
+            self.results_ready.emit(resp, self.raw_query)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            # This QThread is ending: don't leave its SQLite read connection open.
+            index = getattr(self.search_engine, "index", None)
+            if index is not None and hasattr(index, "release_thread_connection"):
+                index.release_thread_connection()
+
+    _FALLBACK_TIME_LIMIT = 5.0  # seconds; the live walk is only a best-effort fallback
 
     def _filesystem_fallback_search(self, query: str, max_results: int = 500):
         from ..search import SearchResponse, SearchResult
@@ -126,16 +167,16 @@ class SearchWorker(QThread):
         start = _time.time()
         query_lower = query.lower()
         results = []
+        excludes = ExcludeMatcher(self.filters["exclude_patterns"])
 
         for root_path in self.index_paths:
             if not os.path.isdir(root_path):
                 continue
             try:
                 for dirpath, dirnames, filenames in os.walk(root_path):
-                    dirnames[:] = [
-                        d for d in dirnames
-                        if not any(pat in d for pat in self.filters["exclude_patterns"])
-                    ]
+                    if self.isInterruptionRequested() or _time.time() - start > self._FALLBACK_TIME_LIMIT:
+                        break
+                    dirnames[:] = [d for d in dirnames if not excludes.matches_name(d)]
                     for name in filenames + dirnames:
                         if query_lower in name.lower():
                             full_path = os.path.join(dirpath, name)
@@ -178,8 +219,13 @@ class SearchWorker(QThread):
 
 class MainWindow(QMainWindow):
     """Main window shell managing panes, watchdogs, config, styles, and tray menus."""
+    # Emitted from the file-watcher's worker threads; Qt delivers them on the GUI thread.
+    watcher_event = pyqtSignal(str, str)
+    watcher_error = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
+        self._shutdown_done = False
 
         # Frameless window configuration
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowMinMaxButtonsHint)
@@ -198,7 +244,18 @@ class MainWindow(QMainWindow):
         self.file_watcher = FileWatcher(persistent_index=self.db_index, config=config_manager.config)
 
         self.indexer_thread: Optional[IndexerThread] = None
+        self._pending_index_jobs: List[tuple] = []
         self.search_worker: Optional[SearchWorker] = None
+        self._stale_search_workers: List[SearchWorker] = []
+
+        self.watcher_event.connect(self.on_file_watcher_change)
+        self.watcher_error.connect(self._on_watcher_error)
+        self.file_watcher.on_change(lambda t, p: self.watcher_event.emit(t, p))
+        self.file_watcher.on_error(lambda exc: self.watcher_error.emit(str(exc)))
+        app = QApplication.instance()
+        if app is not None:
+            # Also covers quitting via the tray menu, which bypasses closeEvent.
+            app.aboutToQuit.connect(self._shutdown)
 
 
         # Custom UI assembly
@@ -238,7 +295,7 @@ class MainWindow(QMainWindow):
         # --- RIGHT PANEL: Search results & Previewer ---
         self.right_splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        self.search_view = SearchView(history_mgr=self.search_history)
+        self.search_view = SearchView(history_mgr=self.search_history, persistent_index=self.db_index)
         self.search_view.search_triggered.connect(self.run_search)
         self.search_view.file_selected.connect(self.on_file_selected)
         self.right_splitter.addWidget(self.search_view)
@@ -500,53 +557,70 @@ class MainWindow(QMainWindow):
             self.startIndexing()
 
 
-    def startIndexing(self):
-        paths = config_manager.config.index_paths
+    def startIndexing(self, force: bool = False):
+        """Bring the index up to date. Normally incremental (reuses the index
+        stored on disk); ``force=True`` re-reads every entry of every folder."""
+        paths = list(config_manager.config.index_paths)
         if not paths:
             self.status_lbl.setText("No folders selected for indexing. Go to settings.")
             return
+        force = force is True  # ignore stray values passed by Qt signals
+        self._launch_indexer(paths, force, "Indexing folders (full rebuild)..." if force else "Indexing folders (updating saved index)...")
 
-        self.status_lbl.setText("Indexing folders...")
+    def startIndexingFolder(self, folder_path: str):
+        """Forces direct re-indexing of a single path."""
+        self._launch_indexer([folder_path], True, f"Indexing folder {folder_path}...")
+
+    def _launch_indexer(self, paths: List[str], force: bool, message: str):
+        if self.indexer_thread is not None and self.indexer_thread.isRunning():
+            job = (tuple(paths), force)
+            if job not in self._pending_index_jobs:
+                self._pending_index_jobs.append(job)
+            self.status_lbl.setText("Indexing already in progress; queued next run...")
+            return
+
+        self.status_lbl.setText(message)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # Pulse status indicator
 
-        self.indexer_thread = IndexerThread(
-            paths, 
-            self.db_index, 
-            config_manager.config.exclude_patterns
-        )
-        self.indexer_thread.progress.connect(self.on_indexer_progress)
-        self.indexer_thread.finished.connect(self.on_indexer_finished)
-        self.indexer_thread.error.connect(self.on_indexer_error)
-        self.indexer_thread.start()
-
-    def startIndexingFolder(self, folder_path: str):
-        """Forces direct indexing of a single path."""
-        self.status_lbl.setText(f"Indexing folder {folder_path}...")
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        
-        self.indexer_thread = IndexerThread(
-            [folder_path],
+        thread = IndexerThread(
+            paths,
             self.db_index,
-            config_manager.config.exclude_patterns
+            config_manager.config.exclude_patterns,
+            force_rebuild=force,
+            index_content=config_manager.config.index_content,
         )
-        self.indexer_thread.progress.connect(self.on_indexer_progress)
-        self.indexer_thread.finished.connect(self.on_indexer_finished)
-        self.indexer_thread.error.connect(self.on_indexer_error)
-        self.indexer_thread.start()
+        thread.progress.connect(self.on_indexer_progress)
+        thread.done.connect(self.on_indexer_finished)
+        thread.error.connect(self.on_indexer_error)
+        thread.finished.connect(self._on_indexer_thread_finished)  # QThread's own signal
+        self.indexer_thread = thread
+        thread.start()
+
+    def _on_indexer_thread_finished(self):
+        if self._shutdown_done or not self._pending_index_jobs:
+            return
+        paths, force = self._pending_index_jobs.pop(0)
+        self._launch_indexer(list(paths), force, "Indexing folders (updating saved index)...")
 
     @pyqtSlot(int, int)
     def on_indexer_progress(self, processed, total):
-        self.status_lbl.setText(f"Indexing... Processed {processed} of {total} items")
-        self.progress_bar.setRange(0, total)
-        self.progress_bar.setValue(processed)
+        if total > 0:
+            self.status_lbl.setText(f"Indexing... Processed {processed} of {total} items")
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(processed)
+        else:  # first scan: the total isn't known yet
+            self.status_lbl.setText(f"Indexing... {processed} items scanned")
+            self.progress_bar.setRange(0, 0)
 
     @pyqtSlot(object)
     def on_indexer_finished(self, stats: Optional[IndexStats]):
         self.progress_bar.setVisible(False)
         if stats:
-            self.status_lbl.setText(f"Index updated: {stats.total_files} files, {stats.total_folders} folders in {stats.duration:.2f}s")
+            self.status_lbl.setText(
+                f"Index up to date: {stats.total_files} files, {stats.total_folders} folders "
+                f"({stats.added} new, {stats.updated} changed, {stats.removed} removed) in {stats.duration:.2f}s"
+            )
         else:
             self.status_lbl.setText("Indexing complete.")
         
@@ -563,15 +637,7 @@ class MainWindow(QMainWindow):
     def update_extensions_dropdown(self):
         """Queries the indexer database to find top extensions and updates filters."""
         try:
-            # Query db for frequency extension stats
-            exts = []
-            conn = self.db_index._get_conn()
-            rows = conn.execute("SELECT extension, COUNT(*) as cnt FROM files WHERE is_folder=0 GROUP BY extension ORDER BY cnt DESC LIMIT 15").fetchall()
-            for r in rows:
-                if r["extension"]:
-                    exts.append(r["extension"])
-            
-            self.filter_panel.update_extensions(exts)
+            self.filter_panel.update_extensions(self.db_index.get_top_extensions(15))
         except Exception:
             pass
 
@@ -580,21 +646,22 @@ class MainWindow(QMainWindow):
     def start_file_watchers(self):
         try:
             self.file_watcher.stop()
-            # Watch folders configured in settings
-            for folder in config_manager.config.index_paths:
-                if os.path.exists(folder):
-                    self.file_watcher.watch(folder)
-            
-            self.file_watcher.on_change(self.on_file_watcher_change)
+            # Watch exactly the folders configured in settings (drops removed ones).
+            self.file_watcher.set_paths(config_manager.config.index_paths)
             self.file_watcher.start()
         except Exception as e:
             self.status_lbl.setText(f"Watcher error: {e}")
 
+    @pyqtSlot(str, str)
     def on_file_watcher_change(self, event_type: str, path: str):
-        """Triggered dynamically when filesystem changes are caught by Watchdog."""
-        self.status_lbl.setText(f"Index watcher: File {event_type} - {Path(path).name}")
+        """Triggered (on the GUI thread) when filesystem changes are caught by Watchdog."""
+        self.status_lbl.setText(f"Index watcher: File {event_type} - {Path(path.split(' -> ')[-1]).name}")
         # Redraw indicators
         self.browser_view.tree_view.viewport().update()
+
+    @pyqtSlot(str)
+    def _on_watcher_error(self, message: str):
+        self.status_lbl.setText(f"Watcher error: {message}")
 
     # --- SEARCH EXECUTION FLOW ---
 
@@ -625,10 +692,9 @@ class MainWindow(QMainWindow):
 
         self.status_lbl.setText("Searching...")
         
-        # Stop previous search thread if still running
-        if self.search_worker and self.search_worker.isRunning():
-            self.search_worker.terminate()
-            self.search_worker.wait()
+        # Supersede a still-running search: never terminate() a thread that may be
+        # inside SQLite; just ignore its result and let it finish on its own.
+        self._retire_search_worker()
 
         # Run search asynchronously in background QThread so GUI never freezes
         self.search_worker = SearchWorker(
@@ -639,9 +705,28 @@ class MainWindow(QMainWindow):
             config_manager.config.max_results,
             list(config_manager.config.index_paths)
         )
-        self.search_worker.finished.connect(self._on_search_completed)
+        self.search_worker.results_ready.connect(self._on_search_completed)
         self.search_worker.error.connect(self._on_search_failed)
         self.search_worker.start()
+
+    def _retire_search_worker(self):
+        worker = self.search_worker
+        self.search_worker = None
+        if worker is None:
+            return
+        for sig in (worker.results_ready, worker.error):
+            try:
+                sig.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        if worker.isRunning():
+            worker.requestInterruption()
+            self._stale_search_workers.append(worker)
+            worker.finished.connect(lambda w=worker: self._forget_search_worker(w))
+
+    def _forget_search_worker(self, worker):
+        if worker in self._stale_search_workers:
+            self._stale_search_workers.remove(worker)
 
     @pyqtSlot(object, str)
     def _on_search_completed(self, resp, raw_query: str):
@@ -702,14 +787,8 @@ class MainWindow(QMainWindow):
         self.tray_icon.setToolTip("Fast File Search Pro")
         
         # Set system icon
-        icon_path = None
-        for p in Path(__file__).parents:
-            if (p / "files.ico").exists():
-                icon_path = p / "files.ico"
-                break
-                
-        if icon_path:
-            icon = QIcon(str(icon_path))
+        icon = app_icon()
+        if not icon.isNull():
             self.tray_icon.setIcon(icon)
             self.setWindowIcon(icon)
             self.title_bar.icon_label.setPixmap(icon.pixmap(20, 20))
@@ -723,8 +802,8 @@ class MainWindow(QMainWindow):
         show_act.triggered.connect(self.showNormal)
         menu.addAction(show_act)
 
-        idx_act = QAction("Re-index all", self)
-        idx_act.triggered.connect(self.startIndexing)
+        idx_act = QAction("Rebuild index", self)
+        idx_act.triggered.connect(lambda _checked=False: self.startIndexing(force=True))
         menu.addAction(idx_act)
 
         settings_act = QAction("Settings...", self)
@@ -734,22 +813,51 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         
         exit_act = QAction("Exit", self)
-        exit_act.triggered.connect(QApplication.instance().quit)
+        exit_act.triggered.connect(self.close_and_quit)
         menu.addAction(exit_act)
 
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.show()
 
+    def close_and_quit(self):
+        self._shutdown()
+        QApplication.instance().quit()
+
+    def _shutdown(self):
+        """Stop every background activity and close the database. Idempotent."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        self._pending_index_jobs.clear()
+
+        # Stop producers first: watcher threads and the indexer write to the DB.
+        try:
+            self.file_watcher.stop()
+        except Exception:
+            pass
+        thread = self.indexer_thread
+        if thread is not None and thread.isRunning():
+            thread.stop()
+            if not thread.wait(15000):
+                thread.requestInterruption()
+        self._retire_search_worker()
+        for worker in list(self._stale_search_workers):
+            worker.wait(5000)
+        try:
+            self.tray_icon.hide()
+        except Exception:
+            pass
+        try:
+            self.search_history.close()
+        except Exception:
+            pass
+        try:
+            self.db_index.close()
+        except Exception:
+            pass
+
     def closeEvent(self, event):
-        # Graceful thread closures
-        if self.indexer_thread and self.indexer_thread.isRunning():
-            self.indexer_thread.stop()
-            self.indexer_thread.wait()
-            
-        self.file_watcher.stop()
-        self.search_history.close()
-        self.db_index.close()
-        
+        self._shutdown()
         event.accept()
 
     # --- SHORTCUTS & ACTIONS ---
@@ -790,7 +898,13 @@ class MainWindow(QMainWindow):
             return self.browser_view.file_model.filePath(idx)
         return None
 
+    def _text_input_focused(self) -> bool:
+        return isinstance(QApplication.focusWidget(), (QLineEdit, QTextEdit, QPlainTextEdit))
+
     def copy_selected_path(self):
+        # Leave normal text copy alone when a text field has focus.
+        if self._text_input_focused():
+            return
         path = self._get_active_path()
         if path:
             QGuiApplication.clipboard().setText(path)
@@ -809,6 +923,9 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def delete_selected_path(self):
+        # Only act when the results list itself has focus, never from a text field.
+        if QApplication.focusWidget() is not self.search_view.results_tree:
+            return
         items = self.search_view.results_tree.selectedItems()
         if items and isinstance(items[0], SearchResultItem):
             self.search_view.delete_file(items[0])

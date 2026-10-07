@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import mimetypes
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable
 
@@ -11,13 +13,62 @@ from PyQt6.QtWidgets import (
     QSlider, QDateEdit, QLineEdit, QFileDialog, QDialog, QTabWidget,
     QListWidget, QListWidgetItem, QGroupBox, QFormLayout, QSpinBox,
     QCheckBox, QTextEdit, QProgressBar, QMessageBox, QDoubleSpinBox,
-    QDialogButtonBox, QFrame, QGridLayout, QSizePolicy
+    QDialogButtonBox, QFrame, QGridLayout, QSizePolicy, QApplication
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QDate, QPoint, QSize, QThread, pyqtSlot
-from PyQt6.QtGui import QIcon, QColor, QFont, QTextCharFormat, QTextDocument, QSyntaxHighlighter, QPixmap
+from PyQt6.QtCore import Qt, pyqtSignal, QDate, QPoint, QSize, QThread, QTimer, pyqtSlot
+from PyQt6.QtGui import (
+    QIcon, QColor, QFont, QTextCharFormat, QTextDocument, QSyntaxHighlighter, QPixmap,
+    QImageReader,
+)
 
 from ..config import AppConfig, config_manager
 from ..utils.file_utils import format_size, get_file_metadata
+
+
+def find_resource(name: str) -> Optional[Path]:
+    """Locate a bundled data file (e.g. ``files.ico``) in source, wheel or Nuitka builds.
+
+    Looks next to the executable (Nuitka standalone/onefile data files), next to this
+    module and its parents (source checkout), the PyInstaller bundle dir and the CWD.
+    """
+    roots: List[Path] = []
+    compiled = globals().get("__compiled__")
+    containing = getattr(compiled, "containing_dir", None)
+    if containing:
+        roots.append(Path(str(containing)))
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+    try:
+        roots.extend(Path(__file__).resolve().parents)
+    except (NameError, OSError):
+        pass
+    for exe in (sys.executable, sys.argv[0] if sys.argv else ""):
+        if exe:
+            try:
+                roots.append(Path(exe).resolve().parent)
+            except OSError:
+                pass
+    roots.append(Path.cwd())
+
+    seen = set()
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        for candidate in (root / name, root / "assets" / name):
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
+    return None
+
+
+def app_icon() -> QIcon:
+    """The application icon, or an empty QIcon when the resource is not bundled."""
+    path = find_resource("files.ico")
+    return QIcon(str(path)) if path else QIcon()
 
 
 class CustomTitleBar(QWidget):
@@ -39,7 +90,9 @@ class CustomTitleBar(QWidget):
         self.icon_label = QLabel()
         self.icon_label.setFixedSize(20, 20)
         self.icon_label.setScaledContents(True)
-        # We will set a generic or actual icon later if available
+        icon = app_icon()
+        if not icon.isNull():
+            self.icon_label.setPixmap(icon.pixmap(20, 20))
 
         self.title_label = QLabel(title)
         self.title_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
@@ -166,6 +219,12 @@ class FilterPanel(QFrame):
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(10, 10, 10, 10)
         self.main_layout.setSpacing(12)
+
+        # Typing in the regex/exclude boxes must not fire a full search per keystroke.
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(300)
+        self._filter_timer.timeout.connect(self.filters_changed.emit)
 
         # Title / Collapse Header
         self.header_layout = QHBoxLayout()
@@ -371,16 +430,24 @@ class FilterPanel(QFrame):
 
     def update_extensions(self, extensions: List[str]):
         """Populate the file type dropdown dynamically."""
+        current = self.ext_combo.currentText()
         self.ext_combo.blockSignals(True)
         self.ext_combo.clear()
         self.ext_combo.addItem("All Types")
         for ext in extensions:
             if ext:
                 self.ext_combo.addItem(ext)
+        # Keep the user's selection across index refreshes.
+        if current and current != "All Types":
+            idx = self.ext_combo.findText(current)
+            if idx < 0:
+                self.ext_combo.addItem(current)
+                idx = self.ext_combo.count() - 1
+            self.ext_combo.setCurrentIndex(idx)
         self.ext_combo.blockSignals(False)
 
-    def _on_filter_changed(self):
-        self.filters_changed.emit()
+    def _on_filter_changed(self, *_args):
+        self._filter_timer.start()
 
     def _on_size_slider_changed(self, value):
         labels = {
@@ -400,15 +467,25 @@ class FilterPanel(QFrame):
         self._on_filter_changed()
 
     def reset_filters(self):
-        self.blockSignals(True)
+        # QObject.blockSignals() on the panel does not silence its children, so block each
+        # control; otherwise every child fires filters_changed and triggers its own search.
+        self._filter_timer.stop()
+        controls = (
+            self.ext_combo, self.size_slider, self.date_combo,
+            self.regex_input, self.exclude_input,
+        )
+        for c in controls:
+            c.blockSignals(True)
         self.ext_combo.setCurrentIndex(0)
         self.size_slider.setValue(0)
         self.size_lbl.setText("Any Size")
         self.date_combo.setCurrentIndex(0)
         self.custom_date_widget.setVisible(False)
         self.regex_input.clear()
+        self.regex_input.setStyleSheet("")
         self.exclude_input.clear()
-        self.blockSignals(False)
+        for c in controls:
+            c.blockSignals(False)
         self.filters_changed.emit()
 
     def get_filter_values(self) -> dict:
@@ -417,6 +494,18 @@ class FilterPanel(QFrame):
         size_idx = self.size_slider.value()
         date_preset = self.date_combo.currentText()
         regex_pattern = self.regex_input.text().strip()
+        if regex_pattern:
+            try:
+                re.compile(regex_pattern)
+                self.regex_input.setStyleSheet("")
+                self.regex_input.setToolTip("")
+            except re.error as exc:
+                # An invalid pattern must not abort the whole search; flag it and ignore it.
+                self.regex_input.setStyleSheet("QLineEdit { border: 1px solid #D32F2F; }")
+                self.regex_input.setToolTip(f"Invalid regular expression: {exc}")
+                regex_pattern = ""
+        else:
+            self.regex_input.setStyleSheet("")
         excludes = [p.strip() for p in self.exclude_input.text().split(",") if p.strip()]
 
         size_range: Optional[Tuple[Optional[int], Optional[int]]] = None
@@ -435,15 +524,15 @@ class FilterPanel(QFrame):
             size_range = (1024 * 1024 * 1024, None)
 
         date_range: Optional[Tuple[Optional[float], Optional[float]]] = None
-        now = QDate.currentDate()
-        import time
+        today = QDate.currentDate()
         t_now = time.time()
         one_day = 24 * 3600
+        midnight = float(today.startOfDay().toSecsSinceEpoch())
 
         if date_preset == "Today":
-            date_range = (t_now - one_day, t_now)
+            date_range = (midnight, t_now)
         elif date_preset == "Yesterday":
-            date_range = (t_now - 2 * one_day, t_now - one_day)
+            date_range = (float(today.addDays(-1).startOfDay().toSecsSinceEpoch()), midnight - 1)
         elif date_preset == "Past Week":
             date_range = (t_now - 7 * one_day, t_now)
         elif date_preset == "Past Month":
@@ -451,9 +540,13 @@ class FilterPanel(QFrame):
         elif date_preset == "Past Year":
             date_range = (t_now - 365 * one_day, t_now)
         elif date_preset == "Custom Range":
-            start_dt = self.start_date_edit.date().startOfDay().toSecsSinceEpoch()
-            end_dt = self.end_date_edit.date().endOfDay().toSecsSinceEpoch()
-            date_range = (start_dt, end_dt)
+            d1, d2 = self.start_date_edit.date(), self.end_date_edit.date()
+            if d1 > d2:
+                d1, d2 = d2, d1
+            date_range = (
+                float(d1.startOfDay().toSecsSinceEpoch()),
+                float(d2.endOfDay().toSecsSinceEpoch()),
+            )
 
         return {
             "extension": None if ext == "All Types" else ext,
@@ -469,18 +562,26 @@ class MatchHighlighter(QSyntaxHighlighter):
     def __init__(self, parent: QTextDocument, terms: List[str]):
         super().__init__(parent)
         self.rules: List[Tuple[re.Pattern, QTextCharFormat]] = []
-        fmt = QTextCharFormat()
-        fmt.setBackground(QColor("#FFE082"))  # Soft amber background
-        fmt.setForeground(QColor("#000000"))
-        fmt.setFontWeight(QFont.Weight.Bold)
+        self._fmt = QTextCharFormat()
+        self._fmt.setBackground(QColor("#FFE082"))  # Soft amber background
+        self._fmt.setForeground(QColor("#000000"))
+        self._fmt.setFontWeight(QFont.Weight.Bold)
+        self._build_rules(terms)
 
+    def _build_rules(self, terms: List[str]) -> None:
+        self.rules = []
         for term in terms:
             if len(term) >= 2:
-                # Compile regex for safety, ignore case
-                pat = re.compile(re.escape(term), re.IGNORECASE)
-                self.rules.append((pat, fmt))
+                # Escape wildcards/regex metacharacters; ignore case
+                self.rules.append((re.compile(re.escape(term), re.IGNORECASE), self._fmt))
 
-    def highlightBlock(self, text: str):
+    def set_terms(self, terms: List[str]) -> None:
+        self._build_rules(terms)
+        self.rehighlight()
+
+    def highlightBlock(self, text: Optional[str]) -> None:
+        if not text:
+            return
         for pat, fmt in self.rules:
             for match in pat.finditer(text):
                 start, end = match.span()
@@ -488,13 +589,39 @@ class MatchHighlighter(QSyntaxHighlighter):
 
 
 class PreviewLoaderThread(QThread):
-    """Background loader thread to read and preview files safely."""
+    """Background loader thread to read and preview files safely.
+
+    The thread is cancelled cooperatively (never ``terminate()``d): killing a thread that
+    holds the GIL or an open file handle can deadlock or crash the whole process.
+    """
     loaded = pyqtSignal(str, str, dict)  # path, content_preview, meta
+    hashes_ready = pyqtSignal(str, str, str)  # path, md5, sha256
     error = pyqtSignal(str)
+
+    MAX_HASH_SIZE = 512 * 1024 * 1024
 
     def __init__(self, path: str):
         super().__init__()
         self.path = path
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        self.requestInterruption()
+
+    def _is_cancelled(self) -> bool:
+        return self._cancelled or self.isInterruptionRequested()
+
+    @staticmethod
+    def _decode_preview(raw: bytes) -> Optional[str]:
+        """Decode the start of a file as text, or None when it looks binary."""
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return raw.decode("utf-16", errors="replace")
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        if b"\x00" in raw:
+            return None
+        return raw.decode("utf-8", errors="replace")
 
     def run(self):
         try:
@@ -503,35 +630,24 @@ class PreviewLoaderThread(QThread):
                 self.error.emit("File does not exist.")
                 return
 
-            meta = get_file_metadata(self.path)
-
-            # Compute MD5 + SHA256 in this background thread (never blocks GUI)
-            md5_hex = "N/A (directory)"
-            sha256_hex = "N/A (directory)"
-            if p.is_file() and p.stat().st_size <= 512 * 1024 * 1024:  # skip files > 512 MB
-                try:
-                    import hashlib
-                    h_md5 = hashlib.md5()
-                    h_sha256 = hashlib.sha256()
-                    with open(self.path, "rb") as f:
-                        for chunk in iter(lambda: f.read(65536), b""):
-                            h_md5.update(chunk)
-                            h_sha256.update(chunk)
-                    md5_hex = h_md5.hexdigest()
-                    sha256_hex = h_sha256.hexdigest()
-                except Exception as e:
-                    md5_hex = f"Error: {e}"
-                    sha256_hex = f"Error: {e}"
-            elif p.is_file():
-                md5_hex = sha256_hex = "File too large (>512 MB)"
-
-            meta["md5"] = md5_hex
-            meta["sha256"] = sha256_hex
+            meta = dict(get_file_metadata(self.path))
+            meta.setdefault("extension", p.suffix.lower())
+            meta["md5"] = "Calculating..." if p.is_file() else "N/A (directory)"
+            meta["sha256"] = meta["md5"]
 
             # Simple content preview loading
             mime, _ = mimetypes.guess_type(self.path)
             if p.is_dir():
-                content = f"Directory: {p.name}\nContains {len(list(p.glob('*')))} items."
+                try:
+                    n = 0
+                    for _ in p.iterdir():
+                        n += 1
+                        if n >= 100000:
+                            break
+                    count = f"{n}+" if n >= 100000 else str(n)
+                except OSError:
+                    count = "?"
+                content = f"Directory: {p.name}\nContains {count} items."
             elif mime and mime.startswith("image/"):
                 content = "IMAGE_FILE"
             elif mime and mime.startswith("video/"):
@@ -540,14 +656,46 @@ class PreviewLoaderThread(QThread):
                 content = "PDF_FILE"
             else:
                 try:
-                    with open(self.path, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read(4000)
+                    with open(self.path, "rb") as f:
+                        raw = f.read(8192)
+                    text = self._decode_preview(raw)
+                    content = text[:4000] if text is not None else "Binary file - no text preview."
                 except Exception:
                     content = "Binary or unreadable file."
 
+            if self._is_cancelled():
+                return
             self.loaded.emit(self.path, content, meta)
+
+            # Hashing can take a while on big files, so it is reported separately and
+            # never delays the preview itself.
+            if not p.is_file():
+                return
+            try:
+                size = p.stat().st_size
+            except OSError:
+                return
+            if size > self.MAX_HASH_SIZE:
+                note = "File too large (>512 MB)"
+                self.hashes_ready.emit(self.path, note, note)
+                return
+            try:
+                import hashlib
+                h_md5 = hashlib.md5(usedforsecurity=False)
+                h_sha256 = hashlib.sha256()
+                with open(self.path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        if self._is_cancelled():
+                            return
+                        h_md5.update(chunk)
+                        h_sha256.update(chunk)
+                self.hashes_ready.emit(self.path, h_md5.hexdigest(), h_sha256.hexdigest())
+            except Exception as e:
+                msg = f"Error: {e}"
+                self.hashes_ready.emit(self.path, msg, msg)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self._is_cancelled():
+                self.error.emit(str(e))
 
 
 class PreviewPanel(QFrame):
@@ -559,6 +707,8 @@ class PreviewPanel(QFrame):
 
         self.current_path = ""
         self.loader_thread: Optional[PreviewLoaderThread] = None
+        self._retired_threads: List[PreviewLoaderThread] = []
+        self.highlighter: Optional[MatchHighlighter] = None
         self.search_terms: List[str] = []
 
         layout = QVBoxLayout(self)
@@ -628,6 +778,11 @@ class PreviewPanel(QFrame):
         layout.addWidget(self.progress_bar)
 
         self.apply_theme(False)
+
+        # Never let Qt destroy a QThread that is still running at shutdown.
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.shutdown)
 
     def apply_theme(self, is_dark: bool):
         """Apply dark or light stylesheet to the preview panel."""
@@ -722,6 +877,35 @@ class PreviewPanel(QFrame):
 
     def set_search_terms(self, terms: List[str]):
         self.search_terms = terms
+        if self.highlighter is not None:
+            self.highlighter.set_terms(terms)
+
+    def _retire_loader(self) -> None:
+        """Cancel the running loader without blocking the GUI or killing the thread."""
+        t = self.loader_thread
+        self.loader_thread = None
+        if t is None:
+            return
+        for sig in (t.loaded, t.hashes_ready, t.error):
+            try:
+                sig.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        t.cancel()
+        if t.isRunning():
+            self._retired_threads.append(t)
+            t.finished.connect(lambda t=t: self._drop_retired(t))
+
+    def _drop_retired(self, t: PreviewLoaderThread) -> None:
+        if t in self._retired_threads:
+            self._retired_threads.remove(t)
+        t.deleteLater()
+
+    def shutdown(self) -> None:
+        """Stop all background loaders and wait for them (call before the app exits)."""
+        self._retire_loader()
+        for t in list(self._retired_threads):
+            t.wait(3000)
 
     def load_file(self, path: str):
         if not path or path == self.current_path:
@@ -735,15 +919,42 @@ class PreviewPanel(QFrame):
         self.image_preview.setVisible(False)
         self.text_preview.setVisible(True)
 
-        if self.loader_thread and self.loader_thread.isRunning():
-            self.loader_thread.terminate()
+        self._retire_loader()
 
         self.progress_bar.setVisible(True)
-        
+
         self.loader_thread = PreviewLoaderThread(path)
         self.loader_thread.loaded.connect(self._on_preview_loaded)
+        self.loader_thread.hashes_ready.connect(self._on_hashes_ready)
         self.loader_thread.error.connect(self._on_preview_error)
         self.loader_thread.start()
+
+    @staticmethod
+    def _format_ts(meta: dict, *keys: str) -> str:
+        import datetime
+        for key in keys:
+            value = meta.get(key)
+            if value:
+                try:
+                    return datetime.datetime.fromtimestamp(float(value)).strftime('%Y-%m-%d %H:%M:%S')
+                except (OverflowError, OSError, ValueError, TypeError):
+                    break
+        return "Unknown"
+
+    def _load_image(self, path: str) -> None:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        area = self.preview_tab.size()
+        target = QSize(max(area.width() - 10, 200), max(area.height() - 10, 200))
+        src = reader.size()
+        if src.isValid() and (src.width() > target.width() or src.height() > target.height()):
+            # Decode straight to the display size: avoids holding a huge bitmap in memory.
+            reader.setScaledSize(src.scaled(target, Qt.AspectRatioMode.KeepAspectRatio))
+        image = reader.read()
+        if image.isNull():
+            self.image_preview.setText("Failed to load image.")
+        else:
+            self.image_preview.setPixmap(QPixmap.fromImage(image))
 
     @pyqtSlot(str, str, dict)
     def _on_preview_loaded(self, path, content, meta):
@@ -752,45 +963,44 @@ class PreviewPanel(QFrame):
         self.progress_bar.setVisible(False)
 
         # Populate Metadata fields
-        self.meta_labels["Path"].setText(meta.get("path", ""))
-        self.meta_labels["Size"].setText(format_size(meta.get("size", 0)))
-        
-        import datetime
-        try:
-            m_time = datetime.datetime.fromtimestamp(meta.get("modified", 0)).strftime('%Y-%m-%d %H:%M:%S')
-            c_time = datetime.datetime.fromtimestamp(meta.get("created", 0)).strftime('%Y-%m-%d %H:%M:%S')
-        except Exception:
-            m_time = c_time = "Unknown"
-
-        self.meta_labels["Created"].setText(c_time)
-        self.meta_labels["Modified"].setText(m_time)
-        self.meta_labels["MD5 Hash"].setText(meta.get("md5", "—"))
-        self.meta_labels["SHA256 Hash"].setText(meta.get("sha256", "—"))
+        self.meta_labels["Path"].setText(str(meta.get("path", path)))
+        self.meta_labels["Size"].setText(format_size(int(meta.get("size", 0) or 0)))
+        self.meta_labels["Created"].setText(self._format_ts(meta, "created", "ctime"))
+        self.meta_labels["Modified"].setText(self._format_ts(meta, "modified", "mtime"))
+        self.meta_labels["MD5 Hash"].setText(str(meta.get("md5", "—")))
+        self.meta_labels["SHA256 Hash"].setText(str(meta.get("sha256", "—")))
 
         # Render Content Preview
         if content == "IMAGE_FILE":
             self.text_preview.setVisible(False)
             self.image_preview.setVisible(True)
-            pixmap = QPixmap(path)
-            if not pixmap.isNull():
-                scaled = pixmap.scaled(self.image_preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                self.image_preview.setPixmap(scaled)
-            else:
-                self.image_preview.setText("Failed to load image.")
+            self._load_image(path)
         elif content == "VIDEO_FILE":
-            self.text_preview.setText(f"Video File: {Path(path).name}\nType: {meta.get('extension', '')}\nDimensions & duration playback require media extensions.")
+            self.text_preview.setPlainText(f"Video File: {Path(path).name}\nType: {meta.get('extension', '')}\nDimensions & duration playback require media extensions.")
         elif content == "PDF_FILE":
-            self.text_preview.setText(f"PDF Document: {Path(path).name}\nOpen the file with custom tools to read document content.")
+            self.text_preview.setPlainText(f"PDF Document: {Path(path).name}\nOpen the file with custom tools to read document content.")
         else:
-            self.text_preview.setText(content)
-            # Apply highlighting rules
+            # Plain text on purpose: setText() would render .html/.md sources as rich text.
+            self.text_preview.setPlainText(content)
             if self.search_terms:
-                self.highlighter = MatchHighlighter(self.text_preview.document(), self.search_terms)
+                if self.highlighter is None:
+                    self.highlighter = MatchHighlighter(self.text_preview.document(), self.search_terms)
+                else:
+                    self.highlighter.set_terms(self.search_terms)
+
+    @pyqtSlot(str, str, str)
+    def _on_hashes_ready(self, path, md5_hex, sha256_hex):
+        if path != self.current_path:
+            return
+        self.meta_labels["MD5 Hash"].setText(md5_hex)
+        self.meta_labels["SHA256 Hash"].setText(sha256_hex)
 
     @pyqtSlot(str)
     def _on_preview_error(self, err_msg):
         self.progress_bar.setVisible(False)
-        self.text_preview.setText(f"Error loading preview: {err_msg}")
+        self.text_preview.setPlainText(f"Error loading preview: {err_msg}")
+        # Allow re-selecting the same file to retry.
+        self.current_path = ""
 
 
 class SettingsDialog(QDialog):
@@ -898,9 +1108,12 @@ class SettingsDialog(QDialog):
     def add_indexed_path(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder to Index")
         if folder:
-            # Check for duplicate
+            # Qt returns forward slashes on Windows; store native paths and compare
+            # case/separator-insensitively so the same folder is never listed twice.
+            folder = os.path.normpath(folder)
+            key = os.path.normcase(folder)
             for i in range(self.paths_list.count()):
-                if self.paths_list.item(i).text() == folder:
+                if os.path.normcase(os.path.normpath(self.paths_list.item(i).text())) == key:
                     return
             self.paths_list.addItem(folder)
 
@@ -1019,7 +1232,7 @@ class ExportDialog(QDialog):
         if path:
             import csv
             try:
-                with open(path, "w", newline="", encoding="utf-8") as f:
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
                     writer = csv.writer(f)
                     writer.writerow(["Name", "Extension", "Size", "Modified", "Path", "Score"])
                     for item in self.results_data:
