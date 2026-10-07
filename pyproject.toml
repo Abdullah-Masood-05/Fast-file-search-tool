@@ -1,6 +1,6 @@
 [project]
 name = "fast-file-search-pro"
-version = "1.0.0"
+version = "1.2.0"
 description = "Fast File Search Pro - High-performance file search with PyQt6 GUI"
 readme = "README.md"
 requires-python = ">=3.10"
