@@ -1,26 +1,38 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import sys
+import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from .config import AppConfig
-from .persistent_index import PersistentIndex
-from .utils.file_utils import FileHash, format_size, is_binary_file
+from .persistent_index import PersistentIndex, MAX_STORED_CONTENT_CHARS
+from .utils.file_utils import ExcludeMatcher, build_file_info, is_binary_file
 
+# Well-known OS folders that are never worth indexing (matched as exact names).
 _SYSTEM_FOLDERS: Set[str] = {
     "$Recycle.Bin", "System Volume Information", "Windows",
     "WinSxS", "Program Files", "Program Files (x86)",
     ".Trash", ".Trashes", ".TemporaryItems",
-    "tmp", "var", "sys", "proc", "dev",
 }
+# Pseudo filesystems: only skipped directly below the filesystem root on
+# POSIX ("/proc", "/sys", "/dev"), never on Windows or deeper in the tree.
+_POSIX_PSEUDO_ROOT_DIRS: Set[str] = {"proc", "sys", "dev"}
+
+_IS_WINDOWS = sys.platform == "win32"
+_SYSTEM_FOLDERS_FOLDED = {n.casefold() for n in _SYSTEM_FOLDERS}
 
 _MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10 MB
+_WRITE_BATCH = 2000
+_CONTENT_CHUNK = 128
+_PROGRESS_INTERVAL = 0.1  # seconds
 
 
 @dataclass
@@ -33,14 +45,37 @@ class IndexStats:
     extension_dist: Counter = field(default_factory=Counter)
     start_time: float = 0.0
     duration: float = 0.0
+    # Incremental-update details (all entries seen are counted in total_*).
+    added: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    removed: int = 0
+    errors: int = 0
+    cancelled: bool = False
 
     @property
     def avg_file_size(self) -> float:
         count = self.total_files
         return self.total_size / max(1, count)
 
+    def merge(self, other: "IndexStats") -> None:
+        for name in ("total_files", "total_folders", "total_size", "content_indexed",
+                     "content_skipped", "added", "updated", "unchanged", "removed",
+                     "errors", "duration"):
+            setattr(self, name, getattr(self, name) + getattr(other, name))
+        self.extension_dist.update(other.extension_dist)
+        self.cancelled = self.cancelled or other.cancelled
+
 
 class Indexer:
+    """Walks folders and keeps a :class:`PersistentIndex` in sync with the disk.
+
+    ``incremental_update`` (the normal path, also used at startup) only touches
+    entries whose size/mtime differ from what is stored in the database, so a
+    restart reuses the on-disk index. ``index_path`` forces a full re-read of a
+    root. Neither ever clears other roots' entries.
+    """
+
     def __init__(
         self,
         config: Optional[AppConfig] = None,
@@ -49,11 +84,16 @@ class Indexer:
         self.config = config or AppConfig()
         self.persistent_index = persistent_index or PersistentIndex()
         self._stats = IndexStats()
-        self._file_hashes: Dict[str, FileHash] = {}
         self._exclude_patterns: List[str] = list(self.config.exclude_patterns)
+        self._excludes = ExcludeMatcher(self._exclude_patterns)
+        self.index_content: bool = bool(getattr(self.config, "index_content", False))
         self._progress_callback: Optional[Callable[[int, int], None]] = None
         self._done_callback: Optional[Callable[[IndexStats], None]] = None
-        self._is_running = False
+        self._stop_event = threading.Event()
+        self._running = False
+        self._last_progress = 0.0
+
+    # ------------------------------------------------------------------ control
 
     def on_progress(self, cb: Callable[[int, int], None]) -> None:
         self._progress_callback = cb
@@ -62,23 +102,49 @@ class Indexer:
         self._done_callback = cb
 
     def stop(self) -> None:
-        self._is_running = False
+        """Request cancellation. Sticky until :meth:`reset` is called, so a stop
+        that races with the start of a scan is never lost."""
+        self._stop_event.set()
+
+    def reset(self) -> None:
+        self._stop_event.clear()
+
+    @property
+    def _is_running(self) -> bool:
+        return self._running and not self._stop_event.is_set()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+    # ------------------------------------------------------------------ filtering
+
+    def _name_skipped(self, name: str, parent: str) -> bool:
+        if name.casefold() in _SYSTEM_FOLDERS_FOLDED:
+            return True
+        if not _IS_WINDOWS and name in _POSIX_PSEUDO_ROOT_DIRS and parent == "/":
+            return True
+        return self._excludes.matches_name(name)
 
     def _should_skip(self, path: Path) -> bool:
-        name = path.name
-        if name in _SYSTEM_FOLDERS:
+        """True if ``path`` itself (by name) or any of its path components is
+        excluded. Matching is by whole path component, never by substring."""
+        if self.persistent_index.is_own_file(path):
             return True
-        for pattern in self._exclude_patterns:
-            if pattern in path.parts:
-                return True
-            if pattern in str(path):
-                return True
-        return False
+        parent = str(path.parent)
+        if self._name_skipped(path.name, parent):
+            return True
+        return self._excludes.matches_path(path)
+
+    # ------------------------------------------------------------------ content
 
     def _extract_content_text(self, path: Path) -> Optional[str]:
-        if not path.is_file():
+        try:
+            if not path.is_file():
+                return None
+            size = path.stat().st_size
+        except OSError:
             return None
-        size = path.stat().st_size
         if size > _MAX_CONTENT_SIZE:
             return None
         ext = path.suffix.lower()
@@ -187,33 +253,6 @@ class Indexer:
         except ImportError:
             return None
 
-    def _index_file(self, path: Path, parent_path: str) -> dict:
-        st = path.stat()
-        name = path.name
-        ext = path.suffix.lower()
-        is_dir = path.is_dir()
-        content_hash = None
-        content_text = None
-
-        if not is_dir and not is_binary_file(path):
-            text = self._extract_content_text(path)
-            if text is not None:
-                content_text = text
-                content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-        return {
-            "path": str(path),
-            "name": name,
-            "extension": ext or ("Folder" if is_dir else "File"),
-            "size": st.st_size,
-            "modified": int(st.st_mtime),
-            "created": int(st.st_ctime),
-            "is_folder": is_dir,
-            "parent_path": parent_path,
-            "content_hash": content_hash,
-            "content_text": content_text,
-        }
-
     def _detect_language(self, path: Path) -> Optional[str]:
         ext_map = {
             ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
@@ -225,188 +264,261 @@ class Indexer:
         }
         return ext_map.get(path.suffix.lower())
 
-    def index_path(self, path: str) -> IndexStats:
-        self._is_running = True
-        self._stats = IndexStats(start_time=time.time())
+    # ------------------------------------------------------------------ per-entry work
+
+    def _index_file(
+        self,
+        path: Path,
+        parent_path: str,
+        st: Optional[os.stat_result] = None,
+        is_dir: Optional[bool] = None,
+    ) -> dict:
+        """Build the DB record for one entry. Content is only read when
+        ``index_content`` is enabled (and is capped when stored)."""
+        if st is None:
+            st = path.stat()
+        if is_dir is None:
+            is_dir = path.is_dir()
+        info = build_file_info(path, st, is_dir)
+        info["parent_path"] = parent_path
+        info["content_hash"] = None
+        info["content_text"] = None
+        if self.index_content and not is_dir and not self.stopped and not is_binary_file(path):
+            text = self._extract_content_text(path)
+            if text is not None:
+                info["content_hash"] = hashlib.sha256(
+                    text.encode("utf-8", errors="replace")
+                ).hexdigest()
+                info["content_text"] = text[:MAX_STORED_CONTENT_CHARS]
+        return info
+
+    # ------------------------------------------------------------------ walking
+
+    def _walk(
+        self, root: str, failed_dirs: List[str]
+    ) -> Iterator[Tuple[str, bool, Optional[os.stat_result]]]:
+        """Yield ``(path, is_dir, stat_or_None)`` for every non-excluded entry
+        below ``root`` without following symlinks/junctions.
+
+        An unreadable directory is recorded in ``failed_dirs`` and skipped; it
+        never aborts the rest of the walk. ``stat_or_None`` is None when the
+        entry exists but could not be stat'ed.
+        """
+        stack = [root]
+        has_junction = hasattr(os.DirEntry, "is_junction")
+        while stack:
+            if self.stopped:
+                return
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    entries = list(it)
+            except OSError:
+                failed_dirs.append(current)
+                self._stats.errors += 1
+                continue
+            for entry in entries:
+                if self.stopped:
+                    return
+                name = entry.name
+                if self._name_skipped(name, current):
+                    continue
+                path = entry.path
+                if self.persistent_index.is_own_file(path):
+                    continue
+                if self._excludes.sequences and self._excludes.matches_path(path):
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    st = entry.stat(follow_symlinks=False)
+                    descend = is_dir
+                    if descend and has_junction and entry.is_junction():
+                        descend = False  # directory junction: avoid loops
+                except OSError:
+                    self._stats.errors += 1
+                    yield path, False, None
+                    continue
+                yield path, is_dir, st
+                if descend:
+                    stack.append(path)
+
+    # ------------------------------------------------------------------ scanning
+
+    def _emit_progress(self, processed: int, total: int, force: bool = False) -> None:
+        cb = self._progress_callback
+        if cb is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_progress < _PROGRESS_INTERVAL:
+            return
+        self._last_progress = now
+        try:
+            cb(processed, max(total, processed) if total else 0)
+        except Exception:
+            pass
+
+    def _build_infos(
+        self, batch: List[Tuple[str, bool, os.stat_result]], pool: Optional[ThreadPoolExecutor]
+    ) -> List[dict]:
+        def build(item):
+            path, is_dir, st = item
+            if self.stopped:
+                return None
+            try:
+                p = Path(path)
+                return self._index_file(p, str(p.parent), st, is_dir)
+            except Exception:
+                return None
+
+        if pool is not None and self.index_content:
+            results = list(pool.map(build, batch))
+        else:
+            results = [build(item) for item in batch]
+        return results
+
+    def _scan(self, path: str, force: bool) -> IndexStats:
         root = Path(path)
         if not root.exists():
             raise FileNotFoundError(f"Path not found: {path}")
+        root_str = str(root)
 
-        self.persistent_index.rebuild_index()
-        all_files: List[Path] = []
-        all_folders: List[Path] = []
-
+        self._stats = stats = IndexStats(start_time=time.time())
+        self._running = True
+        self._last_progress = 0.0
+        index = self.persistent_index
         try:
-            for entry in root.rglob("*"):
-                if not self._is_running:
-                    break
-                if self._should_skip(entry):
-                    continue
-                try:
-                    if entry.is_dir():
-                        all_folders.append(entry)
+            # What the database already knows about this root: path -> (size, mtime, is_folder).
+            # Entries are popped as the walk meets them; what is left was deleted on disk.
+            known: Dict[str, Tuple[int, int, bool]] = {
+                p: (size, mtime, is_folder)
+                for p, size, mtime, is_folder in index.iter_file_states(root_str)
+            }
+            total_estimate = len(known)
+            failed_dirs: List[str] = []
+            pending: List[Tuple[str, bool, os.stat_result]] = []
+            processed = 0
+
+            pool = (
+                ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4))
+                if self.index_content
+                else None
+            )
+
+            def flush() -> None:
+                if not pending:
+                    return
+                infos = [i for i in self._build_infos(pending, pool) if i is not None]
+                stats.errors += len(pending) - len(infos) if not self.stopped else 0
+                pending.clear()
+                if infos and not self.stopped:
+                    for info in infos:
+                        if info["content_text"] is not None:
+                            stats.content_indexed += 1
+                        else:
+                            stats.content_skipped += 1
+                    index.add_files_batch(infos)
+
+            try:
+                for entry_path, is_dir, st in self._walk(root_str, failed_dirs):
+                    old = known.pop(entry_path, None)
+                    processed += 1
+                    if st is None:
+                        # exists but unreadable: keep whatever we had
+                        self._emit_progress(processed, total_estimate)
+                        continue
+                    if is_dir:
+                        stats.total_folders += 1
                     else:
-                        all_files.append(entry)
-                except (PermissionError, OSError):
-                    continue
-        except (PermissionError, OSError):
-            pass
+                        stats.total_files += 1
+                        stats.total_size += st.st_size
+                        stats.extension_dist[
+                            Path(entry_path).suffix.lower() or "File"
+                        ] += 1
 
-        self._stats.total_folders = len(all_folders)
-        self._stats.total_files = len(all_files)
-        total = len(all_folders) + len(all_files)
-        processed = 0
-
-        folder_infos = []
-        for folder in all_folders:
-            info = self._index_file(folder, str(folder.parent))
-            folder_infos.append(info)
-            self._stats.total_size += info["size"]
-            processed += 1
-            if processed % 500 == 0 and self._progress_callback:
-                self._progress_callback(processed, total)
-
-        self.persistent_index.add_files_batch(folder_infos)
-
-        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
-            fut_map = {}
-            for file in all_files:
-                if not self._is_running:
-                    break
-                parent = str(file.parent)
-                fut = executor.submit(self._index_file, file, parent)
-                fut_map[fut] = file
-
-            for fut in as_completed(fut_map):
-                if not self._is_running:
-                    break
-                try:
-                    info = fut.result()
-                    ext = info["extension"]
-                    self._stats.extension_dist[ext] += 1
-                    self._stats.total_size += info["size"]
-                    if info["content_text"] is not None:
-                        self._stats.content_indexed += 1
+                    unchanged = (
+                        not force
+                        and old is not None
+                        and old[2] == is_dir
+                        and (is_dir or (old[0] == st.st_size and old[1] == int(st.st_mtime)))
+                    )
+                    if unchanged:
+                        stats.unchanged += 1
                     else:
-                        self._stats.content_skipped += 1
-                    self.persistent_index.add_file(info)
-                except Exception:
-                    self._stats.content_skipped += 1
-                processed += 1
-                if processed % 200 == 0 and self._progress_callback:
-                    self._progress_callback(processed, total)
+                        if old is None:
+                            stats.added += 1
+                        else:
+                            stats.updated += 1
+                        pending.append((entry_path, is_dir, st))
+                        limit = _CONTENT_CHUNK if self.index_content else _WRITE_BATCH
+                        if len(pending) >= limit:
+                            flush()
+                    self._emit_progress(processed, total_estimate)
+                flush()
+            finally:
+                if pool is not None:
+                    pool.shutdown(wait=True, cancel_futures=True)
 
-        self._stats.duration = time.time() - self._stats.start_time
-        self.persistent_index.update_metadata("last_updated", str(int(time.time())))
-        self.persistent_index.update_metadata(
-            "index_stats", str({
-                "total_files": self._stats.total_files,
-                "total_folders": self._stats.total_folders,
-                "total_size": self._stats.total_size,
-                "duration": self._stats.duration,
-            })
+            if self.stopped:
+                stats.cancelled = True
+            else:
+                # Anything still in `known` vanished from disk, unless it lives under
+                # a directory we could not read (then we simply don't know).
+                gone = [p for p in known if not self._under_any(p, failed_dirs)]
+                if gone:
+                    index.remove_files_batch(gone, include_descendants=False)
+                    index.cleanup_orphan_trigrams()
+                    stats.removed = len(gone)
+
+            stats.duration = time.time() - stats.start_time
+            if not stats.cancelled:
+                self._record_metadata(root_str, stats)
+            self._emit_progress(processed, total_estimate, force=True)
+        finally:
+            self._running = False
+
+        if self._done_callback:
+            try:
+                self._done_callback(stats)
+            except Exception:
+                pass
+        return stats
+
+    @staticmethod
+    def _under_any(path: str, dirs: List[str]) -> bool:
+        for d in dirs:
+            base = d.rstrip("/\\")
+            if path == d or path.startswith(base + "/") or path.startswith(base + "\\"):
+                return True
+        return False
+
+    def _record_metadata(self, root: str, stats: IndexStats) -> None:
+        index = self.persistent_index
+        index.update_metadata("last_updated", str(int(time.time())))
+        index.update_metadata(
+            "index_stats",
+            json.dumps({
+                "root": root,
+                "total_files": stats.total_files,
+                "total_folders": stats.total_folders,
+                "total_size": stats.total_size,
+                "added": stats.added,
+                "updated": stats.updated,
+                "removed": stats.removed,
+                "unchanged": stats.unchanged,
+                "errors": stats.errors,
+                "duration": stats.duration,
+            }),
         )
 
-        if self._done_callback:
-            self._done_callback(self._stats)
-
-        return self._stats
+    def index_path(self, path: str) -> IndexStats:
+        """Full (re)index of one root: every entry is re-read and rewritten and
+        stale entries under the root are removed. Other roots are untouched."""
+        return self._scan(path, force=True)
 
     def incremental_update(self, path: str) -> IndexStats:
-        self._is_running = True
-        self._stats = IndexStats(start_time=time.time())
-        root = Path(path)
-        if not root.exists():
-            raise FileNotFoundError(f"Path not found: {path}")
-
-        current_paths: Set[str] = set()
-        new_files: List[Path] = []
-
-        try:
-            for entry in root.rglob("*"):
-                if not self._is_running:
-                    break
-                if self._should_skip(entry):
-                    continue
-                try:
-                    current_paths.add(str(entry))
-                    if entry.is_file():
-                        new_files.append(entry)
-                except (PermissionError, OSError):
-                    continue
-        except (PermissionError, OSError):
-            pass
-
-        indexed_paths: Set[str] = set()
-        for info in self.persistent_index.iter_all_files():
-            indexed_paths.add(info["path"])
-
-        added = current_paths - indexed_paths
-        removed = indexed_paths - current_paths
-
-        if removed:
-            self.persistent_index.remove_files_batch(list(removed))
-
-        total = len(added)
-        processed = 0
-
-        batch = []
-        for p_str in added:
-            p = Path(p_str)
-            try:
-                parent = str(p.parent)
-                info = self._index_file(p, parent)
-                ext = info["extension"]
-                self._stats.extension_dist[ext] += 1
-                self._stats.total_size += info["size"]
-                if info["is_folder"]:
-                    self._stats.total_folders += 1
-                else:
-                    self._stats.total_files += 1
-                if info["content_text"] is not None:
-                    self._stats.content_indexed += 1
-                else:
-                    self._stats.content_skipped += 1
-                batch.append(info)
-                processed += 1
-                if len(batch) >= 100:
-                    self.persistent_index.add_files_batch(batch)
-                    batch.clear()
-                if processed % 200 == 0 and self._progress_callback:
-                    self._progress_callback(processed, total)
-            except Exception:
-                self._stats.content_skipped += 1
-                processed += 1
-
-        if batch:
-            self.persistent_index.add_files_batch(batch)
-
-        changed = 0
-        for info in self.persistent_index.iter_all_files():
-            if not self._is_running:
-                break
-            p = Path(info["path"])
-            if not p.exists():
-                continue
-            try:
-                new_hash = FileHash.from_path(p, sample=True)
-                old = self._file_hashes.get(info["path"])
-                if new_hash.changed(old) if old else False:
-                    parent = str(p.parent)
-                    new_info = self._index_file(p, parent)
-                    self.persistent_index.add_file(new_info)
-                    changed += 1
-                self._file_hashes[info["path"]] = new_hash
-            except Exception:
-                continue
-
-        self._stats.duration = time.time() - self._stats.start_time
-        self._stats.total_files = self._stats.total_files or len(new_files)
-
-        if self._done_callback:
-            self._done_callback(self._stats)
-
-        return self._stats
+        """Bring the stored index of one root up to date, touching only entries
+        that are new, changed (size/mtime differ from the DB) or deleted."""
+        return self._scan(path, force=False)
 
     @property
     def stats(self) -> IndexStats:

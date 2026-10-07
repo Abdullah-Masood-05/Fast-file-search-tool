@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,6 +124,89 @@ class FileHash:
         if self.digest and other.digest and self.digest != other.digest:
             return True
         return False
+
+
+_IS_CASE_INSENSITIVE = os.name == "nt" or sys.platform == "darwin"
+_GLOB_CHARS = set("*?[")
+
+
+def _fold(text: str) -> str:
+    return text.casefold() if _IS_CASE_INSENSITIVE else text
+
+
+class ExcludeMatcher:
+    """Match exclude patterns against path *components*, never raw substrings.
+
+    * ``".git"`` excludes any file/folder whose name is exactly ``.git``
+      (but not ``.github`` or ``my.git.notes``).
+    * Patterns containing ``* ? [`` are treated as ``fnmatch`` globs applied
+      to single names (``*.tmp``).
+    * Patterns containing a path separator (``build/output``) match a run of
+      consecutive components anywhere in the path.
+    """
+
+    def __init__(self, patterns: Optional[Iterable[str]] = None):
+        self.names: set = set()
+        self.globs: List[str] = []
+        self.sequences: List[tuple] = []
+        for raw in patterns or []:
+            if not isinstance(raw, str):
+                continue
+            pat = raw.strip()
+            if not pat:
+                continue
+            if "/" in pat or "\\" in pat:
+                parts = tuple(_fold(p) for p in pat.replace("\\", "/").split("/") if p)
+                if parts:
+                    self.sequences.append(parts)
+            elif _GLOB_CHARS & set(pat):
+                self.globs.append(_fold(pat))
+            else:
+                self.names.add(_fold(pat))
+
+    def __bool__(self) -> bool:
+        return bool(self.names or self.globs or self.sequences)
+
+    def matches_name(self, name: str) -> bool:
+        folded = _fold(name)
+        if folded in self.names:
+            return True
+        return any(fnmatch.fnmatchcase(folded, g) for g in self.globs)
+
+    def matches_path(self, path: str | Path) -> bool:
+        parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+        for part in parts:
+            if self.matches_name(part):
+                return True
+        if self.sequences:
+            folded = [_fold(p) for p in parts]
+            for seq in self.sequences:
+                n = len(seq)
+                for i in range(len(folded) - n + 1):
+                    if tuple(folded[i:i + n]) == seq:
+                        return True
+        return False
+
+
+def build_file_info(path: str | Path, st: Optional[os.stat_result] = None,
+                    is_dir: Optional[bool] = None) -> Dict[str, object]:
+    """Metadata dict in the shape expected by ``PersistentIndex.add_file``."""
+    p = Path(path)
+    if st is None:
+        st = p.stat()
+    if is_dir is None:
+        is_dir = p.is_dir()
+    ext = p.suffix.lower()
+    return {
+        "path": str(p),
+        "name": p.name,
+        "extension": ext or ("Folder" if is_dir else "File"),
+        "size": st.st_size,
+        "modified": int(st.st_mtime),
+        "created": int(st.st_ctime),
+        "is_folder": bool(is_dir),
+        "parent_path": str(p.parent),
+    }
 
 
 # Convenience helpers
