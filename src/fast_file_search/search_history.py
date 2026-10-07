@@ -22,17 +22,79 @@ class HistoryEntry:
     id: Optional[int] = None
 
 
+def _like_escape(text: str) -> str:
+    """Escape LIKE wildcards so user input is matched literally (use with ESCAPE '!')."""
+    return text.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
+
 class SearchHistory:
+    MAX_ENTRIES = 100
+
     def __init__(self, db_path: Optional[Path] = None):
         if db_path is None:
             db_path = get_cache_dir("Fast File Search Pro") / "search_history.db"
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = Path(db_path)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._create_tables()
+        self._conn = self._open_with_recovery()
+
+    @staticmethod
+    def _connect(target: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(target, check_same_thread=False)
+        try:
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA journal_mode=WAL;")
+            except sqlite3.OperationalError:
+                pass  # e.g. read-only media; the default journal mode still works
+        except BaseException:
+            conn.close()  # release the file handle (a corrupt file must be movable on Windows)
+            raise
+        return conn
+
+    def _try_open(self) -> sqlite3.Connection:
+        conn = self._connect(str(self.db_path))
+        try:
+            self._conn = conn
+            self._create_tables()
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    def _quarantine(self) -> None:
+        backup = self.db_path.with_name(self.db_path.name + ".corrupt")
+        try:
+            if backup.exists():
+                backup.unlink()
+            self.db_path.replace(backup)
+        except OSError:
+            try:
+                self.db_path.unlink()
+            except OSError:
+                pass
+        for suffix in ("-wal", "-shm"):
+            side = self.db_path.with_name(self.db_path.name + suffix)
+            try:
+                if side.exists():
+                    side.unlink()
+            except OSError:
+                pass
+
+    def _open_with_recovery(self) -> sqlite3.Connection:
+        """Open the history DB; move a corrupt file aside, or fall back to memory."""
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                return self._try_open()
+            except sqlite3.DatabaseError:
+                self._quarantine()
+                return self._try_open()
+        except (sqlite3.Error, OSError):
+            # History is non-essential: degrade to an in-memory store instead of crashing.
+            conn = self._connect(":memory:")
+            self._conn = conn
+            self._create_tables()
+            return conn
 
     def _create_tables(self) -> None:
         self._conn.execute(
@@ -78,32 +140,47 @@ class SearchHistory:
         )
         self._conn.commit()
 
+    def _read_all(self, sql: str, params: tuple = ()) -> list:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def _read_one(self, sql: str, params: tuple = ()):
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
+
     def add_search(self, query: str, result_count: int = 0) -> None:
+        query = (query or "").strip()
+        if not query:
+            return
         with self._lock:
             self._conn.execute(
                 "INSERT INTO search_history (query, timestamp, result_count) VALUES (?, ?, ?)",
                 (query, time.time(), result_count),
             )
-            self._prune(100)
+            self._prune(self.MAX_ENTRIES)
             self._conn.commit()
 
     def _prune(self, max_entries: int = 100) -> None:
-        count = self._conn.execute(
-            "SELECT COUNT(*) FROM search_history"
-        ).fetchone()[0]
-        if count > max_entries:
-            self._conn.execute(
-                """DELETE FROM search_history WHERE id IN (
-                    SELECT id FROM search_history ORDER BY timestamp ASC
-                    LIMIT ?
-                )""",
-                (count - max_entries,),
-            )
+        # ids only ever increase, so they give a stable newest-first order even when two
+        # searches share one timestamp (coarse clocks on Windows).
+        self._conn.execute(
+            """DELETE FROM search_history WHERE id NOT IN (
+                SELECT id FROM search_history ORDER BY id DESC LIMIT ?
+            )""",
+            (max(1, max_entries),),
+        )
 
     def recent(self, limit: int = 20) -> List[HistoryEntry]:
-        rows = self._conn.execute(
-            "SELECT * FROM search_history ORDER BY timestamp DESC LIMIT ?", (limit,)
-        ).fetchall()
+        """Most recent distinct queries; repeats collapse into their latest run."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT h.id, h.query, h.timestamp, h.result_count,
+                          EXISTS(SELECT 1 FROM pinned_searches p WHERE p.query = h.query) AS pinned
+                   FROM search_history h
+                   WHERE h.id IN (SELECT MAX(id) FROM search_history GROUP BY query)
+                   ORDER BY h.id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
         return [
             HistoryEntry(
                 id=r["id"],
@@ -136,16 +213,16 @@ class SearchHistory:
             self._conn.commit()
 
     def pinned_searches(self) -> List[str]:
-        rows = self._conn.execute(
+        rows = self._read_all(
             "SELECT query FROM pinned_searches ORDER BY created_at DESC"
-        ).fetchall()
+        )
         return [r["query"] for r in rows]
 
     def frequent_queries(self, limit: int = 10) -> List[tuple[str, int]]:
-        rows = self._conn.execute(
+        rows = self._read_all(
             "SELECT query, COUNT(*) as cnt FROM search_history GROUP BY query ORDER BY cnt DESC LIMIT ?",
             (limit,),
-        ).fetchall()
+        )
         return [(r["query"], r["cnt"]) for r in rows]
 
     def add_favorite(self, path: str) -> None:
@@ -164,15 +241,15 @@ class SearchHistory:
             self._conn.commit()
 
     def is_favorite(self, path: str) -> bool:
-        row = self._conn.execute(
+        row = self._read_one(
             "SELECT 1 FROM favorites WHERE path = ?", (path,)
-        ).fetchone()
+        )
         return row is not None
 
     def get_favorites(self) -> List[str]:
-        rows = self._conn.execute(
+        rows = self._read_all(
             "SELECT path FROM favorites ORDER BY created_at DESC"
-        ).fetchall()
+        )
         return [r["path"] for r in rows]
 
     def add_tag(self, path: str, tag: str) -> None:
@@ -191,9 +268,9 @@ class SearchHistory:
             self._conn.commit()
 
     def get_tags(self, path: str) -> List[str]:
-        rows = self._conn.execute(
+        rows = self._read_all(
             "SELECT tag FROM tags WHERE path = ? ORDER BY tag ASC", (path,)
-        ).fetchall()
+        )
         return [r["tag"] for r in rows]
 
     def set_note(self, path: str, note: str) -> None:
@@ -205,13 +282,17 @@ class SearchHistory:
             self._conn.commit()
 
     def get_note(self, path: str) -> str:
-        row = self._conn.execute(
+        row = self._read_one(
             "SELECT note FROM notes WHERE path = ?", (path,)
-        ).fetchone()
+        )
         return row["note"] if row else ""
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
 
 
 class Autocomplete:
@@ -223,13 +304,14 @@ class Autocomplete:
         p_clean = prefix.strip().lower()
         if not p_clean:
             return []
+        esc = _like_escape(p_clean)
 
         try:
             conn = self.index._get_conn()
             # 1. Prefix matches first
             rows = conn.execute(
-                "SELECT DISTINCT name FROM files WHERE LOWER(name) LIKE ? LIMIT ?",
-                (f"{p_clean}%", limit)
+                "SELECT DISTINCT name FROM files WHERE LOWER(name) LIKE ? ESCAPE '!' LIMIT ?",
+                (f"{esc}%", limit),
             ).fetchall()
             results = [r["name"] for r in rows]
 
@@ -237,8 +319,9 @@ class Autocomplete:
             if len(results) < limit:
                 needed = limit - len(results)
                 c_rows = conn.execute(
-                    "SELECT DISTINCT name FROM files WHERE LOWER(name) LIKE ? AND LOWER(name) NOT LIKE ? LIMIT ?",
-                    (f"%{p_clean}%", f"{p_clean}%", needed)
+                    "SELECT DISTINCT name FROM files WHERE LOWER(name) LIKE ? ESCAPE '!' "
+                    "AND LOWER(name) NOT LIKE ? ESCAPE '!' LIMIT ?",
+                    (f"%{esc}%", f"{esc}%", needed),
                 ).fetchall()
                 results.extend([r["name"] for r in c_rows])
 
@@ -246,30 +329,35 @@ class Autocomplete:
         except Exception:
             return []
 
-
     def context_suggest(self, prefix: str, current_path: str, limit: int = 10) -> List[str]:
-        if not prefix:
+        """Suggest names containing ``prefix``, preferring files under ``current_path``."""
+        p_clean = (prefix or "").strip().lower()
+        if not p_clean:
             return []
-        self._build_freq_cache()
-        prefix_lower = prefix.lower()
-        path_lower = current_path.lower() if current_path else ""
-        seen: Set[str] = set()
-        scored: List[tuple[str, int, bool]] = []
-
-        for f in self.index.iter_all_files():
-            name = f.get("name", "")
-            parent = f.get("parent_path", "")
-            if not name or name in seen:
-                continue
-            if not (name.lower().startswith(prefix_lower) or prefix_lower in name.lower()):
-                continue
-            is_context = path_lower and path_lower in parent.lower()
-            seen.add(name)
-            freq = self._freq_cache.get(name, 0)
-            scored.append((name, freq, is_context))
-
-        scored.sort(key=lambda x: (-x[2], -x[1], x[0]))
-        return [s[0] for s in scored[:limit]]
+        ctx = current_path.lower().replace(chr(92), "/") if current_path else ""
+        try:
+            conn = self.index._get_conn()
+            rows = conn.execute(
+                """SELECT name, COUNT(*) AS cnt,
+                          MAX(CASE WHEN ? != '' AND REPLACE(LOWER(parent_path), char(92), '/')
+                                        LIKE ? ESCAPE '!' THEN 1 ELSE 0 END) AS ctx
+                   FROM files WHERE LOWER(name) LIKE ? ESCAPE '!'
+                   GROUP BY name
+                   ORDER BY ctx DESC,
+                            CASE WHEN LOWER(name) LIKE ? ESCAPE '!' THEN 0 ELSE 1 END,
+                            cnt DESC, name
+                   LIMIT ?""",
+                (
+                    ctx,
+                    f"%{_like_escape(ctx)}%",
+                    f"%{_like_escape(p_clean)}%",
+                    f"{_like_escape(p_clean)}%",
+                    limit,
+                ),
+            ).fetchall()
+            return [r["name"] for r in rows]
+        except Exception:
+            return []
 
 
 class SearchRecommender:
@@ -284,27 +372,36 @@ class SearchRecommender:
         if now - self._last_build < self._cache_ttl and self._ext_cache:
             return
         ext_count: Counter = Counter()
-        for f in self.index.iter_all_files():
-            ext = f.get("extension", "")
-            if ext:
-                ext_count[ext] += 1
+        try:
+            rows = self.index._get_conn().execute(
+                "SELECT extension, COUNT(*) AS cnt FROM files "
+                "WHERE extension != '' GROUP BY extension ORDER BY cnt DESC LIMIT 20"
+            ).fetchall()
+            for r in rows:
+                ext_count[r["extension"]] = r["cnt"]
+        except Exception:
+            pass
         self._ext_cache = ext_count.most_common(20)
         self._last_build = now
+
+    def _sample_names(self, limit: int) -> List[str]:
+        """Distinct file names without dragging every column (e.g. content_text) into memory."""
+        try:
+            rows = self.index._get_conn().execute(
+                "SELECT DISTINCT name FROM files LIMIT ?", (limit,)
+            ).fetchall()
+            return [r["name"] for r in rows if r["name"]]
+        except Exception:
+            return []
 
     def did_you_mean(self, term: str, max_distance: int = 2) -> Optional[str]:
         if not term:
             return None
-        all_names: Set[str] = set()
-        for f in self.index.iter_all_files():
-            name = f.get("name", "")
-            if name:
-                all_names.add(name.lower())
-                if len(all_names) >= 3000:
-                    break
+        all_names: Set[str] = {n.lower() for n in self._sample_names(3000)}
 
         best: Optional[tuple[str, int]] = None
         term_lower = term.lower()
-        for name in all_names:
+        for name in sorted(all_names):
             d = Levenshtein.distance(term_lower, Path(name).stem)
             if 0 < d <= max_distance:
                 if best is None or d < best[1] or (d == best[1] and len(name) < len(best[0])):
@@ -321,14 +418,14 @@ class SearchRecommender:
             trigrams.add(term_lower[i : i + 3])
 
         shared: Dict[str, int] = defaultdict(int)
-        for f in self.index.iter_all_files():
-            name = f.get("name", "").lower()
+        for original in self._sample_names(20000):
+            name = original.lower()
             name_tri = set()
             for i in range(len(name) - 2):
                 name_tri.add(name[i : i + 3])
             overlap = len(trigrams & name_tri)
             if overlap > 0 and name != term_lower:
-                shared[f.get("name", "")] += overlap
+                shared[original] += overlap
 
         sorted_shared = sorted(shared.items(), key=lambda x: -x[1])
         return [s[0] for s in sorted_shared[:limit]]

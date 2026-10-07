@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import heapq
 import math
 import re
 import threading
 import time
 
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Pattern, Set, Tuple
 
 from .persistent_index import PersistentIndex
+
+# Upper bound on candidate rows pulled from the trigram index per search.
+_CANDIDATE_LIMIT = 20000
+
+_RANGE_FIELDS = ("size", "date", "modified", "created")
 
 
 @dataclass
@@ -58,73 +66,107 @@ class SearchResponse:
     total_pages: int = 0
     query_time_ms: float = 0.0
     did_you_mean: Optional[str] = None
+    error: Optional[str] = None
+
+
+def _glob_to_regex(pattern: str) -> str:
+    """Translate a ``*`` / ``?`` wildcard pattern into a regex source string."""
+    out = []
+    for ch in pattern:
+        if ch == "*":
+            out.append(".*")
+        elif ch == "?":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+    return "".join(out)
+
+
+@lru_cache(maxsize=512)
+def _compile_glob(pattern: str, case_sensitive: bool = False) -> Pattern[str]:
+    return re.compile(_glob_to_regex(pattern), 0 if case_sensitive else re.IGNORECASE)
+
+
+def _is_glob(term: str) -> bool:
+    return "*" in term or "?" in term
 
 
 class QueryParser:
-    _FIELD_PATTERN = re.compile(r'(name|path|ext|extension|size|date|modified|created):\s*(\S+)')
-    _RANGE_PATTERN = re.compile(r'(size|date|modified|created):\s*([<>=!]+)\s*(\S+)')
-    _RANGE_DOTDOT = re.compile(r'(size|date|modified|created):\s*(\S+?)\.\.(\S+)')
+    _FIELD_PATTERN = re.compile(
+        r'\b(name|path|ext|extension|size|date|modified|created):\s*(\S+)'
+    )
+    _FIELD_QUOTED = re.compile(r'\b(name|path|ext|extension):\s*"([^"]+)"')
+    _RANGE_PATTERN = re.compile(r'\b(size|date|modified|created):\s*([<>=!]+)\s*(\S+)')
+    _RANGE_DOTDOT = re.compile(r'\b(size|date|modified|created):\s*(\S*?)\.\.(\S*)')
     _QUOTED = re.compile(r'"([^"]+)"')
-    _BOOL_OPS = {"AND", "OR", "NOT", "&", "|", "!"}
+    _BOOL_WORDS = {"AND", "OR", "NOT"}
+    _BOOL_SYMBOLS = {"&": "AND", "|": "OR", "!": "NOT"}
+    _PREFIX_REGEX = re.compile(r'^(re|regex):', re.IGNORECASE)
+    _PREFIX_CASE = re.compile(r'^(cs|case):', re.IGNORECASE)
 
     @classmethod
     def parse(cls, raw: str) -> SearchQuery:
-        q = SearchQuery(raw=raw.strip())
+        q = SearchQuery(raw=(raw or "").strip())
         if not q.raw:
             return q
 
-        q.is_regex = q.raw.startswith("re:") or q.raw.startswith("regex:")
-        if q.is_regex:
-            q.raw = re.sub(r'^(re|regex):', '', q.raw).strip()
-            q.terms = [q.raw]
+        if cls._PREFIX_REGEX.match(q.raw):
+            q.is_regex = True
+            q.raw = cls._PREFIX_REGEX.sub("", q.raw, count=1).strip()
+            q.terms = [q.raw] if q.raw else []
             return q
 
-        q.case_sensitive = q.raw.startswith("cs:") or "case:" in q.raw[:6]
-        if q.case_sensitive:
-            q.raw = re.sub(r'^(cs|case):', '', q.raw).strip()
+        if cls._PREFIX_CASE.match(q.raw):
+            q.case_sensitive = True
+            q.raw = cls._PREFIX_CASE.sub("", q.raw, count=1).strip()
 
-        exact = cls._QUOTED.search(q.raw)
-        if exact:
-            q.exact_phrase = exact.group(1)
-            q.raw = cls._QUOTED.sub("", q.raw).strip()
+        # field:"value with spaces"
+        for m in cls._FIELD_QUOTED.finditer(q.raw):
+            fld, val = m.groups()
+            q.field_filters["extension" if fld == "ext" else fld] = val
+        q.raw = cls._FIELD_QUOTED.sub(" ", q.raw)
+
+        phrases = cls._QUOTED.findall(q.raw)
+        if phrases:
+            q.exact_phrase = phrases[0]
+            q.raw = cls._QUOTED.sub(" ", q.raw)
+        # Drop stray (unbalanced) quote characters so they do not poison terms.
+        q.raw = q.raw.replace('"', " ").strip()
 
         for m in cls._RANGE_DOTDOT.finditer(q.raw):
-            field, lo, hi = m.groups()
-            q.range_filters[field] = (lo, hi)
-            q.raw = q.raw.replace(m.group(0), "")
+            fld, lo, hi = m.groups()
+            q.range_filters[fld] = (lo or None, hi or None)
+        q.raw = cls._RANGE_DOTDOT.sub(" ", q.raw)
 
         for m in cls._RANGE_PATTERN.finditer(q.raw):
-            field, op, val = m.groups()
-            if op == ">":
-                q.range_filters[field] = (val, None)
-            elif op == "<":
-                q.range_filters[field] = (None, val)
-            elif op in (">=", ">="):
-                q.range_filters[field] = (val, None)
-            elif op in ("<=", "=<"):
-                q.range_filters[field] = (None, val)
-            elif op == "=":
-                q.field_filters[field] = val
-            elif op == "!":
-                q.field_filters[field] = f"!{val}"
-            q.raw = q.raw.replace(m.group(0), "")
+            fld, op, val = m.groups()
+            if op in (">", ">=", "=>"):
+                q.range_filters[fld] = (val, None)
+            elif op in ("<", "<=", "=<"):
+                q.range_filters[fld] = (None, val)
+            elif op in ("=", "=="):
+                q.range_filters[fld] = (val, val)
+            elif op in ("!", "!="):
+                q.field_filters[fld] = f"!{val}"
+        q.raw = cls._RANGE_PATTERN.sub(" ", q.raw)
 
         for m in cls._FIELD_PATTERN.finditer(q.raw):
-            field, val = m.groups()
-            if field == "ext":
-                field = "extension"
-            if val.startswith("!"):
-                q.field_filters[field] = val
+            fld, val = m.groups()
+            if fld == "ext":
+                fld = "extension"
+            if fld in _RANGE_FIELDS and not val.startswith("!"):
+                # "size:100" / "date:2024-01-05" mean equality.
+                q.range_filters[fld] = (val, val)
             else:
-                q.field_filters[field] = val
-            q.raw = q.raw.replace(m.group(0), "")
+                q.field_filters[fld] = val
+        q.raw = cls._FIELD_PATTERN.sub(" ", q.raw)
 
         tokens = q.raw.split()
         i = 0
         while i < len(tokens):
             t = tokens[i]
-            if t.upper() in cls._BOOL_OPS or t in cls._BOOL_OPS:
-                op = t.upper().replace("&", "AND").replace("|", "OR").replace("!", "NOT")
+            op = t if t in cls._BOOL_WORDS else cls._BOOL_SYMBOLS.get(t)
+            if op:
                 if i + 1 < len(tokens):
                     q.boolean_groups.append((op, tokens[i + 1]))
                     i += 2
@@ -132,6 +174,10 @@ class QueryParser:
             else:
                 q.terms.append(t)
             i += 1
+
+        # Additional quoted phrases are required substrings too.
+        for extra in phrases[1:]:
+            q.terms.append(extra)
 
         return q
 
@@ -155,13 +201,15 @@ class Levenshtein:
 
     @staticmethod
     def fuzzy_match(term: str, target: str, max_dist: int = 2) -> bool:
+        if abs(len(term) - len(target)) > max_dist:
+            return False
         return Levenshtein.distance(term.lower(), target.lower()) <= max_dist
 
 
 class LRUCache:
     def __init__(self, maxsize: int = 128):
         self._maxsize = maxsize
-        self._cache: OrderedDict = OrderedDict()
+        self._cache: OrderedDict[str, object] = OrderedDict()
         self._lock = threading.Lock()
 
     def get(self, key: str) -> Optional[object]:
@@ -175,7 +223,7 @@ class LRUCache:
         with self._lock:
             self._cache[key] = value
             self._cache.move_to_end(key)
-            if len(self._cache) > self._maxsize:
+            while len(self._cache) > self._maxsize:
                 self._cache.popitem(last=False)
 
     def invalidate(self) -> None:
@@ -186,6 +234,10 @@ class LRUCache:
         with self._lock:
             self._cache.pop(key, None)
 
+
+def _copy_response(resp: SearchResponse) -> SearchResponse:
+    """Shallow copy so callers can post-filter a response without corrupting the cache."""
+    return replace(resp, results=list(resp.results))
 
 
 class SearchEngine:
@@ -221,76 +273,124 @@ class SearchEngine:
         term_freq: int,
         now: float,
     ) -> float:
-        name = file.get("name", "")
+        name = file.get("name", "") or ""
         modified = file.get("modified", 0)
-        path = file.get("path", "")
+        path = file.get("path", "") or ""
+        name_lower = name.lower()
         score = 0.0
 
         if query.exact_phrase:
-            if query.exact_phrase.lower() in name.lower():
+            if query.exact_phrase.lower() in name_lower:
                 score += 10.0
-            if query.exact_phrase.lower() == name.lower():
+            if query.exact_phrase.lower() == name_lower:
                 score += 20.0
 
         for term in query.terms:
-            if query.case_sensitive:
+            if _is_glob(term):
+                matches = bool(_compile_glob(term, query.case_sensitive).search(name))
+            elif query.case_sensitive:
                 matches = term in name
             else:
-                matches = term.lower() in name.lower()
-            if matches:
+                matches = term.lower() in name_lower
+            if matches and not _is_glob(term):
                 score += self.compute_tfidf(term, name, total_files, term_freq) * 2.0
+            elif matches:
+                score += 1.0
 
-            if Levenshtein.fuzzy_match(term, name, self.typo_tolerance):
+            if not _is_glob(term) and Levenshtein.fuzzy_match(term, name, self.typo_tolerance):
                 score += 0.5
 
         path_depth = path.count("/") + path.count("\\")
         score += max(0, 5 - path_depth) * 0.3
 
-        age_hours = (now - modified) / 3600 if modified else 1e9
-        recent_bonus = max(0, 1.0 - math.log1p(age_hours) / 100.0)
+        # Files with a modification time in the future must not crash log1p.
+        age_hours = max(0.0, (now - modified) / 3600) if modified else 1e9
+        recent_bonus = max(0.0, 1.0 - math.log1p(age_hours) / 100.0)
         score += recent_bonus * 2.0
 
         if query.terms:
-            exact_matches = sum(1 for t in query.terms if t.lower() == name.lower())
+            plain = [t for t in query.terms if not _is_glob(t)]
+            exact_matches = sum(1 for t in plain if t.lower() == name_lower)
             score += exact_matches * 15.0
-            partial_matches = sum(
-                1 for t in query.terms if len(t) > 2 and t.lower() in name.lower()
-            )
+            partial_matches = sum(1 for t in plain if len(t) > 2 and t.lower() in name_lower)
             score += partial_matches * 3.0
 
-        return score
+        return float(score)
 
     def _matches_field_filter(self, file: dict, field: str, value: str) -> bool:
-        file_val = str(file.get(field, "")).lower()
         negate = value.startswith("!")
-        val = value.lstrip("!").lower()
+        val = (value[1:] if negate else value).strip().lower()
+        if not val:
+            return True
 
-        if field in ("name", "path", "extension"):
-            match = val in file_val or file_val == val
-            if "*" in val:
-                pat = ".*".join(re.escape(p) for p in val.split("*"))
-                match = bool(re.search(pat, file_val))
+        if field == "extension":
+            file_val = str(file.get("extension") or "").lower().lstrip(".")
+            alternatives = [v.strip().lstrip(".") for v in val.split(",") if v.strip()]
+            match = False
+            for alt in alternatives:
+                if _is_glob(alt):
+                    if _compile_glob(alt).fullmatch(file_val):
+                        match = True
+                        break
+                elif alt == file_val:
+                    match = True
+                    break
+            return not match if negate else match
+
+        if field in ("name", "path"):
+            file_val = str(file.get(field) or "").lower()
+            if field == "path":
+                # Accept either separator on every platform.
+                file_val = file_val.replace("\\", "/")
+                val = val.replace("\\", "/")
+            if _is_glob(val):
+                match = bool(_compile_glob(val).search(file_val))
+            else:
+                match = val in file_val
             return not match if negate else match
 
         return True
 
+    @staticmethod
+    def _parse_date(s: str, end: bool = False) -> Optional[float]:
+        """Parse YYYY, YYYY-MM or YYYY-MM-DD (also with '/' or '.') to a local timestamp."""
+        s = s.strip().replace("/", "-").replace(".", "-")
+        m = re.match(r"^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?$", s)
+        if not m:
+            return None
+        year, month, day = int(m.group(1)), m.group(2), m.group(3)
+        try:
+            if month is None:
+                start = datetime(year, 1, 1)
+                stop = datetime(year + 1, 1, 1)
+            elif day is None:
+                start = datetime(year, int(month), 1)
+                stop = datetime(year + (int(month) == 12), int(month) % 12 + 1, 1)
+            else:
+                start = datetime(year, int(month), int(day))
+                stop = start + timedelta(days=1)
+            return (stop - timedelta(microseconds=1)).timestamp() if end else start.timestamp()
+        except (ValueError, OverflowError, OSError):
+            return None
+
     def _matches_range(self, file: dict, field: str, lo: Optional[str], hi: Optional[str]) -> bool:
-        val = file.get(field)
-        if val is None:
+        key = "modified" if field == "date" else field
+        val = file.get(key)
+        if val is None or not isinstance(val, (int, float)):
             return False
-        if isinstance(val, (int, float)):
-            if lo is not None:
-                lo_val = self._parse_size(lo)
-                if lo_val is not None and val < lo_val:
-                    return False
-            if hi is not None:
-                hi_val = self._parse_size(hi)
-                if hi_val is not None and val > hi_val:
-                    return False
-            return True
-        if isinstance(val, str) and field in ("date", "modified", "created"):
-            return True
-        return False
+        lo_val: Optional[float]
+        hi_val: Optional[float]
+        if key == "size":
+            lo_val = self._parse_size(lo) if lo is not None else None
+            hi_val = self._parse_size(hi) if hi is not None else None
+        else:
+            lo_val = self._parse_date(lo) if lo is not None else None
+            hi_val = self._parse_date(hi, end=True) if hi is not None else None
+        if lo_val is not None and val < lo_val:
+            return False
+        if hi_val is not None and val > hi_val:
+            return False
+        return True
 
     def _parse_size(self, s: str) -> Optional[int]:
         s = s.strip().lower()
@@ -305,16 +405,49 @@ class SearchEngine:
         except ValueError:
             return None
 
-    def _apply_boolean(self, file: dict, query: SearchQuery) -> bool:
-        name_lower = file.get("name", "").lower()
+    @staticmethod
+    def _text_match(term: str, name: str, case_sensitive: bool) -> bool:
+        if _is_glob(term):
+            return bool(_compile_glob(term, case_sensitive).search(name))
+        if case_sensitive:
+            return term in name
+        return term.lower() in name.lower()
+
+    def _matches_text(self, name: str, query: SearchQuery) -> bool:
+        """Evaluate terms / phrase / AND / OR / NOT groups against a file name."""
+        cs = query.case_sensitive
+        required = list(query.terms)
+        if query.exact_phrase:
+            required.append(query.exact_phrase)
+        or_terms: List[str] = []
         for op, term in query.boolean_groups:
-            term_lower = term.lower()
-            match = term_lower in name_lower
-            if op == "NOT" and match:
-                return False
-            if op == "AND" and not match:
-                return False
-        return True
+            if op == "NOT":
+                if self._text_match(term, name, cs):
+                    return False
+            elif op == "AND":
+                required.append(term)
+            elif op == "OR":
+                or_terms.append(term)
+
+        required_ok = all(self._text_match(t, name, cs) for t in required)
+        if not or_terms:
+            return required_ok
+        or_ok = any(self._text_match(t, name, cs) for t in or_terms)
+        return (required_ok and bool(required)) or or_ok
+
+    def _apply_boolean(self, file: dict, query: SearchQuery) -> bool:
+        return self._matches_text(file.get("name", "") or "", query)
+
+    def _index_generation(self) -> Tuple[int, int]:
+        """Cheap fingerprint of the index so cached responses never outlive index changes."""
+        try:
+            conn = self.index._get_conn()
+            row = conn.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM files").fetchone()
+            if row:
+                return int(row[0]), int(row[1])
+        except Exception:
+            pass
+        return (0, 0)
 
     def search_persistent(
         self,
@@ -324,100 +457,118 @@ class SearchEngine:
         use_cache: bool = True,
     ) -> SearchResponse:
         start = time.time()
+        try:
+            page = max(1, int(page))
+            page_size = max(1, int(page_size))
+        except (TypeError, ValueError):
+            page, page_size = 1, 50
         resp = SearchResponse(page=page, page_size=page_size)
 
         query = QueryParser.parse(query_str)
-        if not query.raw and not query.exact_phrase and not query.field_filters:
+        if (
+            not query.raw
+            and not query.exact_phrase
+            and not query.field_filters
+            and not query.range_filters
+        ):
             resp.query_time_ms = (time.time() - start) * 1000
             return resp
 
-        cache_key = f"{query_str}:p{page}:ps{page_size}" if use_cache else ""
+        generation = self._index_generation()
+        total_files = generation[0]
+        cache_key = f"{query_str}\x00p{page}\x00ps{page_size}\x00g{generation}"
         if use_cache:
             cached = self.cache.get(cache_key)
-            if cached is not None:
-                resp = cached
+            if isinstance(cached, SearchResponse):
+                resp = _copy_response(cached)
+                resp.query_time_ms = (time.time() - start) * 1000
+                return resp
+
+        regex: Optional[Pattern[str]] = None
+        if query.is_regex:
+            if not query.terms:
+                resp.query_time_ms = (time.time() - start) * 1000
+                return resp
+            try:
+                regex = re.compile(query.terms[0], re.IGNORECASE)
+            except re.error as exc:
+                resp.error = f"Invalid regular expression: {exc}"
                 resp.query_time_ms = (time.time() - start) * 1000
                 return resp
 
         candidates = self._collect_candidates(query)
         now = time.time()
-        
-        try:
-            conn = self.index._get_conn()
-            row = conn.execute("SELECT COUNT(*) FROM files").fetchone()
-            total_files = row[0] if row else len(candidates)
-        except Exception:
-            total_files = len(candidates)
 
         term_freq_map: Dict[str, int] = defaultdict(int)
-        for f in candidates:
-            name_lower = f.get("name", "").lower()
-            for t in query.terms:
-                if t.lower() in name_lower:
-                    term_freq_map[t.lower()] += 1
+        if isinstance(candidates, list) and query.terms:
+            lowered = [t.lower() for t in query.terms if not _is_glob(t)]
+            for f in candidates:
+                name_lower = (f.get("name", "") or "").lower()
+                for t in lowered:
+                    if t in name_lower:
+                        term_freq_map[t] += 1
+        term_freq = max(term_freq_map.values(), default=0)
 
-
-        scored: List[SearchResult] = []
+        count = 0
         seen: Set[str] = set()
-        for f in candidates:
-            p = f.get("path", "")
-            if p in seen:
-                continue
-            seen.add(p)
 
-            if not self._apply_boolean(f, query):
-                continue
+        def matching() -> Iterator[SearchResult]:
+            nonlocal count
+            for f in candidates:
+                p = f.get("path", "")
+                if p in seen:
+                    continue
+                seen.add(p)
+                name = f.get("name", "") or ""
 
-            ok = True
-            for field, val in query.field_filters.items():
-                if not self._matches_field_filter(f, field, val):
-                    ok = False
-                    break
-            if not ok:
-                continue
+                if regex is not None:
+                    if not regex.search(name):
+                        continue
+                elif not self._matches_text(name, query):
+                    continue
 
-            for field, (lo, hi) in query.range_filters.items():
-                if not self._matches_range(f, field, lo, hi):
-                    ok = False
-                    break
-            if not ok:
-                continue
+                if any(
+                    not self._matches_field_filter(f, fld, val)
+                    for fld, val in query.field_filters.items()
+                ):
+                    continue
+                if any(
+                    not self._matches_range(f, fld, lo, hi)
+                    for fld, (lo, hi) in query.range_filters.items()
+                ):
+                    continue
 
-            term_freq = max(term_freq_map.get(t.lower(), 0) for t in query.terms) if query.terms else 0
-            score = self.rank_result(f, query, total_files, term_freq, now)
-
-            sr = SearchResult(
-                path=p,
-                name=f.get("name", ""),
-                extension=f.get("extension", ""),
-                size=f.get("size", 0),
-                modified=f.get("modified", 0),
-                is_folder=f.get("is_folder", False),
-                score=score,
-                matches=[t for t in query.terms if t.lower() in f.get("name", "").lower()],
-            )
-            scored.append(sr)
-
-        if query.exact_phrase:
-            scored = [r for r in scored if query.exact_phrase.lower() in r.name.lower()]
-
-        scored.sort(key=lambda r: (-r.score, r.name.lower()))
-        resp.total_count = len(scored)
-        resp.total_pages = max(1, math.ceil(resp.total_count / page_size))
+                score = self.rank_result(f, query, total_files, term_freq, now)
+                name_lower = name.lower()
+                count += 1
+                yield SearchResult(
+                    path=p,
+                    name=name,
+                    extension=f.get("extension", ""),
+                    size=f.get("size", 0),
+                    modified=f.get("modified", 0),
+                    is_folder=bool(f.get("is_folder", False)),
+                    score=score,
+                    matches=[t for t in query.terms if not _is_glob(t) and t.lower() in name_lower],
+                )
 
         start_idx = (page - 1) * page_size
         end_idx = start_idx + page_size
-        resp.results = scored[start_idx:end_idx]
+        # Only the requested window is kept in memory, however many files match.
+        top = heapq.nsmallest(end_idx, matching(), key=lambda r: (-r.score, r.name.lower()))
+        resp.results = top[start_idx:end_idx]
+        resp.total_count = count
+        resp.total_pages = max(1, math.ceil(count / page_size))
 
         resp.query_time_ms = (time.time() - start) * 1000
 
-        if resp.total_count == 0 and query.terms:
+        if count == 0 and query.terms and not query.is_regex:
             resp.did_you_mean = self._suggest_correction(query)
 
         if use_cache:
-            self.cache.put(cache_key, resp)
+            self.cache.put(cache_key, _copy_response(resp))
 
-        for cb in self._on_search_callbacks:
+        for cb in list(self._on_search_callbacks):
             try:
                 cb(query_str, resp.total_count)
             except Exception:
@@ -425,26 +576,60 @@ class SearchEngine:
 
         return resp
 
-    def _collect_candidates(self, query: SearchQuery) -> List[dict]:
-        terms = list(query.terms)
+    @staticmethod
+    def _literal_chunk(term: str) -> str:
+        """Longest wildcard-free fragment of a term (what the trigram index can look up)."""
+        chunks = [c.strip() for c in re.split(r"[*?]", term)]
+        return max(chunks, key=len) if chunks else ""
+
+    def _collect_candidates(self, query: SearchQuery) -> Iterable[dict]:
+        if query.is_regex:
+            return self.index.iter_all_files()
+
+        required = list(query.terms)
         if query.exact_phrase:
-            terms.append(query.exact_phrase)
-        if not terms:
-            return list(self.index.iter_all_files())
+            required.append(query.exact_phrase)
+        or_terms: List[str] = []
+        for op, term in query.boolean_groups:
+            if op == "AND":
+                required.append(term)
+            elif op == "OR":
+                or_terms.append(term)
+
+        lookups: List[str] = []
+        scan_all = False
+        # A file must satisfy every required term, so the most selective one is enough
+        # to produce the candidate set; _matches_text() verifies the rest.
+        if required:
+            best = max((self._literal_chunk(t) for t in required), key=len)
+            if best:
+                lookups.append(best)
+            elif not or_terms:
+                scan_all = True
+        for t in or_terms:
+            chunk = self._literal_chunk(t)
+            if chunk:
+                lookups.append(chunk)
+            else:
+                scan_all = True
+        if not required and not or_terms:
+            scan_all = True
+        if required and or_terms and not lookups:
+            scan_all = True
+
+        if scan_all or not lookups:
+            return self.index.iter_all_files()
 
         candidates_map: Dict[str, dict] = {}
-        for t in terms:
-            clean_t = t.strip()
-            if not clean_t:
-                continue
-            matches = self.index.search_trigram(clean_t)
-            for item in matches:
+        for t in lookups:
+            for item in self.index.search_trigram(t, limit=_CANDIDATE_LIMIT):
                 candidates_map[item["path"]] = item
-
         return list(candidates_map.values())
 
-
     def _suggest_correction(self, query: SearchQuery) -> Optional[str]:
+        terms = [t for t in query.terms if not _is_glob(t)]
+        if not terms:
+            return None
         all_names: List[str] = []
         for f in self.index.iter_all_files():
             all_names.append(f.get("name", ""))
@@ -452,7 +637,7 @@ class SearchEngine:
                 break
 
         best: Optional[Tuple[str, int]] = None
-        for term in query.terms:
+        for term in terms:
             for name in all_names:
                 name_stem = Path(name).stem.lower()
                 d = Levenshtein.distance(term.lower(), name_stem)
@@ -483,7 +668,7 @@ class SearchEngine:
             "any_of": any_of,
             "exact": [q.exact_phrase] if q.exact_phrase else [],
             "wildcards": wildcards,
-            "fields": {**q.field_filters, **{k: f"{v[0]}-{v[1]}" for k, v in q.range_filters.items()}},
+            "fields": {**q.field_filters, **{k: f"{v[0] or ''}-{v[1] or ''}" for k, v in q.range_filters.items()}},
         }
 
     def search(
@@ -558,16 +743,7 @@ class SearchEngine:
             if parsed["wildcards"]:
                 wc_match = False
                 for wc in parsed["wildcards"]:
-                    pat = ".*".join(
-                        re.escape(p) if c != "*" else ".*"
-                        for p in wc.split("*")
-                        for c in [""]
-                    )
-                    if "?" in wc:
-                        pat = wc.replace("?", ".")
-                    else:
-                        pat = ".*".join(re.escape(p) for p in wc.split("*"))
-                    if re.search(pat, name_lower):
+                    if _compile_glob(wc).search(name_lower):
                         wc_match = True
                         break
                 if not wc_match:
