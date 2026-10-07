@@ -22,16 +22,30 @@ def get_app_data_dir(app_name: Optional[str] = None) -> Path:
 
 
 def get_cache_dir(app_name: Optional[str] = None) -> Path:
+    """Persistent per-user cache directory (%LOCALAPPDATA% on Windows).
+
+    ``FAST_FILE_SEARCH_CACHE_DIR`` overrides the base directory (useful for
+    portable installs and tests).
+    """
     system = platform.system()
     home = Path.home()
-    if system == "Windows":
+    override = os.getenv('FAST_FILE_SEARCH_CACHE_DIR')
+    if override:
+        base = Path(override)
+    elif system == "Windows":
         base = Path(os.getenv('LOCALAPPDATA', home / 'AppData' / 'Local'))
     elif system == "Darwin":
         base = home / 'Library' / 'Caches'
     else:
         base = Path(os.getenv('XDG_CACHE_HOME', home / '.cache'))
     path = base / (app_name or 'fast_file_search')
-    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Unwritable/ill-defined cache root (e.g. bogus LOCALAPPDATA): fall back
+        # to a per-user dot-directory so the index still persists.
+        path = home / '.fast_file_search' / (app_name or 'fast_file_search')
+        path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -61,9 +75,17 @@ def copy_to_clipboard(text: str) -> bool:
     system = platform.system()
     try:
         if system == "Windows":
-            # Use powershell Set-Clipboard if available
-            subprocess.run(["powershell", "-Command", f"Set-Clipboard -Value \"{text}\""], check=False)
-            return True
+            # Pass the text through the environment so quotes/$()/backticks in
+            # file names can never be interpreted as PowerShell code.
+            env = dict(os.environ, FFS_CLIPBOARD_TEXT=text)
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Set-Clipboard -Value $env:FFS_CLIPBOARD_TEXT"],
+                check=False,
+                env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return proc.returncode == 0
         elif system == "Darwin":
             p = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
             p.communicate(input=text.encode('utf-8'))
@@ -89,8 +111,11 @@ def get_system_theme() -> str:
             try:
                 import winreg
 
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
-                val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                ) as key:
+                    val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
                 return "light" if val == 1 else "dark"
             except Exception:
                 return "light"
