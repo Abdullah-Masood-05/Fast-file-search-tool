@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
-from .utils.platform_utils import get_cache_dir
+from .utils.file_utils import search_key
+from .utils.platform_utils import get_cache_dir, paths_equal
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Rows written per transaction by add_files_batch (readers see progress between
 # chunks and the WAL stays small).
@@ -40,6 +43,67 @@ CREATE TABLE IF NOT EXISTS _schema_version (
 
 def _py_lower(value):
     return value.lower() if isinstance(value, str) else value
+
+
+# File names are not always valid Unicode: POSIX names with non-UTF-8 bytes
+# decode to lone surrogates (surrogateescape) and NTFS allows unpaired UTF-16
+# surrogates. SQLite needs valid UTF-8, so path/name/parent_path store every
+# surrogate code point as NUL + 4 hex digits. NUL can never occur in a real path,
+# so the escape is unambiguous and decode_db_text() restores the exact str (the
+# file stays openable). Search keys (name_lower, trigrams) use U+FFFD instead.
+_DB_ESCAPE = "\x00"
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+_DB_ESCAPED_RE = re.compile("\x00([0-9a-f]{4})")
+
+
+def encode_db_text(value: str) -> str:
+    """Path text -> form storable in SQLite (identity for valid Unicode)."""
+    if value.isascii() or not _SURROGATE_RE.search(value):
+        return value
+    return _SURROGATE_RE.sub(lambda m: f"{_DB_ESCAPE}{ord(m.group()):04x}", value)
+
+
+def decode_db_text(value):
+    """Inverse of :func:`encode_db_text`."""
+    if isinstance(value, str) and _DB_ESCAPE in value:
+        return _DB_ESCAPED_RE.sub(lambda m: chr(int(m.group(1), 16)), value)
+    return value
+
+
+def _decode_row(row) -> dict:
+    d = dict(row)
+    for key in ("path", "name", "parent_path"):
+        if key in d:
+            d[key] = decode_db_text(d[key])
+    return d
+
+
+def _py_key_changed(name, name_lower):
+    if not isinstance(name, str) or name.isascii():
+        return 0
+    return int(search_key(decode_db_text(name)) != name_lower)
+
+
+def _migrate_4(conn: sqlite3.Connection) -> None:
+    """v4: name search keys are NFC-normalized (macOS returns decomposed names),
+    so recompute name_lower and trigrams for names whose key changed."""
+    rows = conn.execute(
+        "SELECT id, name FROM files WHERE py_key_changed(name, name_lower)"
+    ).fetchall()
+    for fid, name in rows:
+        key = search_key(decode_db_text(name))
+        conn.execute("UPDATE files SET name_lower = ? WHERE id = ?", (key, fid))
+        conn.execute("DELETE FROM file_trigrams WHERE file_id = ?", (fid,))
+        grams = list({key[i : i + 3] for i in range(len(key) - 2)})
+        conn.executemany(
+            "INSERT OR IGNORE INTO trigrams (trigram) VALUES (?)", ((g,) for g in grams)
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO file_trigrams (file_id, trigram_id) "
+            "SELECT ?, id FROM trigrams WHERE trigram = ?",
+            ((fid, g) for g in grams),
+        )
+    conn.execute("UPDATE metadata SET value = '4' WHERE key = 'schema_version'")
 
 
 def _migrate_3(conn: sqlite3.Connection) -> None:
@@ -113,6 +177,7 @@ _MIGRATIONS: Dict[int, _Migration] = {
         "UPDATE metadata SET value = '2' WHERE key = 'schema_version';",
     ],
     3: _migrate_3,
+    4: _migrate_4,
 }
 
 _UPSERT_SQL = """
@@ -155,8 +220,17 @@ def _chunks(seq: Sequence, size: int) -> Iterator[Sequence]:
 def _descendant_clause(prefix: str, column: str = "path") -> Tuple[str, tuple]:
     """SQL (index-friendly range scan) matching ``prefix`` itself and everything below it.
 
-    Works for both ``/`` and ``\\`` separated stored paths; case-sensitive.
+    On Windows both ``/`` and ``\\`` separated stored paths match; on POSIX
+    ``\\`` is an ordinary file-name character, so only ``/`` separates.
+    Case-sensitive: stored paths are spelled exactly as the walk produced them.
     """
+    prefix = encode_db_text(prefix)
+    if sys.platform != "win32":
+        base = prefix.rstrip("/")
+        if not base:  # the filesystem root: everything below "/"
+            return f"({column} >= ? AND {column} < ?)", ("/", "0")
+        sql = f"({column} = ? OR {column} = ? OR ({column} >= ? AND {column} < ?))"
+        return sql, (prefix, base, base + "/", base + "0")
     base = prefix.rstrip("/\\")
     sql = (
         f"({column} = ? OR {column} = ? "
@@ -205,6 +279,7 @@ class PersistentIndex:
         try:
             conn.row_factory = sqlite3.Row
             conn.create_function("py_lower", 1, _py_lower, deterministic=True)
+            conn.create_function("py_key_changed", 2, _py_key_changed, deterministic=True)
             conn.execute("PRAGMA busy_timeout=30000;")
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
@@ -348,7 +423,7 @@ class PersistentIndex:
         p = Path(path)
         return (
             p.name.startswith(self.db_path.name)
-            and os.path.normcase(str(p.parent)) == os.path.normcase(str(self.db_path.parent))
+            and paths_equal(p.parent, self.db_path.parent)
         )
 
     def _init_schema(self) -> None:
@@ -393,8 +468,8 @@ class PersistentIndex:
     # ------------------------------------------------------------------ writes
 
     def _generate_trigrams(self, text: str) -> List[str]:
-        """Distinct lowercase 3-grams of ``text`` (empty for text shorter than 3)."""
-        text = text.lower()
+        """Distinct lowercase NFC 3-grams of ``text`` (empty for text shorter than 3)."""
+        text = search_key(text)
         if len(text) < 3:
             return []
         return list({text[i : i + 3] for i in range(len(text) - 2)})
@@ -412,16 +487,18 @@ class PersistentIndex:
         content = info.get("content_text")
         if content is not None and len(content) > MAX_STORED_CONTENT_CHARS:
             content = content[:MAX_STORED_CONTENT_CHARS]
+        if content is not None and not content.isascii():
+            content = content.encode("utf-8", "replace").decode("utf-8")
         return (
-            path,
-            name,
-            name.lower(),
-            extension,
+            encode_db_text(path),
+            encode_db_text(name),
+            search_key(name),
+            extension if extension.isascii() else extension.encode("utf-8", "replace").decode("utf-8"),
             int(info.get("size") or 0),
             int(info.get("modified") or 0),
             int(info.get("created") or 0),
             1 if info.get("is_folder") else 0,
-            parent_path,
+            encode_db_text(str(parent_path)),
             info.get("content_hash"),
             content,
         )
@@ -477,7 +554,7 @@ class PersistentIndex:
                     if old[1] == name:
                         continue  # trigrams depend only on the name
                     stale_ids.append(fid)
-                file_grams = self._generate_trigrams(name)
+                file_grams = self._generate_trigrams(decode_db_text(name))
                 grams.update(file_grams)
                 pairs.extend((fid, g) for g in file_grams)
 
@@ -507,7 +584,7 @@ class PersistentIndex:
         Folders also remove their indexed descendants unless
         ``include_descendants`` is False. Returns the number of rows deleted.
         """
-        paths = [str(p) for p in paths]
+        paths = [encode_db_text(str(p)) for p in paths]
         if not paths:
             return 0
         removed = 0
@@ -524,7 +601,7 @@ class PersistentIndex:
                         )
                     )
                 for folder in folders:
-                    clause, params = _descendant_clause(folder)
+                    clause, params = _descendant_clause(decode_db_text(folder))
                     conn.execute(
                         f"DELETE FROM file_trigrams WHERE file_id IN "
                         f"(SELECT id FROM files WHERE {clause})",
@@ -612,20 +689,21 @@ class PersistentIndex:
 
     def file_exists(self, path: str) -> bool:
         row = self._get_conn().execute(
-            "SELECT 1 FROM files WHERE path = ?", (path,)
+            "SELECT 1 FROM files WHERE path = ?", (encode_db_text(path),)
         ).fetchone()
         return row is not None
 
     def get_file_by_path(self, path: str) -> Optional[dict]:
         row = self._get_conn().execute(
-            f"SELECT {_FILE_COLUMNS}, content_text FROM files WHERE path = ?", (path,)
+            f"SELECT {_FILE_COLUMNS}, content_text FROM files WHERE path = ?",
+            (encode_db_text(path),),
         ).fetchone()
-        return dict(row) if row is not None else None
+        return _decode_row(row) if row is not None else None
 
     def iter_all_files(self) -> Iterator[dict]:
         cursor = self._get_conn().execute(f"SELECT {_FILE_COLUMNS} FROM files")
         for row in cursor:
-            yield dict(row)
+            yield _decode_row(row)
 
     def iter_file_states(
         self, root: Optional[str] = None
@@ -642,7 +720,7 @@ class PersistentIndex:
         else:
             cursor = conn.execute("SELECT path, size, modified, is_folder FROM files")
         for r in cursor:
-            yield r[0], r[1], r[2], bool(r[3])
+            yield decode_db_text(r[0]), r[1], r[2], bool(r[3])
 
     def search_trigram(self, query: str, limit: int = 1000) -> List[dict]:
         """Case-insensitive substring search on file names.
@@ -650,7 +728,7 @@ class PersistentIndex:
         Queries of 3+ characters intersect the trigram postings in SQL and are
         verified against the real substring; shorter queries use a substring scan.
         """
-        query_lower = query.lower().strip()
+        query_lower = search_key(query.strip())
         if not query_lower:
             return []
         grams = self._generate_trigrams(query_lower)
@@ -679,7 +757,7 @@ class PersistentIndex:
                 LIMIT ?""",
             (*ids, len(ids), query_lower, limit),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_decode_row(r) for r in rows]
 
     def _search_like(self, query_lower: str, limit: int = 1000) -> List[dict]:
         """Substring scan on the name column. Uses ``instr`` rather than LIKE so
@@ -689,4 +767,4 @@ class PersistentIndex:
             "WHERE instr(COALESCE(name_lower, lower(name)), ?) > 0 LIMIT ?",
             (query_lower, limit),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_decode_row(r) for r in rows]

@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, List
 
-from .utils.platform_utils import get_app_data_dir
+from .utils.platform_utils import get_app_data_dir, path_key
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -47,6 +47,16 @@ class AppConfig:
             if not isinstance(value, list):
                 value = []
             setattr(self, name, [v for v in value if isinstance(v, str)])
+        # One folder listed twice (e.g. "C:\Docs" and "c:\docs" on Windows/macOS)
+        # would be indexed twice under two spellings: keep the first only.
+        seen = set()
+        unique: List[str] = []
+        for p in self.index_paths:
+            key = path_key(p) if p else p
+            if p and key not in seen:
+                seen.add(key)
+                unique.append(p)
+        self.index_paths = unique
         for name, default in (("max_index_size", 500), ("auto_index_interval", 300),
                               ("max_results", 1000)):
             value = getattr(self, name)
@@ -101,6 +111,8 @@ class ConfigManager:
         self.config_file = self.config_dir / "config.json"
         self._listeners: List[Callable[[AppConfig], None]] = []
         self.config = AppConfig()
+        # True only when no config file existed yet (a genuine first launch).
+        self.first_run = False
         self.load()
 
     def _notify(self) -> None:
@@ -126,6 +138,7 @@ class ConfigManager:
     def load(self) -> None:
         with self._lock:
             if not self.config_file.exists():
+                self.first_run = True
                 self.save()  # create defaults
                 return
             try:

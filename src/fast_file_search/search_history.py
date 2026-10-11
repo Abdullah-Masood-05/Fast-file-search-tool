@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -8,9 +9,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from .persistent_index import PersistentIndex
+from .persistent_index import PersistentIndex, decode_db_text, encode_db_text
 from .search import Levenshtein
-from .utils.platform_utils import get_cache_dir
+from .utils.file_utils import search_key
+from .utils.platform_utils import get_cache_dir, get_data_dir
 
 
 @dataclass
@@ -32,14 +34,34 @@ class SearchHistory:
 
     def __init__(self, db_path: Optional[Path] = None):
         if db_path is None:
-            db_path = get_cache_dir("Fast File Search Pro") / "search_history.db"
+            db_path = self._default_db_path()
         self.db_path = Path(db_path)
         self._lock = threading.RLock()
         self._conn = self._open_with_recovery()
 
     @staticmethod
+    def _default_db_path() -> Path:
+        """History, favorites, tags and notes are user data: keep them out of
+        the purgeable cache dir (macOS/Linux). Older versions stored them in the
+        cache dir; move that file over once. Windows keeps its old location."""
+        name = "search_history.db"
+        new = get_data_dir("Fast File Search Pro") / name
+        try:
+            old = get_cache_dir("Fast File Search Pro") / name
+            if old != new and old.exists() and not new.exists():
+                for suffix in ("", "-wal", "-shm"):
+                    src = old.with_name(name + suffix)
+                    if src.exists():
+                        os.replace(src, new.with_name(name + suffix))
+        except OSError:
+            pass
+        return new
+
+    @staticmethod
     def _connect(target: str) -> sqlite3.Connection:
-        conn = sqlite3.connect(target, check_same_thread=False)
+        # timeout = SQLite busy timeout: wait instead of failing with
+        # "database is locked" while another connection/process writes.
+        conn = sqlite3.connect(target, timeout=30, check_same_thread=False)
         try:
             conn.row_factory = sqlite3.Row
             try:
@@ -229,20 +251,20 @@ class SearchHistory:
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO favorites (path, created_at) VALUES (?, ?)",
-                (path, time.time()),
+                (encode_db_text(path), time.time()),
             )
             self._conn.commit()
 
     def remove_favorite(self, path: str) -> None:
         with self._lock:
             self._conn.execute(
-                "DELETE FROM favorites WHERE path = ?", (path,)
+                "DELETE FROM favorites WHERE path = ?", (encode_db_text(path),)
             )
             self._conn.commit()
 
     def is_favorite(self, path: str) -> bool:
         row = self._read_one(
-            "SELECT 1 FROM favorites WHERE path = ?", (path,)
+            "SELECT 1 FROM favorites WHERE path = ?", (encode_db_text(path),)
         )
         return row is not None
 
@@ -250,26 +272,26 @@ class SearchHistory:
         rows = self._read_all(
             "SELECT path FROM favorites ORDER BY created_at DESC"
         )
-        return [r["path"] for r in rows]
+        return [decode_db_text(r["path"]) for r in rows]
 
     def add_tag(self, path: str, tag: str) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT OR IGNORE INTO tags (path, tag) VALUES (?, ?)",
-                (path, tag),
+                (encode_db_text(path), tag),
             )
             self._conn.commit()
 
     def remove_tag(self, path: str, tag: str) -> None:
         with self._lock:
             self._conn.execute(
-                "DELETE FROM tags WHERE path = ? AND tag = ?", (path, tag)
+                "DELETE FROM tags WHERE path = ? AND tag = ?", (encode_db_text(path), tag)
             )
             self._conn.commit()
 
     def get_tags(self, path: str) -> List[str]:
         rows = self._read_all(
-            "SELECT tag FROM tags WHERE path = ? ORDER BY tag ASC", (path,)
+            "SELECT tag FROM tags WHERE path = ? ORDER BY tag ASC", (encode_db_text(path),)
         )
         return [r["tag"] for r in rows]
 
@@ -277,13 +299,13 @@ class SearchHistory:
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO notes (path, note) VALUES (?, ?)",
-                (path, note),
+                (encode_db_text(path), note),
             )
             self._conn.commit()
 
     def get_note(self, path: str) -> str:
         row = self._read_one(
-            "SELECT note FROM notes WHERE path = ?", (path,)
+            "SELECT note FROM notes WHERE path = ?", (encode_db_text(path),)
         )
         return row["note"] if row else ""
 
@@ -301,7 +323,7 @@ class Autocomplete:
 
     def suggest(self, prefix: str, limit: int = 8) -> List[str]:
         """Fast SQL-backed autocomplete suggestions."""
-        p_clean = prefix.strip().lower()
+        p_clean = search_key(prefix.strip())
         if not p_clean:
             return []
         esc = _like_escape(p_clean)
@@ -310,20 +332,20 @@ class Autocomplete:
             conn = self.index._get_conn()
             # 1. Prefix matches first
             rows = conn.execute(
-                "SELECT DISTINCT name FROM files WHERE LOWER(name) LIKE ? ESCAPE '!' LIMIT ?",
+                "SELECT DISTINCT name FROM files WHERE name_lower LIKE ? ESCAPE '!' LIMIT ?",
                 (f"{esc}%", limit),
             ).fetchall()
-            results = [r["name"] for r in rows]
+            results = [decode_db_text(r["name"]) for r in rows]
 
             # 2. Substring matches if limit not reached
             if len(results) < limit:
                 needed = limit - len(results)
                 c_rows = conn.execute(
-                    "SELECT DISTINCT name FROM files WHERE LOWER(name) LIKE ? ESCAPE '!' "
-                    "AND LOWER(name) NOT LIKE ? ESCAPE '!' LIMIT ?",
+                    "SELECT DISTINCT name FROM files WHERE name_lower LIKE ? ESCAPE '!' "
+                    "AND name_lower NOT LIKE ? ESCAPE '!' LIMIT ?",
                     (f"%{esc}%", f"{esc}%", needed),
                 ).fetchall()
-                results.extend([r["name"] for r in c_rows])
+                results.extend([decode_db_text(r["name"]) for r in c_rows])
 
             return results
         except Exception:
@@ -331,7 +353,7 @@ class Autocomplete:
 
     def context_suggest(self, prefix: str, current_path: str, limit: int = 10) -> List[str]:
         """Suggest names containing ``prefix``, preferring files under ``current_path``."""
-        p_clean = (prefix or "").strip().lower()
+        p_clean = search_key((prefix or "").strip())
         if not p_clean:
             return []
         ctx = current_path.lower().replace(chr(92), "/") if current_path else ""
@@ -341,10 +363,10 @@ class Autocomplete:
                 """SELECT name, COUNT(*) AS cnt,
                           MAX(CASE WHEN ? != '' AND REPLACE(LOWER(parent_path), char(92), '/')
                                         LIKE ? ESCAPE '!' THEN 1 ELSE 0 END) AS ctx
-                   FROM files WHERE LOWER(name) LIKE ? ESCAPE '!'
+                   FROM files WHERE name_lower LIKE ? ESCAPE '!'
                    GROUP BY name
                    ORDER BY ctx DESC,
-                            CASE WHEN LOWER(name) LIKE ? ESCAPE '!' THEN 0 ELSE 1 END,
+                            CASE WHEN name_lower LIKE ? ESCAPE '!' THEN 0 ELSE 1 END,
                             cnt DESC, name
                    LIMIT ?""",
                 (
@@ -355,7 +377,7 @@ class Autocomplete:
                     limit,
                 ),
             ).fetchall()
-            return [r["name"] for r in rows]
+            return [decode_db_text(r["name"]) for r in rows]
         except Exception:
             return []
 
@@ -390,17 +412,17 @@ class SearchRecommender:
             rows = self.index._get_conn().execute(
                 "SELECT DISTINCT name FROM files LIMIT ?", (limit,)
             ).fetchall()
-            return [r["name"] for r in rows if r["name"]]
+            return [decode_db_text(r["name"]) for r in rows if r["name"]]
         except Exception:
             return []
 
     def did_you_mean(self, term: str, max_distance: int = 2) -> Optional[str]:
         if not term:
             return None
-        all_names: Set[str] = {n.lower() for n in self._sample_names(3000)}
+        all_names: Set[str] = {search_key(n) for n in self._sample_names(3000)}
 
         best: Optional[tuple[str, int]] = None
-        term_lower = term.lower()
+        term_lower = search_key(term)
         for name in sorted(all_names):
             d = Levenshtein.distance(term_lower, Path(name).stem)
             if 0 < d <= max_distance:
@@ -412,14 +434,14 @@ class SearchRecommender:
     def related_searches(self, term: str, limit: int = 5) -> List[str]:
         if not term:
             return []
-        term_lower = term.lower()
+        term_lower = search_key(term)
         trigrams = set()
         for i in range(len(term_lower) - 2):
             trigrams.add(term_lower[i : i + 3])
 
         shared: Dict[str, int] = defaultdict(int)
         for original in self._sample_names(20000):
-            name = original.lower()
+            name = search_key(original)
             name_tri = set()
             for i in range(len(name) - 2):
                 name_tri.add(name[i : i + 3])

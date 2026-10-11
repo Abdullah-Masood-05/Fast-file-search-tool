@@ -7,7 +7,7 @@ import pytest
 
 from fast_file_search.config import AppConfig
 from fast_file_search.indexer import Indexer
-from fast_file_search.persistent_index import PersistentIndex
+from fast_file_search.persistent_index import SCHEMA_VERSION, PersistentIndex
 
 
 def _info(path, name=None, size=1, modified=1, is_folder=False):
@@ -406,7 +406,7 @@ def test_migrates_legacy_v2_database(db_path):
     assert [r["path"] for r in idx.search_trigram("legacyfile")] == ["/old/LegacyFile.TXT"] or \
         [r["path"] for r in idx.search_trigram("leg")] == ["/old/LegacyFile.TXT"]
     assert idx.get_file_by_path("/old/LegacyFile.TXT")["content_text"] is None
-    assert idx._get_conn().execute("SELECT MAX(version) FROM _schema_version").fetchone()[0] == 3
+    assert idx._get_conn().execute("SELECT MAX(version) FROM _schema_version").fetchone()[0] == SCHEMA_VERSION
     idx.close()
 
 

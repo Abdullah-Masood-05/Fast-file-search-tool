@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Pattern, Set, Tuple
 
 from .persistent_index import PersistentIndex
+from .utils.file_utils import nfc
 
 # Upper bound on candidate rows pulled from the trigram index per search.
 _CANDIDATE_LIMIT = 20000
@@ -106,7 +107,8 @@ class QueryParser:
 
     @classmethod
     def parse(cls, raw: str) -> SearchQuery:
-        q = SearchQuery(raw=(raw or "").strip())
+        # NFC: names are matched in composed form (macOS stores them decomposed).
+        q = SearchQuery(raw=nfc((raw or "").strip()))
         if not q.raw:
             return q
 
@@ -273,7 +275,7 @@ class SearchEngine:
         term_freq: int,
         now: float,
     ) -> float:
-        name = file.get("name", "") or ""
+        name = nfc(file.get("name", "") or "")
         modified = file.get("modified", 0)
         path = file.get("path", "") or ""
         name_lower = name.lower()
@@ -338,7 +340,7 @@ class SearchEngine:
             return not match if negate else match
 
         if field in ("name", "path"):
-            file_val = str(file.get(field) or "").lower()
+            file_val = nfc(str(file.get(field) or "")).lower()
             if field == "path":
                 # Accept either separator on every platform.
                 file_val = file_val.replace("\\", "/")
@@ -503,7 +505,7 @@ class SearchEngine:
         if isinstance(candidates, list) and query.terms:
             lowered = [t.lower() for t in query.terms if not _is_glob(t)]
             for f in candidates:
-                name_lower = (f.get("name", "") or "").lower()
+                name_lower = nfc(f.get("name", "") or "").lower()
                 for t in lowered:
                     if t in name_lower:
                         term_freq_map[t] += 1
@@ -519,7 +521,7 @@ class SearchEngine:
                 if p in seen:
                     continue
                 seen.add(p)
-                name = f.get("name", "") or ""
+                name = nfc(f.get("name", "") or "")
 
                 if regex is not None:
                     if not regex.search(name):
@@ -632,7 +634,7 @@ class SearchEngine:
             return None
         all_names: List[str] = []
         for f in self.index.iter_all_files():
-            all_names.append(f.get("name", ""))
+            all_names.append(nfc(f.get("name", "") or ""))
             if len(all_names) >= 5000:
                 break
 
@@ -793,13 +795,13 @@ class SearchEngine:
     def suggest(self, prefix: str, limit: int = 10) -> List[str]:
         if not prefix:
             return []
-        prefix_lower = prefix.lower()
+        prefix_lower = nfc(prefix).lower()
         seen: Set[str] = set()
         suggestions: List[Tuple[str, int]] = []
 
         freq_map: Dict[str, int] = defaultdict(int)
         for f in self.index.iter_all_files():
-            name = f.get("name", "")
+            name = nfc(f.get("name", "") or "")
             freq_map[name] += 1
 
         for name, freq in freq_map.items():

@@ -1,20 +1,51 @@
 from __future__ import annotations
 
+import errno
+import logging
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Set
+from typing import Callable, Iterable, List, Optional, Set, Tuple
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .config import AppConfig
-from .indexer import _SYSTEM_FOLDERS_FOLDED
+from .indexer import is_system_name
 from .persistent_index import PersistentIndex
-from .utils.file_utils import ExcludeMatcher, build_file_info
+from .utils.file_utils import ExcludeMatcher, build_file_info, split_path
+from .utils.platform_utils import dedupe_roots, is_path_under
 
 _TREE_BATCH = 1000
+_log = logging.getLogger(__name__)
+
+# inotify (Linux) runs out of watches/instances on big trees: the watcher then
+# degrades to "no live updates" for that root; periodic rescans keep it fresh.
+_LIMIT_ERRNOS = {errno.ENOSPC, errno.EMFILE, errno.ENFILE}
+
+
+def _close_leaked_inotify(exc: BaseException) -> None:
+    """watchdog's Inotify.__init__ does not close its inotify fd when adding
+    watches fails part-way, so the watches already added would keep eating the
+    per-user limit (starving other programs) until we exit. Close it."""
+    tb = exc.__traceback__
+    while tb is not None:
+        obj = tb.tb_frame.f_locals.get("self")
+        if type(obj).__name__ == "Inotify" and not getattr(obj, "_closed", True):
+            for name in ("_inotify_fd", "_kill_r", "_kill_w"):
+                fd = getattr(obj, name, None)
+                if isinstance(fd, int):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            obj._closed = True
+        tb = tb.tb_next
+
+
+def _rel_parts(path: str, base: str) -> List[str]:
+    return split_path(os.path.normpath(path))[len(split_path(os.path.normpath(base))):]
 
 
 class DebouncedEventHandler(FileSystemEventHandler):
@@ -37,6 +68,7 @@ class DebouncedEventHandler(FileSystemEventHandler):
         exclude_patterns: Optional[List[str]] = None,
         max_wait_seconds: float = 15.0,
         ignore: Optional[Callable[[str], bool]] = None,
+        normalize: Optional[Callable[[str], str]] = None,
     ):
         super().__init__()
         self._on_created = on_created
@@ -47,6 +79,7 @@ class DebouncedEventHandler(FileSystemEventHandler):
         self._max_wait_seconds = max_wait_seconds
         self._matcher = ExcludeMatcher(exclude_patterns)
         self._ignore = ignore
+        self._normalize = normalize
         self._timer: Optional[threading.Timer] = None
         self._first_event: Optional[float] = None
         self._cancelled = False
@@ -136,11 +169,20 @@ class DebouncedEventHandler(FileSystemEventHandler):
         except Exception:
             pass
 
+    def _norm(self, path) -> str:
+        path = os.fsdecode(path)
+        if self._normalize is not None:
+            try:
+                return self._normalize(path)
+            except Exception:
+                pass
+        return path
+
     def _queue(self, bucket: Set[str], path: str) -> None:
         with self._lock:
             if self._cancelled:
                 return
-            bucket.add(os.fsdecode(path))
+            bucket.add(self._norm(path))
             self._reset_timer()
 
     def on_created(self, event: FileSystemEvent) -> None:
@@ -159,7 +201,7 @@ class DebouncedEventHandler(FileSystemEventHandler):
             if self._cancelled:
                 return
             self._pending_moved.append(
-                (os.fsdecode(event.src_path), os.fsdecode(event.dest_path))
+                (self._norm(event.src_path), self._norm(event.dest_path))
             )
             self._reset_timer()
 
@@ -180,6 +222,10 @@ class FileWatcher:
         self._change_callback: Optional[Callable[[str, str], None]] = None
         self._error_callback: Optional[Callable[[Exception], None]] = None
         self._excludes = ExcludeMatcher(self.config.exclude_patterns)
+        # (alias, root): another spelling of a watched root that events may use,
+        # e.g. macOS FSEvents reports /private/var/... for a root under /var.
+        self._aliases: List[Tuple[str, str]] = []
+        self._limit_logged = False
 
     def on_change(self, cb: Callable[[str, str], None]) -> None:
         self._change_callback = cb
@@ -191,25 +237,34 @@ class FileWatcher:
 
     def _is_ignored(self, path: str) -> bool:
         """Exclusion is judged on the part of the path *below* the watched root
-        (same rule as the indexer), plus the index's own database files."""
+        (same rule as the indexer), plus the index's own database files.
+        "Below the root" follows the platform's case rules."""
         if self.persistent_index.is_own_file(path):
             return True
-        norm = os.path.normcase(os.path.normpath(path))
-        rel_parts: List[str] = []
         with self._lock:
             roots = list(self._watched_paths)
         for root in roots:
-            nroot = os.path.normcase(os.path.normpath(root))
-            if norm == nroot or norm.startswith(nroot.rstrip("\\/") + os.sep):
-                rel = os.path.relpath(os.path.normpath(path), os.path.normpath(root))
-                rel_parts = [p for p in rel.replace("\\", "/").split("/") if p and p != "."]
+            if is_path_under(path, root):
+                rel_parts = _rel_parts(path, root)
                 break
         else:
-            rel_parts = [p for p in path.replace("\\", "/").split("/") if p]
+            rel_parts = split_path(path)
         for part in rel_parts:
-            if part.casefold() in _SYSTEM_FOLDERS_FOLDED or self._excludes.matches_name(part):
+            if is_system_name(part) or self._excludes.matches_name(part):
                 return True
         return bool(self._excludes.sequences) and self._excludes.matches_path(path)
+
+    def _normalize_event_path(self, path: str) -> str:
+        """Spell an event path the way the indexer does (under the configured
+        root string), so watcher updates never create duplicate rows for
+        /private/var vs /var (macOS) or a differently-cased root."""
+        with self._lock:
+            pairs = [(r, r) for r in self._watched_paths] + list(self._aliases)
+        for alias, root in pairs:
+            if is_path_under(path, alias):
+                rel = _rel_parts(path, alias)
+                return os.path.join(root, *rel) if rel else root
+        return path
 
     # ------------------------------------------------------------------ index updates
 
@@ -263,6 +318,18 @@ class FileWatcher:
         if batch:
             self.persistent_index.add_files_batch(batch)
 
+    def _report_limit(self, root: str, exc: OSError) -> None:
+        """Log/report the OS watch limit once; the root simply gets no live updates."""
+        if self._limit_logged:
+            return
+        self._limit_logged = True
+        _log.warning(
+            "Live file watching disabled for %s (%s). The index is still kept up "
+            "to date by periodic rescans. On Linux raise fs.inotify.max_user_watches "
+            "/ max_user_instances to enable it.", root, exc,
+        )
+        self._report(exc)
+
     def _handle_created(self, path: str) -> None:
         try:
             if self._upsert_path(path):
@@ -306,9 +373,10 @@ class FileWatcher:
             self._watched_paths.discard(path)
 
     def set_paths(self, paths: Iterable[str]) -> None:
-        """Replace the watched set with the given folders (missing ones are skipped)."""
+        """Replace the watched set with the given folders (missing ones are skipped,
+        duplicates and folders nested in another watched folder are dropped)."""
         with self._lock:
-            self._watched_paths = {p for p in paths if os.path.isdir(p)}
+            self._watched_paths = set(dedupe_roots(p for p in paths if os.path.isdir(p)))
 
     def start(self) -> None:
         with self._lock:
@@ -317,6 +385,11 @@ class FileWatcher:
             if not self._watched_paths:
                 return
             self._excludes = ExcludeMatcher(self.config.exclude_patterns)
+            self._aliases = []
+            for root in self._watched_paths:
+                real = os.path.realpath(root)
+                if not is_path_under(real, root) or not is_path_under(root, real):
+                    self._aliases.append((real, root))
             handler = DebouncedEventHandler(
                 on_created=self._handle_created,
                 on_deleted=self._handle_deleted,
@@ -324,22 +397,33 @@ class FileWatcher:
                 on_moved=self._handle_moved,
                 debounce_seconds=2.0,
                 ignore=self._is_ignored,
+                normalize=self._normalize_event_path,
             )
             observer = Observer()
             observer.daemon = True
+            try:
+                observer.start()
+            except Exception as exc:
+                self._report(exc)
+                return
+            # Scheduling on a running observer starts each root's emitter right
+            # away, so one root failing (e.g. inotify limits) cannot take the
+            # other roots down with it.
             scheduled = 0
             for wp in sorted(self._watched_paths):
                 try:
                     observer.schedule(handler, wp, recursive=True)
                     scheduled += 1
+                except OSError as exc:
+                    if exc.errno in _LIMIT_ERRNOS:
+                        _close_leaked_inotify(exc)
+                        self._report_limit(wp, exc)
+                    else:
+                        self._report(exc)
                 except Exception as exc:
                     self._report(exc)
             if not scheduled:
-                return
-            try:
-                observer.start()
-            except Exception as exc:
-                self._report(exc)
+                observer.stop()
                 return
             self._observer = observer
             self._handler = handler

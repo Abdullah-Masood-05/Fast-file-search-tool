@@ -16,18 +16,88 @@ from .config import AppConfig
 from .persistent_index import PersistentIndex, MAX_STORED_CONTENT_CHARS
 from .utils.file_utils import ExcludeMatcher, build_file_info, is_binary_file
 
-# Well-known OS folders that are never worth indexing (matched as exact names).
-_SYSTEM_FOLDERS: Set[str] = {
-    "$Recycle.Bin", "System Volume Information", "Windows",
-    "WinSxS", "Program Files", "Program Files (x86)",
-    ".Trash", ".Trashes", ".TemporaryItems",
-}
-# Pseudo filesystems: only skipped directly below the filesystem root on
-# POSIX ("/proc", "/sys", "/dev"), never on Windows or deeper in the tree.
-_POSIX_PSEUDO_ROOT_DIRS: Set[str] = {"proc", "sys", "dev"}
-
 _IS_WINDOWS = sys.platform == "win32"
+_IS_MACOS = sys.platform == "darwin"
+
+# Trash/metadata folders written by macOS.
+_MACOS_METADATA_NAMES: Set[str] = {
+    ".Trash", ".Trashes", ".TemporaryItems", ".DS_Store", ".Spotlight-V100",
+    ".fseventsd", ".DocumentRevisions-V100", ".MobileBackups",
+    "Backups.backupdb",  # Time Machine
+}
+
+def system_folder_names(platform: str = sys.platform) -> Set[str]:
+    """Well-known OS folders that are never worth indexing (matched as exact
+    names anywhere in the tree). Windows names are only special on Windows: on
+    Linux and macOS a folder called "Windows" or "Program Files" is user data."""
+    if platform == "win32":
+        return {
+            "$Recycle.Bin", "System Volume Information", "Windows",
+            "WinSxS", "Program Files", "Program Files (x86)",
+            ".Trash", ".Trashes", ".TemporaryItems",
+        }
+    if platform == "darwin":
+        return set(_MACOS_METADATA_NAMES)
+    return {".Trash", ".Trashes", ".TemporaryItems", ".fseventsd", ".Spotlight-V100"}
+
+
+def root_excludes(platform: str = sys.platform) -> Set[str]:
+    """Absolute paths skipped only when met *during* a walk (a scan explicitly
+    rooted at one of them still works): pseudo/volatile file systems on Linux,
+    the sealed system volume, other disks and system caches on macOS."""
+    if platform == "win32":
+        return set()
+    if platform == "darwin":
+        return {"/System", "/Volumes", "/private/var", "/dev"}
+    return {"/proc", "/sys", "/dev", "/run", "/snap", "/tmp"}
+
+
+_SYSTEM_FOLDERS: Set[str] = system_folder_names()
+_ROOT_EXCLUDES: Set[str] = root_excludes()
+
+_PATHS_FOLD_CASE = _IS_WINDOWS or _IS_MACOS
 _SYSTEM_FOLDERS_FOLDED = {n.casefold() for n in _SYSTEM_FOLDERS}
+_ROOT_EXCLUDES_KEYS = {p.casefold() if _PATHS_FOLD_CASE else p for p in _ROOT_EXCLUDES}
+_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # junctions and volume mount folders
+
+
+def is_system_name(name: str) -> bool:
+    """True for OS trash/metadata/system folder names that are never indexed."""
+    if _PATHS_FOLD_CASE:
+        if name.casefold() in _SYSTEM_FOLDERS_FOLDED:
+            return True
+    elif name in _SYSTEM_FOLDERS:
+        return True
+    # Per-user trash on removable media: ".Trash-1000"
+    return not _IS_WINDOWS and name.startswith(".Trash-")
+
+
+def is_root_excluded(path: str) -> bool:
+    """True for the absolute system paths in ``_ROOT_EXCLUDES``."""
+    if not _ROOT_EXCLUDES_KEYS:
+        return False
+    return (path.casefold() if _PATHS_FOLD_CASE else path) in _ROOT_EXCLUDES_KEYS
+
+
+def _same_volume_devices(root: str) -> Set[int]:
+    """Device ids the walk may enter without crossing a mount point (POSIX).
+
+    On macOS 10.15+ "/" is the read-only system volume and /Users, /Applications,
+    ... are firmlinks into /System/Volumes/Data (another st_dev), so a scan of
+    "/" treats both as one volume."""
+    try:
+        devs = {os.stat(root).st_dev}
+    except OSError:
+        return set()
+    if _IS_MACOS:
+        try:
+            pair = {os.stat("/").st_dev, os.stat("/System/Volumes/Data").st_dev}
+            if devs & pair:
+                devs |= pair
+        except OSError:
+            pass
+    return devs
+
 
 _MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10 MB
 _WRITE_BATCH = 2000
@@ -120,9 +190,9 @@ class Indexer:
     # ------------------------------------------------------------------ filtering
 
     def _name_skipped(self, name: str, parent: str) -> bool:
-        if name.casefold() in _SYSTEM_FOLDERS_FOLDED:
+        if is_system_name(name):
             return True
-        if not _IS_WINDOWS and name in _POSIX_PSEUDO_ROOT_DIRS and parent == "/":
+        if _ROOT_EXCLUDES and is_root_excluded(os.path.join(parent, name)):
             return True
         return self._excludes.matches_name(name)
 
@@ -303,9 +373,23 @@ class Indexer:
         An unreadable directory is recorded in ``failed_dirs`` and skipped; it
         never aborts the rest of the walk. ``stat_or_None`` is None when the
         entry exists but could not be stat'ed.
+
+        Mount points are listed but not entered (other disks, network shares,
+        /proc-like file systems): on POSIX by comparing ``st_dev`` with the
+        root's, on Windows junctions/volume mount folders are reparse points
+        (``scandir`` reports no ``st_dev`` there). On POSIX every directory is
+        entered at most once by (st_dev, st_ino), so bind mounts cannot loop.
         """
         stack = [root]
         has_junction = hasattr(os.DirEntry, "is_junction")
+        devices: Set[int] = set() if _IS_WINDOWS else _same_volume_devices(root)
+        visited: Set[Tuple[int, int]] = set()
+        if not _IS_WINDOWS:
+            try:
+                rst = os.stat(root)
+                visited.add((rst.st_dev, rst.st_ino))
+            except OSError:
+                pass
         while stack:
             if self.stopped:
                 return
@@ -332,8 +416,18 @@ class Indexer:
                     is_dir = entry.is_dir(follow_symlinks=False)
                     st = entry.stat(follow_symlinks=False)
                     descend = is_dir
-                    if descend and has_junction and entry.is_junction():
-                        descend = False  # directory junction: avoid loops
+                    if descend and _IS_WINDOWS:
+                        if (has_junction and entry.is_junction()) or (
+                            getattr(st, "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT
+                        ):
+                            descend = False  # junction / mounted volume: avoid loops
+                    elif descend:
+                        if devices and st.st_dev not in devices:
+                            descend = False  # another file system is mounted here
+                        elif (st.st_dev, st.st_ino) in visited:
+                            descend = False  # bind-mount loop / already walked
+                        else:
+                            visited.add((st.st_dev, st.st_ino))
                 except OSError:
                     self._stats.errors += 1
                     yield path, False, None
@@ -485,9 +579,12 @@ class Indexer:
 
     @staticmethod
     def _under_any(path: str, dirs: List[str]) -> bool:
+        # Both strings come from the same walk, so no case folding is needed;
+        # "\\" is only a separator on Windows (a legal name character on POSIX).
+        seps = ("/", "\\") if _IS_WINDOWS else ("/",)
         for d in dirs:
-            base = d.rstrip("/\\")
-            if path == d or path.startswith(base + "/") or path.startswith(base + "\\"):
+            base = d.rstrip("".join(seps))
+            if path == d or any(path.startswith(base + s) for s in seps):
                 return True
         return False
 

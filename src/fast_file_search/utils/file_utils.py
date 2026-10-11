@@ -5,6 +5,7 @@ import hashlib
 import os
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
@@ -130,8 +131,35 @@ _IS_CASE_INSENSITIVE = os.name == "nt" or sys.platform == "darwin"
 _GLOB_CHARS = set("*?[")
 
 
+def nfc(text: str) -> str:
+    """Unicode NFC form. macOS returns file names decomposed (NFD: "e" + U+0301)
+    while typed text is composed, so names and queries are compared as NFC."""
+    if not text or text.isascii():
+        return text
+    return unicodedata.normalize("NFC", text)
+
+
+def search_key(text: str) -> str:
+    """Lower-cased NFC form used for name matching and trigrams. Lone surrogates
+    (undecodable bytes in POSIX names) become U+FFFD so the key is valid UTF-8."""
+    if not text.isascii():
+        text = unicodedata.normalize("NFC", text.encode("utf-8", "surrogatepass")
+                                     .decode("utf-8", "replace"))
+    return text.lower()
+
+
 def _fold(text: str) -> str:
-    return text.casefold() if _IS_CASE_INSENSITIVE else text
+    # NFC first: on macOS "Café" may arrive decomposed from the file system.
+    return nfc(text).casefold() if _IS_CASE_INSENSITIVE else text
+
+
+def split_path(path: str | Path) -> List[str]:
+    """Path components. "\\" only separates on Windows; on POSIX it is a legal
+    character inside a file name."""
+    s = os.fspath(path)
+    if os.name == "nt":
+        s = s.replace("\\", "/")
+    return [p for p in s.split("/") if p]
 
 
 class ExcludeMatcher:
@@ -156,6 +184,7 @@ class ExcludeMatcher:
             if not pat:
                 continue
             if "/" in pat or "\\" in pat:
+                # Patterns are typed by the user: accept "\\" as a separator here.
                 parts = tuple(_fold(p) for p in pat.replace("\\", "/").split("/") if p)
                 if parts:
                     self.sequences.append(parts)
@@ -174,7 +203,7 @@ class ExcludeMatcher:
         return any(fnmatch.fnmatchcase(folded, g) for g in self.globs)
 
     def matches_path(self, path: str | Path) -> bool:
-        parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+        parts = split_path(path)
         for part in parts:
             if self.matches_name(part):
                 return True
