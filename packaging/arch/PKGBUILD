@@ -1,0 +1,30 @@
+# Maintainer: Abdullah Masood <Abdullah-Masood-05@users.noreply.github.com>
+#
+# Binary package built from the prebuilt Nuitka standalone tree; package() only installs
+# files. packaging/arch/build-arch.sh places the staged FHS tree (build/linux/root) in
+# $srcdir/root and sets pkgver, then runs: makepkg -f --nodeps --skipchecksums --noextract
+pkgname=fast-file-search-pro
+pkgver=1.3.0
+pkgrel=1
+pkgdesc="High-performance desktop file search with a PyQt6 GUI (self-contained build)"
+arch=('x86_64')
+url="https://github.com/Abdullah-Masood-05/Fast-file-search-tool"
+license=('MIT')
+# Python, Qt 6 and ICU are bundled under /opt; these are the system libraries the bundled
+# Qt needs (xcb + Wayland platform plugins, OpenGL/EGL, fonts, D-Bus).
+depends=('glibc>=2.35' 'glib2' 'libglvnd' 'fontconfig' 'freetype2' 'dbus'
+         'libxkbcommon' 'libxkbcommon-x11' 'libx11' 'libxcb'
+         'xcb-util' 'xcb-util-cursor' 'xcb-util-image' 'xcb-util-keysyms'
+         'xcb-util-renderutil' 'xcb-util-wm' 'wayland')
+optdepends=('gtk3: native GTK file dialogs and platform theme'
+            'brotli: Qt PDF image format plugin')
+provides=("$pkgname")
+conflicts=("$pkgname-git")
+# Never strip or post-process the Nuitka/Qt binaries.
+options=('!strip' '!debug' '!lto' '!emptydirs')
+source=()
+sha256sums=()
+
+package() {
+  cp -a "$srcdir/root/." "$pkgdir/"
+}

@@ -1,126 +1,70 @@
 <#
 .SYNOPSIS
-  Build Fast File Search Pro into a Windows executable with Nuitka.
+  Local Windows build of Fast File Search Pro (wrapper around build.py).
 
 .DESCRIPTION
-  Compiler fallback order (first success wins):
-    1. MSVC   (VS Build Tools 2022, --msvc=latest, vcvars64 environment imported)
+  All Nuitka flags live in build.py (shared with CI and the other platforms); this script
+  only adds a compiler fallback chain for local Windows machines (first success wins):
+    1. MSVC    (Visual Studio / Build Tools with the C++ x64 toolset, --msvc=latest)
     2. MinGW64 (C:\msys64\mingw64\bin gcc, --mingw64; Nuitka 4.1.3 rejects MinGW on
        Python >= 3.13, so this stage runs in an isolated uv-managed Python 3.12 env)
-    3. Docker (LAST RESORT, only if 1 and 2 both failed; needs the Windows-containers
+    3. Docker  (LAST RESORT, only if 1 and 2 both failed; needs the Windows-containers
        engine, see Invoke-DockerBuild below). Container and image are removed afterwards.
 
   Output (default, standalone): dist\FastFileSearchPro\FastFileSearchPro.exe
   Output (-Mode onefile)      : dist\FastFileSearchPro.exe
+  -Installer additionally builds dist\Fast-File-Search-Pro-v<version>-Windows-x64-Setup.exe
+  with Inno Setup (packaging\windows\setup.iss) from the standalone folder.
 
 .EXAMPLE
   .\build.ps1                      # standalone folder build, auto compiler
   .\build.ps1 -Mode onefile        # single-file exe
   .\build.ps1 -Compiler mingw      # force one compiler (no fallback)
+  .\build.ps1 -Installer           # standalone build + Inno Setup installer
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('standalone', 'onefile')] [string]$Mode = 'standalone',
     [ValidateSet('auto', 'msvc', 'mingw', 'docker')] [string]$Compiler = 'auto',
-    [string]$Entry   = 'main.py',
-    [string]$Icon    = 'files.ico',
-    [string]$Name    = 'FastFileSearchPro',
     [string]$OutDir  = 'dist',
-    [string]$SrcPath = 'src',          # added to PYTHONPATH so Nuitka can find the package
-    [string]$Package = 'fast_file_search',   # package to force-include ('' to skip)
     [int]$Jobs = [Environment]::ProcessorCount,
     [string]$MingwBin = 'C:\msys64\mingw64\bin',
-    [switch]$KeepBuildDir
+    [switch]$KeepBuildDir,
+    [switch]$Installer
 )
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
-function Resolve-Rel([string]$p) { if ([IO.Path]::IsPathRooted($p)) { $p } else { Join-Path $Root $p } }
-$EntryAbs  = Resolve-Rel $Entry
-$IconAbs   = Resolve-Rel $Icon
-$OutAbs    = Resolve-Rel $OutDir
-$SrcAbs    = Resolve-Rel $SrcPath
-$ExeName   = "$Name.exe"
+$OutAbs  = if ([IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $Root $OutDir }
+$Version = (& uv run --no-project python (Join-Path $Root 'build.py') --print-version | Select-Object -Last 1).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $Version) { throw 'Could not read the version via build.py (is uv installed?)' }
 
-# ---------------------------------------------------------------- nuitka args
-function Get-NuitkaArgs([string]$CompilerFlag) {
-    $a = @(
-        '-m', 'nuitka',
-        '--standalone',
-        '--enable-plugin=pyqt6',
-        '--windows-console-mode=disable',
-        "--windows-icon-from-ico=$IconAbs",
-        "--include-data-files=$IconAbs=files.ico",
-        "--output-dir=$OutAbs",
-        "--output-filename=$ExeName",
-        "--company-name=Abdullah Masood",
-        "--product-name=Fast File Search Pro",
-        "--file-version=1.2.0.0",
-        "--product-version=1.2.0.0",
-        "--file-description=Fast File Search Pro",
-        "--jobs=$Jobs",
-        '--assume-yes-for-downloads',
-        $CompilerFlag
-    )
-    if ($Package) { $a += "--include-package=$Package" }
-    if ($Mode -eq 'onefile') { $a += '--onefile' }
-    if (-not $KeepBuildDir) { $a += '--remove-output' }
-    $a += $EntryAbs
+function Get-BuildPyArgs([string]$CompilerName, [string]$OutputDir = $OutAbs) {
+    $a = @('build.py', '--mode', $Mode, '--compiler', $CompilerName, '--output-dir', $OutputDir, '--jobs', $Jobs)
+    if ($KeepBuildDir) { $a += '--keep-build-dir' }
     return $a
 }
 
-# --------------------------------------------------------- environment helpers
-function Import-VcVars {
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    if (-not (Test-Path $vswhere)) { throw 'vswhere.exe not found' }
-    $inst = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-    if (-not $inst) { throw 'No Visual Studio install with the C++ x64 toolset found' }
-    $bat = Join-Path $inst 'VC\Auxiliary\Build\vcvars64.bat'
-    if (-not (Test-Path $bat)) { throw "vcvars64.bat missing: $bat" }
-    $dump = cmd /c "`"$bat`" >nul 2>&1 && set"
-    foreach ($line in $dump) {
-        if ($line -match '^([^=]+)=(.*)$') { Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2] }
-    }
-    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw 'cl.exe not on PATH after vcvars64' }
-}
-
-function Invoke-Nuitka([string]$Label, [string]$CompilerFlag, [string[]]$Runner = @('run', 'python')) {
+function Invoke-BuildPy([string]$Label, [string]$CompilerName, [string[]]$Runner = @('run', 'python')) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    Write-Host "`n=== Nuitka build [$Label] mode=$Mode ===" -ForegroundColor Cyan
-    $env:PYTHONPATH = $SrcAbs
-    $nuitkaArgs = Get-NuitkaArgs $CompilerFlag
-    Write-Host ("uv " + ($Runner -join ' ') + " " + ($nuitkaArgs -join ' '))
-    & uv @Runner @nuitkaArgs
+    Write-Host "`n=== Nuitka build [$Label] mode=$Mode version=$Version ===" -ForegroundColor Cyan
+    $buildArgs = Get-BuildPyArgs $CompilerName
+    Write-Host ("uv " + ($Runner -join ' ') + " " + ($buildArgs -join ' '))
+    & uv @Runner @buildArgs
     $code = $LASTEXITCODE
     Write-Host ("[{0}] exit code {1}, {2:n0}s" -f $Label, $code, $sw.Elapsed.TotalSeconds)
-    if ($code -ne 0) { return $false }
-    return (Publish-Output)
-}
-
-# Normalise output to dist\FastFileSearchPro\ (standalone) or dist\FastFileSearchPro.exe (onefile)
-function Publish-Output {
-    $stem = [IO.Path]::GetFileNameWithoutExtension($EntryAbs)
-    if ($Mode -eq 'onefile') {
-        $exe = Join-Path $OutAbs $ExeName
-        if (-not (Test-Path $exe)) { Write-Warning "Expected $exe not found"; return $false }
-        Write-Host "OK: $exe" -ForegroundColor Green
-        return $true
-    }
-    $dist = Join-Path $OutAbs "$stem.dist"
-    $final = Join-Path $OutAbs $Name
-    if (-not (Test-Path (Join-Path $dist $ExeName))) { Write-Warning "Expected $dist\$ExeName not found"; return $false }
-    if (Test-Path $final) { Remove-Item $final -Recurse -Force }
-    Move-Item $dist $final
-    Write-Host "OK: $final\$ExeName" -ForegroundColor Green
-    return $true
+    return ($code -eq 0)
 }
 
 # ------------------------------------------------------------------ compilers
 function Invoke-Msvc {
-    Import-VcVars
-    Invoke-Nuitka 'MSVC' '--msvc=latest'
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path $vswhere)) { throw 'vswhere.exe not found' }
+    $inst = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $inst) { throw 'No Visual Studio install with the C++ x64 toolset found' }
+    Invoke-BuildPy 'MSVC' 'msvc'
 }
 
 function Invoke-Mingw {
@@ -129,8 +73,8 @@ function Invoke-Mingw {
     # Nuitka 4.1.3 refuses --mingw64 on Python >= 3.13, so run it from an isolated
     # Python 3.12 environment (uv downloads 3.12 + packages once, repo .venv untouched).
     $runner = @('run', '--no-project', '--isolated', '--python', '3.12',
-                '--with', 'nuitka==4.1.3', '--with', 'PyQt6>=6.0.0', '--with', 'watchdog>=3.0.0', 'python')
-    Invoke-Nuitka 'MinGW64' '--mingw64' $runner
+                '--with', 'nuitka==4.1.3', '--with', 'zstandard', '--with', 'PyQt6>=6.0.0', '--with', 'watchdog>=3.0.0', 'python')
+    Invoke-BuildPy 'MinGW64' 'mingw' $runner
 }
 
 <#
@@ -181,15 +125,13 @@ WORKDIR C:\src
         & docker build -t $tag $ctx
         if ($LASTEXITCODE -ne 0) { throw 'docker build failed' }
 
-        $inner = "uv sync --python $pyVer; `$env:PYTHONPATH='C:\src\$SrcPath'; " +
-                 "uv run python -m nuitka --standalone --enable-plugin=pyqt6 --windows-console-mode=disable " +
-                 "--windows-icon-from-ico=$Icon --include-data-files=$Icon=files.ico --output-dir=C:\out " +
-                 "--output-filename=$ExeName --include-package=$Package --msvc=latest --assume-yes-for-downloads $Entry"
+        # Keep the container's venv out of the bind-mounted tree (the host .venv stays untouched).
+        $inner = "`$env:UV_PROJECT_ENVIRONMENT='C:\venv'; uv sync --python $pyVer; uv run python " + ((Get-BuildPyArgs 'msvc' 'C:\out') -join ' ')
         $cmd = "cmd /c `"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`" && powershell -NoProfile -Command `"$inner`""
         New-Item -ItemType Directory -Force -Path $OutAbs | Out-Null
         & docker run --name $cont --isolation=hyperv -v "${Root}:C:\src" -v "${OutAbs}:C:\out" $tag cmd /c $cmd
         if ($LASTEXITCODE -ne 0) { throw 'docker run (nuitka build) failed' }
-        $ok = Publish-Output
+        $ok = $true
     }
     finally {
         & docker rm -f $cont 2>$null | Out-Null
@@ -197,6 +139,18 @@ WORKDIR C:\src
         Remove-Item $ctx -Recurse -Force -ErrorAction SilentlyContinue
     }
     return $ok
+}
+
+function Invoke-Installer {
+    $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+              "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe", "$env:ProgramFiles\Inno Setup 7\ISCC.exe",
+              "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $iscc) { throw 'Inno Setup (ISCC.exe) not found; install it from https://jrsoftware.org/isdl.php' }
+    $src = Join-Path $OutAbs 'FastFileSearchPro'
+    if (-not (Test-Path (Join-Path $src 'FastFileSearchPro.exe'))) { throw "Standalone build not found in $src (the installer needs -Mode standalone)" }
+    & $iscc /Q "/DAppVersion=$Version" "/DSourceDir=$src" "/DOutputDir=$OutAbs" (Join-Path $Root 'packaging\windows\setup.iss')
+    if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+    Write-Host "OK: $OutAbs\Fast-File-Search-Pro-v$Version-Windows-x64-Setup.exe" -ForegroundColor Green
 }
 
 # ----------------------------------------------------------------------- main
@@ -222,4 +176,5 @@ foreach ($c in $order) {
 }
 
 if (-not $success) { Write-Error 'All build methods failed.'; exit 1 }
+if ($Installer) { Invoke-Installer }
 exit 0

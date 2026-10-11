@@ -1,0 +1,129 @@
+# nfpm config producing the .deb and .rpm from the staged tree in build/linux/root
+# (created by packaging/linux/build-packages.sh; paths are relative to the repo root).
+# VERSION is expanded from the environment.
+name: fast-file-search-pro
+arch: amd64
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: 1
+section: utils
+priority: optional
+maintainer: Abdullah Masood <Abdullah-Masood-05@users.noreply.github.com>
+vendor: Abdullah Masood
+homepage: https://github.com/Abdullah-Masood-05/Fast-file-search-tool
+license: MIT
+description: |-
+  High-performance desktop file search with a PyQt6 GUI.
+  Fast File Search Pro indexes folders into a persistent SQLite trigram index,
+  supports boolean queries, extension and size filters, live file-system
+  monitoring and a preview panel. Self-contained build (Python and Qt bundled).
+
+contents:
+  - src: build/linux/root/opt/fast-file-search-pro
+    dst: /opt/fast-file-search-pro
+    type: tree
+  - src: /opt/fast-file-search-pro/fast-file-search-pro
+    dst: /usr/bin/fast-file-search-pro
+    type: symlink
+  - src: build/linux/root/usr/share/applications/fast-file-search-pro.desktop
+    dst: /usr/share/applications/fast-file-search-pro.desktop
+# Icons listed one by one so the package does not claim the shared hicolor directories.
+  - src: build/linux/root/usr/share/icons/hicolor/16x16/apps/fast-file-search-pro.png
+    dst: /usr/share/icons/hicolor/16x16/apps/fast-file-search-pro.png
+  - src: build/linux/root/usr/share/icons/hicolor/32x32/apps/fast-file-search-pro.png
+    dst: /usr/share/icons/hicolor/32x32/apps/fast-file-search-pro.png
+  - src: build/linux/root/usr/share/icons/hicolor/48x48/apps/fast-file-search-pro.png
+    dst: /usr/share/icons/hicolor/48x48/apps/fast-file-search-pro.png
+  - src: build/linux/root/usr/share/icons/hicolor/64x64/apps/fast-file-search-pro.png
+    dst: /usr/share/icons/hicolor/64x64/apps/fast-file-search-pro.png
+  - src: build/linux/root/usr/share/icons/hicolor/128x128/apps/fast-file-search-pro.png
+    dst: /usr/share/icons/hicolor/128x128/apps/fast-file-search-pro.png
+  - src: build/linux/root/usr/share/icons/hicolor/256x256/apps/fast-file-search-pro.png
+    dst: /usr/share/icons/hicolor/256x256/apps/fast-file-search-pro.png
+
+# Python, Qt 6 and ICU are bundled under /opt. These are the remaining system libraries
+# the bundled Qt needs, found with ldd on every .so in a bare ubuntu:22.04 container:
+# QtCore/QtGui (glib, GL/EGL, xkbcommon, fonts, D-Bus), the xcb platform plugin
+# (libqxcb.so -> libQt6XcbQpa: xcb + xcb-util*, X11-xcb, xkbcommon-x11) and the Wayland
+# plugin (libqwayland.so: wayland-client/cursor/egl). Optional plugins (GTK3 platform
+# theme, CUPS printing, TIFF, PDF/brotli, eglfs/KMS) degrade gracefully and are not required.
+# glibc floor = the build host's glibc (ubuntu-22.04 runner: 2.35).
+depends: []
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.35)
+      - libglib2.0-0
+      - libgl1
+      - libegl1
+      - libfontconfig1
+      - libfreetype6
+      - libdbus-1-3
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libx11-6
+      - libx11-xcb1
+      - libxcb1
+      - libxcb-cursor0
+      - libxcb-glx0
+      - libxcb-icccm4
+      - libxcb-image0
+      - libxcb-keysyms1
+      - libxcb-randr0
+      - libxcb-render0
+      - libxcb-render-util0
+      - libxcb-shape0
+      - libxcb-shm0
+      - libxcb-sync1
+      - libxcb-util1
+      - libxcb-xfixes0
+      - libxcb-xkb1
+      - libwayland-client0
+      - libwayland-cursor0
+      - libwayland-egl1
+    recommends:
+      - libbrotli1
+    suggests:
+      - libgtk-3-0
+  rpm:
+    # Soname requirements (what rpmbuild would auto-generate) so the package resolves on
+    # Fedora, RHEL-compatible and openSUSE regardless of distro-specific package names.
+    depends:
+      - glibc >= 2.35
+      - libglib-2.0.so.0()(64bit)
+      - libgthread-2.0.so.0()(64bit)
+      - libGL.so.1()(64bit)
+      - libEGL.so.1()(64bit)
+      - libfontconfig.so.1()(64bit)
+      - libfreetype.so.6()(64bit)
+      - libdbus-1.so.3()(64bit)
+      - libxkbcommon.so.0()(64bit)
+      - libxkbcommon-x11.so.0()(64bit)
+      - libX11.so.6()(64bit)
+      - libX11-xcb.so.1()(64bit)
+      - libxcb.so.1()(64bit)
+      - libxcb-cursor.so.0()(64bit)
+      - libxcb-glx.so.0()(64bit)
+      - libxcb-icccm.so.4()(64bit)
+      - libxcb-image.so.0()(64bit)
+      - libxcb-keysyms.so.1()(64bit)
+      - libxcb-randr.so.0()(64bit)
+      - libxcb-render.so.0()(64bit)
+      - libxcb-render-util.so.0()(64bit)
+      - libxcb-shape.so.0()(64bit)
+      - libxcb-shm.so.0()(64bit)
+      - libxcb-sync.so.1()(64bit)
+      - libxcb-util.so.1()(64bit)
+      - libxcb-xfixes.so.0()(64bit)
+      - libxcb-xkb.so.1()(64bit)
+      - libwayland-client.so.0()(64bit)
+      - libwayland-cursor.so.0()(64bit)
+      - libwayland-egl.so.1()(64bit)
+
+deb:
+  fields:
+    Bugs: https://github.com/Abdullah-Masood-05/Fast-file-search-tool/issues
+rpm:
+  group: Applications/File
+  summary: High-performance desktop file search (PyQt6)

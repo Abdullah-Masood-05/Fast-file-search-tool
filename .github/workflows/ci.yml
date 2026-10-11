@@ -1,0 +1,315 @@
+name: CI / CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Publish a GitHub release with this tag (must equal v<pyproject version>, e.g. v1.3.0). Leave empty to only build.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: '3.13'
+  # Make uv use the interpreter from actions/setup-python (Nuitka-friendly, shared libpython)
+  # instead of downloading its own.
+  UV_PYTHON: '3.13'
+  UV_PYTHON_PREFERENCE: only-system
+  PYTHONUTF8: '1'
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Use a throwaway app cache dir
+        shell: bash
+        run: echo "FAST_FILE_SEARCH_CACHE_DIR=$RUNNER_TEMP/ffs-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+
+      - name: Install Qt runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 libdbus-1-3 libglib2.0-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-image0 \
+            libxcb-randr0 libxcb-render-util0 libxcb-xkb1
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run tests
+        run: uv run pytest -v
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-latest
+          - platform: macos-arm64
+            os: macos-latest
+          - platform: macos-x86_64
+            os: macos-15-intel
+          # Oldest supported Ubuntu runner: glibc 2.35 is the binaries' runtime floor.
+          # (PyQt6 6.11 wheels already need glibc >= 2.34, so nothing older is possible.)
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+    env:
+      NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
+      QT_QPA_PLATFORM: offscreen
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Use a throwaway app cache dir
+        shell: bash
+        run: echo "FAST_FILE_SEARCH_CACHE_DIR=$RUNNER_TEMP/ffs-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+
+      - name: Read version
+        id: version
+        run: echo "version=$(python build.py --print-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends patchelf ccache \
+            libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 libdbus-1-3 libglib2.0-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-image0 \
+            libxcb-randr0 libxcb-render-util0 libxcb-xkb1
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Nuitka cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.NUITKA_CACHE_DIR }}
+          key: nuitka-${{ matrix.platform }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          restore-keys: |
+            nuitka-${{ matrix.platform }}-${{ hashFiles('uv.lock') }}-
+            nuitka-${{ matrix.platform }}-
+
+      - name: Build standalone (Nuitka)
+        run: uv run python build.py --mode standalone
+
+      - name: Build portable onefile (Windows)
+        if: runner.os == 'Windows'
+        run: uv run python build.py --mode onefile
+
+      - name: Smoke test
+        run: |
+          case "$RUNNER_OS" in
+            Windows) bin="dist/FastFileSearchPro/FastFileSearchPro.exe" ;;
+            macOS)
+              app="dist/Fast File Search Pro.app"
+              bin="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" ;;
+            *)       bin="dist/FastFileSearchPro/fast-file-search-pro" ;;
+          esac
+          "$bin" & pid=$!
+          sleep 10
+          if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" || true
+            echo "OK: $bin is running"
+          else
+            wait "$pid" && code=0 || code=$?
+            echo "::error::$bin exited early with code $code"
+            exit 1
+          fi
+
+      - name: Prepare installer artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $base = "Fast-File-Search-Pro-v$env:VERSION-Windows-x64"
+          New-Item -ItemType Directory -Force dist-installers | Out-Null
+          Copy-Item dist/FastFileSearchPro.exe "dist-installers/$base-Portable.exe"
+          Compress-Archive -Path dist/FastFileSearchPro -DestinationPath "dist-installers/$base.zip"
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          if (-not $iscc) {
+            $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+                      "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe", "$env:ProgramFiles\Inno Setup 7\ISCC.exe") |
+                    Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress | Out-Host
+            $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe", "$env:ProgramFiles\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue |
+                    Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $iscc) { throw 'Inno Setup compiler (ISCC.exe) not found' }
+          & $iscc /Q "/DAppVersion=$env:VERSION" "/DOutputDir=$PWD\dist-installers" "/DOutputBaseFilename=$base-Setup" packaging\windows\setup.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem dist-installers
+
+      - name: Prepare installer artifacts (macOS)
+        if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist-installers
+          arch="$(uname -m)"
+          bash packaging/macos/make-dmg.sh "dist/Fast File Search Pro.app" \
+            "dist-installers/Fast-File-Search-Pro-v${VERSION}-macOS-${arch}.dmg"
+
+      - name: Prepare installer artifacts (Linux)
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          bash packaging/linux/build-packages.sh dist/FastFileSearchPro dist-installers
+          # Arch package, built in a throwaway Arch container from the staged tree.
+          docker run --rm -e VERSION="$VERSION" -v "${{ github.workspace }}:/workspace" -w /workspace \
+            archlinux:base-devel bash packaging/arch/build-arch.sh build/linux/root dist-installers
+          sudo chown -R "$(id -u):$(id -g)" dist-installers build
+          dpkg-deb --info dist-installers/*.deb
+          ls -l dist-installers
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installers-${{ matrix.platform }}
+          path: dist-installers/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve and validate tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then tag="$GITHUB_REF_NAME"; else tag="$INPUT_TAG"; fi
+          version="$(python3 build.py --print-version)"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::Tag '$tag' does not match pyproject.toml version 'v$version'"
+            exit 1
+          fi
+          case "$version" in *-*|*a[0-9]*|*b[0-9]*|*rc[0-9]*|*dev*) pre=true ;; *) pre=false ;; esac
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "prerelease=$pre"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: release-files
+
+      - name: Write release notes
+        env:
+          V: ${{ steps.tag.outputs.version }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          ls -l release-files
+          n="Fast-File-Search-Pro-v$V"
+          cat > release-notes.md <<EOF
+          ## Fast File Search Pro v$V
+
+          ### Windows (x64)
+          | File | Description |
+          |---|---|
+          | \`$n-Windows-x64-Setup.exe\` | Installer (Start menu entry, optional desktop icon, uninstaller) |
+          | \`$n-Windows-x64-Portable.exe\` | Single-file portable executable, no installation |
+          | \`$n-Windows-x64.zip\` | Portable folder build, unzip and run \`FastFileSearchPro.exe\` |
+
+          > **SmartScreen:** the executables are not code-signed, so Windows may show *"Windows protected your PC"*. Click **More info → Run anyway**.
+
+          ### macOS
+          | File | Description |
+          |---|---|
+          | \`$n-macOS-arm64.dmg\` | Apple Silicon (M1 and later) |
+          | \`$n-macOS-x86_64.dmg\` | Intel Macs |
+
+          Open the DMG and drag **Fast File Search Pro** into **Applications**.
+
+          > **Gatekeeper:** the app is ad-hoc signed and not notarized. On first launch, **right-click the app → Open → Open** (on macOS 15 and later, go to *System Settings → Privacy & Security → Open Anyway*). Alternatively, run \`xattr -dr com.apple.quarantine "/Applications/Fast File Search Pro.app"\`.
+
+          ### Linux (x86_64, glibc 2.35+: Ubuntu 22.04+, Debian 12+, Fedora 36+, current Arch)
+          | Distribution | File | Install |
+          |---|---|---|
+          | Debian / Ubuntu / Mint | \`$n-Linux-x86_64.deb\` | \`sudo apt install ./$n-Linux-x86_64.deb\` |
+          | Fedora / RHEL 10 / openSUSE | \`$n-Linux-x86_64.rpm\` | \`sudo dnf install ./$n-Linux-x86_64.rpm\` |
+          | Arch / Manjaro / EndeavourOS | \`$n-Linux-x86_64.pkg.tar.zst\` | \`sudo pacman -U $n-Linux-x86_64.pkg.tar.zst\` |
+          | Any (portable) | \`$n-Linux-x86_64.tar.gz\` | \`tar xzf $n-Linux-x86_64.tar.gz && ./fast-file-search-pro-$V/fast-file-search-pro\` |
+
+          After installing a package, start **Fast File Search Pro** from your application menu or run \`fast-file-search-pro\`.
+
+          ### Known limitations
+          - **macOS builds are new and lightly tested.** They are produced and launch-tested by CI only. They have not been tried by hand on a real Mac, and they are not notarized (see the Gatekeeper note above).
+          - **Linux desktop integration varies by desktop.** "Show in File Manager" uses the freedesktop \`FileManager1\` D-Bus interface and falls back to opening the parent folder. Move to Trash needs \`gio\`, \`trash-put\` or \`kioclient5\`. These were tested with mocks, not on every desktop.
+          - **Linux scans stay on one filesystem.** A scan rooted at \`/\` does not enter a separate \`/home\` partition or btrfs subvolumes (Fedora's default layout). Add those folders as index roots directly. The default root (your home folder) is not affected.
+          - **macOS \`~/Library\` is indexed** when you index your home folder. Add \`Library\` to the exclude patterns if you don't want its caches in results.
+          - **No tray icon on some desktops** (for example GNOME without an AppIndicator extension). There, closing the window quits the app.
+          - **Windows long paths:** paths longer than 260 characters are reported as scan errors and skipped.
+          - **Search and results:** search runs when you press Enter, not as you type. The result list shows at most the configured maximum (default 1,000), and the status bar says when the list was cut off.
+          - **Unsigned executables:** none of the downloads are code-signed.
+
+          ---
+          Source code and issue tracker: $REPO_URL
+          EOF
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Fast File Search Pro ${{ steps.tag.outputs.tag }}
+          body_path: release-notes.md
+          prerelease: ${{ steps.tag.outputs.prerelease }}
+          target_commitish: ${{ github.sha }}
+          files: release-files/*
+          fail_on_unmatched_files: true

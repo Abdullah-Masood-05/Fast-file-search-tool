@@ -6,14 +6,21 @@ __pycache__/
 /main.onefile-build
 *.exe
 /.venv
-setup.iss
+# Legacy local installer script (the tracked one is packaging/windows/setup.iss)
+/setup.iss
 pr_body.md
 
-
-
-
-# Build artifacts (Nuitka)
+# Build artifacts (Nuitka / packaging)
 /dist/
+/build/
+/dist-installers/
+/release-files/
+/.nuitka-cache/
 *.build/
 *.dist/
 *.onefile-build/
+*.app/
+*.dmg
+*.deb
+*.rpm
+*.pkg.tar.zst

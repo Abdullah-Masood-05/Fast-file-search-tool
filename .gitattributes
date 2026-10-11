@@ -1,0 +1,24 @@
+# Line endings. No global "* text=auto" on purpose: it would renormalise every existing file.
+# Files executed or parsed on Linux/macOS (also from a Windows checkout mounted into Docker)
+# must keep LF, whatever core.autocrlf says.
+*.sh text eol=lf
+PKGBUILD text eol=lf
+*.desktop text eol=lf
+packaging/linux/nfpm.yaml text eol=lf
+.github/workflows/*.yml text eol=lf
+
+# Binary files: never convert line endings or diff as text.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.gz binary
+*.zst binary
+*.dmg binary
+*.deb binary
+*.rpm binary
+*.db binary

@@ -28,6 +28,32 @@ Fast File Search Pro is a local search application that indexes your directories
 
 ---
 
+## Download
+
+Prebuilt, self-contained builds (Python and Qt bundled) for every release are on the
+[Releases page](https://github.com/Abdullah-Masood-05/Fast-file-search-tool/releases/latest).
+Replace `<version>` below with the release version (for example `1.3.0`).
+
+| Platform | File | Install |
+|---|---|---|
+| Windows 10/11 (x64) | `Fast-File-Search-Pro-v<version>-Windows-x64-Setup.exe` | Run the installer |
+| Windows, portable | `...-Windows-x64-Portable.exe` or `...-Windows-x64.zip` | Run directly / unzip and run `FastFileSearchPro.exe` |
+| macOS (Apple Silicon) | `...-macOS-arm64.dmg` | Open, drag the app to Applications |
+| macOS (Intel) | `...-macOS-x86_64.dmg` | Open, drag the app to Applications |
+| Debian / Ubuntu | `...-Linux-x86_64.deb` | `sudo apt install ./Fast-File-Search-Pro-v<version>-Linux-x86_64.deb` |
+| Fedora | `...-Linux-x86_64.rpm` | `sudo dnf install ./Fast-File-Search-Pro-v<version>-Linux-x86_64.rpm` |
+| Arch / Manjaro | `...-Linux-x86_64.pkg.tar.zst` | `sudo pacman -U Fast-File-Search-Pro-v<version>-Linux-x86_64.pkg.tar.zst` |
+| Other Linux | `...-Linux-x86_64.tar.gz` | Extract, run `./fast-file-search-pro` |
+
+The Linux builds need glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+, current Arch).
+Packages install to `/opt/fast-file-search-pro` with a `fast-file-search-pro` command and a menu entry.
+
+**Unsigned builds.** On Windows, SmartScreen may say "Windows protected your PC": click
+**More info → Run anyway**. On macOS the app is ad-hoc signed but not notarized: the first time,
+**right-click the app → Open → Open** (macOS 15+: *System Settings → Privacy & Security → Open Anyway*).
+
+---
+
 ## Installation & Setup
 
 ### Prerequisites
@@ -38,7 +64,7 @@ Fast File Search Pro is a local search application that indexes your directories
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/fast-file-search-pro.git
+   git clone https://github.com/Abdullah-Masood-05/Fast-file-search-tool.git
    cd Fast-file-search-tool
    ```
 
@@ -63,16 +89,39 @@ uv run pytest tests/ -v
 
 ---
 
-## Packaging as an Executable
+## Building from Source
 
-To compile the application into a standalone executable using `Nuitka`:
+`build.py` drives [Nuitka](https://nuitka.net) on all three platforms (all flags, version
+info and icons in one place; the version comes from `pyproject.toml`):
 
 ```bash
-uv run nuitka main.py \
-  --standalone \
-  --plugin-enable=pyqt6 \
-  --windows-console-mode=disable \
-  --windows-icon-from-ico=files.ico
+uv sync
+uv run python build.py                  # standalone folder: dist/FastFileSearchPro/ (macOS: dist/Fast File Search Pro.app)
+uv run python build.py --mode onefile   # single file (Windows/Linux)
+uv run python build.py --dry-run        # print the Nuitka command only
+```
+
+Requirements: a C compiler (Windows: Visual Studio Build Tools with the C++ x64 workload;
+Linux: `gcc` and `patchelf`; macOS: Xcode command line tools).
+
+On Windows, `.\build.ps1` wraps `build.py` with a compiler fallback (MSVC → MinGW64 → Docker)
+and `.\build.ps1 -Installer` also builds the Inno Setup installer from `packaging\windows\setup.iss`.
+
+Platform packages (see `packaging/`):
+
+```bash
+bash packaging/linux/build-packages.sh   # .deb, .rpm (nfpm) and .tar.gz from dist/FastFileSearchPro
+docker run --rm -v "$PWD:/workspace" -w /workspace archlinux:base-devel \
+  bash packaging/arch/build-arch.sh     # .pkg.tar.zst (run after build-packages.sh)
+bash packaging/macos/make-dmg.sh         # .dmg from the .app (macOS)
+```
+
+The [CI / CD workflow](.github/workflows/ci.yml) runs the tests on Windows, macOS and Linux, builds
+every package, and publishes a GitHub release when a `v<version>` tag is pushed (the tag must match
+the version in `pyproject.toml`):
+
+```bash
+git tag v1.3.0 && git push origin v1.3.0
 ```
 
 ---
