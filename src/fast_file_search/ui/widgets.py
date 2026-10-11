@@ -1,30 +1,36 @@
+"""Panels and dialogs: filters, preview, settings, about, export, empty states."""
 from __future__ import annotations
 
+import csv
+import json
+import mimetypes
 import os
 import re
 import sys
-import mimetypes
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
-    QSlider, QDateEdit, QLineEdit, QFileDialog, QDialog, QTabWidget,
-    QListWidget, QListWidgetItem, QGroupBox, QFormLayout, QSpinBox,
-    QCheckBox, QTextEdit, QProgressBar, QMessageBox, QDoubleSpinBox,
-    QDialogButtonBox, QFrame, QGridLayout, QSizePolicy, QApplication
-)
-from PyQt6.QtCore import Qt, pyqtSignal, QDate, QPoint, QSize, QThread, QTimer, pyqtSlot
+from PyQt6.QtCore import QDate, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
-    QIcon, QColor, QFont, QTextCharFormat, QTextDocument, QSyntaxHighlighter, QPixmap,
-    QImageReader,
+    QColor, QFont, QIcon, QImageReader, QPainter, QPalette, QPixmap, QSyntaxHighlighter,
+    QTextCharFormat, QTextDocument,
+)
+from PyQt6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMessageBox,
+    QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QSystemTrayIcon, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
-from ..config import AppConfig, config_manager
-from ..utils.file_utils import format_size, get_file_metadata
+from ..config import config_manager
+from ..utils.file_utils import get_file_metadata
+from ..utils.platform_utils import paths_equal
+from . import theme
+from .theme import SPACE_L, SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SecondaryLabel
 
 
+# --------------------------------------------------------------------------- resources
 def find_resource(name: str) -> Optional[Path]:
     """Locate a bundled data file (e.g. ``files.ico``) in source, wheel or Nuitka builds.
 
@@ -71,154 +77,148 @@ def app_icon() -> QIcon:
     return QIcon(str(path)) if path else QIcon()
 
 
-class CustomTitleBar(QWidget):
-    """Custom title bar for a frameless/modern look."""
-    theme_toggled = pyqtSignal(str)  # Emits new theme name
+def app_version() -> str:
+    # Compiled builds carry no package metadata, so use the in-package constant.
+    from .. import __version__
 
-    def __init__(self, parent=None, title="Fast File Search Pro"):
+    return __version__
+
+
+# --------------------------------------------------------------------------- small widgets
+class ElidedLabel(QLabel):
+    """Single-line label that elides instead of forcing its parent wider."""
+
+    def __init__(self, text: str = "", mode: Qt.TextElideMode = Qt.TextElideMode.ElideRight,
+                 parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.parent_window = parent
-        self.drag_position = QPoint()
-        self.is_dark = config_manager.config.theme == "dark"
+        self._full = ""
+        self._mode = mode
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setText(text)
 
-        self.setFixedHeight(42)
-        self.layout = QHBoxLayout(self)
-        self.layout.setContentsMargins(10, 0, 10, 0)
-        self.layout.setSpacing(5)
+    def setText(self, text: Optional[str]) -> None:  # noqa: N802 (Qt naming)
+        self._full = text or ""
+        super().setText(self._full)
+        self._update_tooltip()
 
-        # App Icon & Title
-        self.icon_label = QLabel()
-        self.icon_label.setFixedSize(20, 20)
-        self.icon_label.setScaledContents(True)
-        icon = app_icon()
-        if not icon.isNull():
-            self.icon_label.setPixmap(icon.pixmap(20, 20))
+    def text(self) -> str:
+        return self._full
 
-        self.title_label = QLabel(title)
-        self.title_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        self.title_label.setStyleSheet("color: white; border: none; background: transparent;")
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(0, super().minimumSizeHint().height())
 
-        self.layout.addWidget(self.icon_label)
-        self.layout.addWidget(self.title_label)
-        self.layout.addStretch()
+    def _elided(self) -> str:
+        return self.fontMetrics().elidedText(self._full, self._mode, self.contentsRect().width())
 
-        # Theme Toggle Button
-        self.theme_btn = QPushButton()
-        self.theme_btn.setFixedSize(30, 30)
-        self.theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.theme_btn.clicked.connect(self.toggle_theme)
-        self.update_theme_btn_icon()
-        self.layout.addWidget(self.theme_btn)
+    def _update_tooltip(self) -> None:
+        self.setToolTip(self._full if self._elided() != self._full else "")
 
-        # Window Controls
-        self.min_btn = QPushButton("—")
-        self.min_btn.setFixedSize(35, 30)
-        self.min_btn.clicked.connect(self.minimize_parent)
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._update_tooltip()
 
-        self.max_btn = QPushButton("⬜")
-        self.max_btn.setFixedSize(35, 30)
-        self.max_btn.clicked.connect(self.maximize_parent)
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        self.style().drawItemText(
+            painter, self.contentsRect(), int(self.alignment() | Qt.AlignmentFlag.AlignVCenter),
+            self.palette(), self.isEnabled(), self._elided(), self.foregroundRole(),
+        )
 
-        self.close_btn = QPushButton("✕")
-        self.close_btn.setFixedSize(35, 30)
-        self.close_btn.setObjectName("close_btn")
-        self.close_btn.clicked.connect(self.close_parent)
 
-        for btn in (self.min_btn, self.max_btn, self.close_btn):
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.layout.addWidget(btn)
+class EmptyState(QFrame):
+    """Centered title, one-line explanation and optional buttons."""
 
-        self.setStyleSheet("""
-            CustomTitleBar {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1E1E24, stop:1 #2D2D35);
-                border-bottom: 1px solid #15151A;
-            }
-            QPushButton {
-                background: transparent;
-                border: none;
-                color: #DCDCDC;
-                font-family: 'Segoe UI';
-                font-size: 11px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background: #3E3E45;
-                color: white;
-            }
-            QPushButton#close_btn:hover {
-                background: #E81123;
-                color: white;
-            }
-        """)
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.kind = ""
+        self.buttons: List[QPushButton] = []
+        # Same frame and background as the results list it stands in for.
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setAutoFillBackground(True)
+        self.setBackgroundRole(QPalette.ColorRole.Base)
 
-    def update_theme_btn_icon(self):
-        # Using unicode symbols for light/dark theme toggle to avoid missing image file issues
-        self.theme_btn.setText("☀️" if self.is_dark else "🌙")
-        self.theme_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 14px;
-                color: white;
-                background: transparent;
-                border: none;
-            }
-            QPushButton:hover {
-                background: #3E3E45;
-                border-radius: 15px;
-            }
-        """)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(SPACE_XL, SPACE_XL, SPACE_XL, SPACE_XL)
+        column = QWidget()
+        column.setMaximumWidth(460)
+        column.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        root.addStretch(1)
+        root.addWidget(column, 100)
+        root.addStretch(1)
+        outer = QVBoxLayout(column)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(SPACE_S)
+        outer.addStretch(2)
 
-    def toggle_theme(self):
-        self.is_dark = not self.is_dark
-        theme_str = "dark" if self.is_dark else "light"
-        config_manager.config.theme = theme_str
-        config_manager.save()
-        self.update_theme_btn_icon()
-        self.theme_toggled.emit(theme_str)
+        self.title = QLabel()
+        self.title.setFont(theme.ui_font(1.25, QFont.Weight.DemiBold))
+        self.title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.title.setWordWrap(True)
+        self.message = SecondaryLabel()
+        self.message.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.message.setWordWrap(True)
+        self.message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        for lbl in (self.title, self.message):
+            outer.addWidget(lbl)
+        outer.addSpacing(SPACE_L)
 
-    def minimize_parent(self):
-        if self.parent_window:
-            self.parent_window.showMinimized()
+        self.button_row = QHBoxLayout()
+        self.button_row.setSpacing(SPACE_S)
+        self.button_row.addStretch()
+        self.button_row.addStretch()
+        outer.addLayout(self.button_row)
+        outer.addStretch(3)
 
-    def maximize_parent(self):
-        if self.parent_window:
-            if self.parent_window.isMaximized():
-                self.parent_window.showNormal()
-                self.max_btn.setText("⬜")
-            else:
-                self.parent_window.showMaximized()
-                self.max_btn.setText("❐")
+    def set_content(self, kind: str, title: str, message: str = "",
+                    actions: Sequence[Tuple[str, Callable[[], None]]] = ()) -> None:
+        self.kind = kind
+        self.title.setText(title)
+        self.message.setText(message)
+        self.message.setVisible(bool(message))
+        for b in self.buttons:
+            # Hide first: until the deferred delete runs, a removed button would
+            # otherwise be painted over the content at its default size.
+            b.hide()
+            self.button_row.removeWidget(b)
+            b.deleteLater()
+        self.buttons = []
+        for i, (text, callback) in enumerate(actions):
+            btn = QPushButton(text)
+            btn.clicked.connect(lambda _=False, cb=callback: cb())
+            self.button_row.insertWidget(1 + i, btn)
+            self.buttons.append(btn)
 
-    def close_parent(self):
-        if self.parent_window:
-            self.parent_window.close()
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.parent_window:
-            self.drag_position = event.globalPosition().toPoint() - self.parent_window.frameGeometry().topLeft()
-            event.accept()
+# --------------------------------------------------------------------------- filters
+_SIZE_PRESETS: List[Tuple[str, Optional[Tuple[Optional[int], Optional[int]]]]] = [
+    ("Any size", None),
+    ("Under 10 KB", (0, 10 * 1024)),
+    ("10 KB to 1 MB", (10 * 1024, 1024 ** 2)),
+    ("1 MB to 10 MB", (1024 ** 2, 10 * 1024 ** 2)),
+    ("10 MB to 100 MB", (10 * 1024 ** 2, 100 * 1024 ** 2)),
+    ("100 MB to 1 GB", (100 * 1024 ** 2, 1024 ** 3)),
+    ("Over 1 GB", (1024 ** 3, None)),
+]
 
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton and self.parent_window:
-            self.parent_window.move(event.globalPosition().toPoint() - self.drag_position)
-            event.accept()
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.maximize_parent()
+_DATE_PRESETS = [
+    ("Any time", "any"), ("Today", "today"), ("Yesterday", "yesterday"),
+    ("Past 7 days", "week"), ("Past 30 days", "month"), ("Past year", "year"),
+    ("Custom range", "custom"),
+]
 
 
 class FilterPanel(QFrame):
-    """Collapsible panel containing advanced filters."""
+    """Type, size, date, path and exclude filters for the current search."""
     filters_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFrameShape(QFrame.Shape.NoFrame)
         self.setObjectName("FilterPanel")
-        
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(10, 10, 10, 10)
-        self.main_layout.setSpacing(12)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, SPACE_S, 0, 0)
+        layout.setSpacing(SPACE_S)
 
         # Typing in the regex/exclude boxes must not fire a full search per keystroke.
         self._filter_timer = QTimer(self)
@@ -226,360 +226,221 @@ class FilterPanel(QFrame):
         self._filter_timer.setInterval(300)
         self._filter_timer.timeout.connect(self.filters_changed.emit)
 
-        # Title / Collapse Header
-        self.header_layout = QHBoxLayout()
-        self.title_lbl = QLabel("Advanced Filters")
-        self.title_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        self.header_layout.addWidget(self.title_lbl)
-        self.header_layout.addStretch()
-        
+        header = QHBoxLayout()
+        header.setSpacing(SPACE_S)
+        self.title_lbl = QLabel("Filters")
+        self.title_lbl.setFont(theme.ui_font(1.0, QFont.Weight.DemiBold))
+        header.addWidget(self.title_lbl)
+        header.addStretch()
         self.clear_filters_btn = QPushButton("Reset")
-        self.clear_filters_btn.setFixedSize(50, 22)
-        self.clear_filters_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_filters_btn.setToolTip("Clear all filters")
         self.clear_filters_btn.clicked.connect(self.reset_filters)
-        self.header_layout.addWidget(self.clear_filters_btn)
-        self.main_layout.addLayout(self.header_layout)
+        header.addWidget(self.clear_filters_btn)
+        layout.addLayout(header)
 
-        # Line Separator
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        line.setStyleSheet("background-color: #DDDDDD;")
-        self.main_layout.addWidget(line)
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(SPACE_M)
+        form.setVerticalSpacing(SPACE_S)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.form_layout = form
 
-        # Filters Layout Form
-        self.form_widget = QWidget()
-        self.form_layout = QFormLayout(self.form_widget)
-        self.form_layout.setContentsMargins(0, 0, 0, 0)
-        self.form_layout.setSpacing(10)
-        self.form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-
-        # 1. File Type/Extension Selector
         self.ext_combo = QComboBox()
-        self.ext_combo.addItem("All Types")
-        self.ext_combo.currentTextChanged.connect(self._on_filter_changed)
-        self.form_layout.addRow(QLabel("File Type:"), self.ext_combo)
+        self.ext_combo.addItem("All types", None)
+        self.ext_combo.currentIndexChanged.connect(self._on_filter_changed)
+        form.addRow("Type", self.ext_combo)
 
-        # 2. File Size Selector
-        self.size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.size_slider.setRange(0, 6)
-        self.size_slider.setValue(0)
-        self.size_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.size_slider.setTickInterval(1)
-        self.size_slider.valueChanged.connect(self._on_size_slider_changed)
+        self.size_combo = QComboBox()
+        for text, rng in _SIZE_PRESETS:
+            self.size_combo.addItem(text, rng)
+        self.size_combo.currentIndexChanged.connect(self._on_filter_changed)
+        form.addRow("Size", self.size_combo)
 
-        self.size_lbl = QLabel("Any Size")
-        self.size_lbl.setFont(QFont("Segoe UI", 8, QFont.Weight.Medium))
-        self.size_lbl.setStyleSheet("color: #666;")
-
-        size_container = QVBoxLayout()
-        size_container.addWidget(self.size_slider)
-        size_container.addWidget(self.size_lbl)
-        self.form_layout.addRow(QLabel("Max Size:"), size_container)
-
-        # 3. Date Modified Range Selector
         self.date_combo = QComboBox()
-        self.date_combo.addItems(["Any Time", "Today", "Yesterday", "Past Week", "Past Month", "Past Year", "Custom Range"])
-        self.date_combo.currentTextChanged.connect(self._on_date_preset_changed)
-        self.form_layout.addRow(QLabel("Date Modified:"), self.date_combo)
+        for text, key in _DATE_PRESETS:
+            self.date_combo.addItem(text, key)
+        self.date_combo.currentIndexChanged.connect(self._on_date_preset_changed)
+        form.addRow("Modified", self.date_combo)
 
-        # Custom date widget container (hidden by default)
         self.custom_date_widget = QWidget()
-        date_range_layout = QHBoxLayout(self.custom_date_widget)
-        date_range_layout.setContentsMargins(0, 0, 0, 0)
+        dates = QHBoxLayout(self.custom_date_widget)
+        dates.setContentsMargins(0, 0, 0, 0)
+        dates.setSpacing(SPACE_S)
         self.start_date_edit = QDateEdit(QDate.currentDate().addYears(-1))
-        self.start_date_edit.setCalendarPopup(True)
-        self.start_date_edit.dateChanged.connect(self._on_filter_changed)
         self.end_date_edit = QDateEdit(QDate.currentDate())
-        self.end_date_edit.setCalendarPopup(True)
-        self.end_date_edit.dateChanged.connect(self._on_filter_changed)
-
-        date_range_layout.addWidget(self.start_date_edit)
-        date_range_layout.addWidget(QLabel("to"))
-        date_range_layout.addWidget(self.end_date_edit)
+        for edit, name in ((self.start_date_edit, "From date"), (self.end_date_edit, "To date")):
+            edit.setCalendarPopup(True)
+            edit.setAccessibleName(name)
+            edit.dateChanged.connect(self._on_filter_changed)
+        dates.addWidget(self.start_date_edit, 1)
+        dates.addWidget(QLabel("to"))
+        dates.addWidget(self.end_date_edit, 1)
         self.custom_date_widget.setVisible(False)
-        self.form_layout.addRow("", self.custom_date_widget)
+        form.addRow("", self.custom_date_widget)
 
-        # 4. Path Regex Filter
         self.regex_input = QLineEdit()
-        self.regex_input.setPlaceholderText("^.*\\\\src\\\\.*$")
+        self.regex_input.setPlaceholderText("Regular expression")
+        self.regex_input.setClearButtonEnabled(True)
         self.regex_input.textChanged.connect(self._on_filter_changed)
-        self.form_layout.addRow(QLabel("Path Regex:"), self.regex_input)
+        form.addRow("Path", self.regex_input)
+        self.regex_error = QLabel()
+        self.regex_error.setWordWrap(True)
+        self.regex_error.setVisible(False)
+        form.addRow("", self.regex_error)
 
-        # 5. Exclude Patterns
         self.exclude_input = QLineEdit()
-        self.exclude_input.setPlaceholderText(".git, __pycache__, node_modules")
+        self.exclude_input.setPlaceholderText("node_modules, *.tmp")
+        self.exclude_input.setClearButtonEnabled(True)
         self.exclude_input.textChanged.connect(self._on_filter_changed)
-        self.form_layout.addRow(QLabel("Exclude:"), self.exclude_input)
+        form.addRow("Exclude", self.exclude_input)
 
-        self.main_layout.addWidget(self.form_widget)
-        self.main_layout.addStretch()
+        for row in range(form.rowCount()):
+            label = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+            field = form.itemAt(row, QFormLayout.ItemRole.FieldRole)
+            if label and field and isinstance(label.widget(), QLabel) and label.widget().text():
+                label.widget().setBuddy(field.widget())
+                field.widget().setAccessibleName(label.widget().text())
 
-        # Apply initial (light) theme
-        self.apply_theme(False)
+        layout.addLayout(form)
+        layout.addStretch()
+        self._sync_reset()
 
-    def apply_theme(self, is_dark: bool):
-        """Apply dark or light stylesheet to the entire filter panel."""
-        if is_dark:
-            self.setStyleSheet("""
-                QFrame#FilterPanel {
-                    background-color: #1C1C1E;
-                    border-right: 1px solid #2C2C2E;
-                }
-                QLabel {
-                    font-family: 'Segoe UI';
-                    font-size: 11px;
-                    color: #EBEBF5;
-                }
-                QComboBox, QLineEdit, QDateEdit {
-                    font-family: 'Segoe UI';
-                    font-size: 11px;
-                    padding: 4px 8px;
-                    border: 1px solid #3A3A3C;
-                    border-radius: 4px;
-                    background-color: #2C2C2E;
-                    color: #FFFFFF;
-                }
-                QComboBox:hover, QLineEdit:focus, QDateEdit:hover {
-                    border-color: #0A84FF;
-                }
-                QComboBox QAbstractItemView {
-                    background-color: #2C2C2E;
-                    color: #FFFFFF;
-                    selection-background-color: #0A84FF;
-                }
-                QSlider::groove:horizontal {
-                    height: 4px;
-                    background: #3A3A3C;
-                    border-radius: 2px;
-                }
-                QSlider::handle:horizontal {
-                    background: #0A84FF;
-                    width: 14px;
-                    height: 14px;
-                    margin: -5px 0;
-                    border-radius: 7px;
-                }
-                QSlider::sub-page:horizontal {
-                    background: #0A84FF;
-                    border-radius: 2px;
-                }
-                QPushButton {
-                    font-family: 'Segoe UI';
-                    font-size: 10px;
-                    background-color: #2C2C2E;
-                    color: #FFFFFF;
-                    border: 1px solid #3A3A3C;
-                    border-radius: 3px;
-                }
-                QPushButton:hover {
-                    background-color: #3A3A3C;
-                }
-            """)
-        else:
-            self.setStyleSheet("""
-                QFrame#FilterPanel {
-                    background-color: #F8F9FA;
-                    border-right: 1px solid #E0E0E0;
-                }
-                QLabel {
-                    font-family: 'Segoe UI';
-                    font-size: 11px;
-                    color: #333333;
-                }
-                QComboBox, QLineEdit, QDateEdit {
-                    font-family: 'Segoe UI';
-                    font-size: 11px;
-                    padding: 4px 8px;
-                    border: 1px solid #CCCCCC;
-                    border-radius: 4px;
-                    background-color: #FFFFFF;
-                    color: #333333;
-                }
-                QComboBox:hover, QLineEdit:focus, QDateEdit:hover {
-                    border-color: #007AFF;
-                }
-                QSlider::groove:horizontal {
-                    height: 4px;
-                    background: #CCCCCC;
-                    border-radius: 2px;
-                }
-                QSlider::handle:horizontal {
-                    background: #007AFF;
-                    width: 14px;
-                    height: 14px;
-                    margin: -5px 0;
-                    border-radius: 7px;
-                }
-                QSlider::sub-page:horizontal {
-                    background: #007AFF;
-                    border-radius: 2px;
-                }
-                QPushButton {
-                    font-family: 'Segoe UI';
-                    font-size: 10px;
-                    background-color: #EFEFEF;
-                    color: #333333;
-                    border: 1px solid #CCCCCC;
-                    border-radius: 3px;
-                }
-                QPushButton:hover {
-                    background-color: #DDDDDD;
-                }
-            """)
+    # -- state
+    def active_filter_count(self) -> int:
+        return sum((
+            self.ext_combo.currentIndex() > 0,
+            self.size_combo.currentIndex() > 0,
+            self.date_combo.currentIndex() > 0,
+            bool(self.regex_input.text().strip()),
+            bool(self.exclude_input.text().strip()),
+        ))
+
+    def _sync_reset(self) -> None:
+        self.clear_filters_btn.setEnabled(self.active_filter_count() > 0)
 
     def update_extensions(self, extensions: List[str]):
-        """Populate the file type dropdown dynamically."""
-        current = self.ext_combo.currentText()
+        """Fill the type list with the most common extensions, keeping the selection."""
+        current = self.ext_combo.currentData()
         self.ext_combo.blockSignals(True)
         self.ext_combo.clear()
-        self.ext_combo.addItem("All Types")
+        self.ext_combo.addItem("All types", None)
         for ext in extensions:
             if ext:
-                self.ext_combo.addItem(ext)
-        # Keep the user's selection across index refreshes.
-        if current and current != "All Types":
-            idx = self.ext_combo.findText(current)
+                self.ext_combo.addItem(ext, ext)
+        if current:
+            idx = self.ext_combo.findData(current)
             if idx < 0:
-                self.ext_combo.addItem(current)
+                self.ext_combo.addItem(current, current)
                 idx = self.ext_combo.count() - 1
             self.ext_combo.setCurrentIndex(idx)
         self.ext_combo.blockSignals(False)
 
     def _on_filter_changed(self, *_args):
+        self._sync_reset()
         self._filter_timer.start()
 
-    def _on_size_slider_changed(self, value):
-        labels = {
-            0: "Any Size",
-            1: "Tiny (< 10 KB)",
-            2: "Small (10 KB - 1 MB)",
-            3: "Medium (1 MB - 10 MB)",
-            4: "Large (10 MB - 100 MB)",
-            5: "Huge (100 MB - 1 GB)",
-            6: "Gigantic (> 1 GB)"
-        }
-        self.size_lbl.setText(labels.get(value, "Any Size"))
-        self._on_filter_changed()
-
-    def _on_date_preset_changed(self, text):
-        self.custom_date_widget.setVisible(text == "Custom Range")
+    def _on_date_preset_changed(self, *_args):
+        self.custom_date_widget.setVisible(self.date_combo.currentData() == "custom")
         self._on_filter_changed()
 
     def reset_filters(self):
-        # QObject.blockSignals() on the panel does not silence its children, so block each
-        # control; otherwise every child fires filters_changed and triggers its own search.
+        # blockSignals() on the panel does not silence its children, so block each
+        # control; otherwise every child fires filters_changed and triggers a search.
         self._filter_timer.stop()
-        controls = (
-            self.ext_combo, self.size_slider, self.date_combo,
-            self.regex_input, self.exclude_input,
-        )
+        controls = (self.ext_combo, self.size_combo, self.date_combo,
+                    self.regex_input, self.exclude_input)
         for c in controls:
             c.blockSignals(True)
         self.ext_combo.setCurrentIndex(0)
-        self.size_slider.setValue(0)
-        self.size_lbl.setText("Any Size")
+        self.size_combo.setCurrentIndex(0)
         self.date_combo.setCurrentIndex(0)
         self.custom_date_widget.setVisible(False)
         self.regex_input.clear()
-        self.regex_input.setStyleSheet("")
+        self._set_regex_error(None)
         self.exclude_input.clear()
         for c in controls:
             c.blockSignals(False)
+        self._sync_reset()
         self.filters_changed.emit()
 
+    def _set_regex_error(self, message: Optional[str]) -> None:
+        if message:
+            theme.set_error_text(self.regex_error, True)
+        self.regex_error.setText(message or "")
+        self.regex_error.setVisible(bool(message))
+        self.regex_input.setToolTip(message or "")
+        self.regex_input.setAccessibleDescription(message or "")
+
     def get_filter_values(self) -> dict:
-        """Returns active filters for search engine queries."""
-        ext = self.ext_combo.currentText()
-        size_idx = self.size_slider.value()
-        date_preset = self.date_combo.currentText()
+        """Active filters for the search engine."""
         regex_pattern = self.regex_input.text().strip()
         if regex_pattern:
             try:
                 re.compile(regex_pattern)
-                self.regex_input.setStyleSheet("")
-                self.regex_input.setToolTip("")
+                self._set_regex_error(None)
             except re.error as exc:
-                # An invalid pattern must not abort the whole search; flag it and ignore it.
-                self.regex_input.setStyleSheet("QLineEdit { border: 1px solid #D32F2F; }")
-                self.regex_input.setToolTip(f"Invalid regular expression: {exc}")
+                # An invalid pattern must not abort the search; say so and ignore it.
+                self._set_regex_error(f"Not a valid regular expression ({exc}). Ignored.")
                 regex_pattern = ""
         else:
-            self.regex_input.setStyleSheet("")
+            self._set_regex_error(None)
         excludes = [p.strip() for p in self.exclude_input.text().split(",") if p.strip()]
-
-        size_range: Optional[Tuple[Optional[int], Optional[int]]] = None
-        # Values mapping in Bytes
-        if size_idx == 1:
-            size_range = (0, 10 * 1024)
-        elif size_idx == 2:
-            size_range = (10 * 1024, 1024 * 1024)
-        elif size_idx == 3:
-            size_range = (1024 * 1024, 10 * 1024 * 1024)
-        elif size_idx == 4:
-            size_range = (10 * 1024 * 1024, 100 * 1024 * 1024)
-        elif size_idx == 5:
-            size_range = (100 * 1024 * 1024, 1024 * 1024 * 1024)
-        elif size_idx == 6:
-            size_range = (1024 * 1024 * 1024, None)
 
         date_range: Optional[Tuple[Optional[float], Optional[float]]] = None
         today = QDate.currentDate()
-        t_now = time.time()
-        one_day = 24 * 3600
+        now = time.time()
+        day = 24 * 3600
         midnight = float(today.startOfDay().toSecsSinceEpoch())
-
-        if date_preset == "Today":
-            date_range = (midnight, t_now)
-        elif date_preset == "Yesterday":
+        preset = self.date_combo.currentData()
+        if preset == "today":
+            date_range = (midnight, now)
+        elif preset == "yesterday":
             date_range = (float(today.addDays(-1).startOfDay().toSecsSinceEpoch()), midnight - 1)
-        elif date_preset == "Past Week":
-            date_range = (t_now - 7 * one_day, t_now)
-        elif date_preset == "Past Month":
-            date_range = (t_now - 30 * one_day, t_now)
-        elif date_preset == "Past Year":
-            date_range = (t_now - 365 * one_day, t_now)
-        elif date_preset == "Custom Range":
+        elif preset == "week":
+            date_range = (now - 7 * day, now)
+        elif preset == "month":
+            date_range = (now - 30 * day, now)
+        elif preset == "year":
+            date_range = (now - 365 * day, now)
+        elif preset == "custom":
             d1, d2 = self.start_date_edit.date(), self.end_date_edit.date()
             if d1 > d2:
                 d1, d2 = d2, d1
-            date_range = (
-                float(d1.startOfDay().toSecsSinceEpoch()),
-                float(d2.endOfDay().toSecsSinceEpoch()),
-            )
+            date_range = (float(d1.startOfDay().toSecsSinceEpoch()),
+                          float(d2.endOfDay().toSecsSinceEpoch()))
 
         return {
-            "extension": None if ext == "All Types" else ext,
-            "size_range": size_range,
+            "extension": self.ext_combo.currentData() or None,
+            "size_range": self.size_combo.currentData(),
             "date_range": date_range,
-            "regex": regex_pattern if regex_pattern else None,
-            "exclude_patterns": excludes
+            "regex": regex_pattern or None,
+            "exclude_patterns": excludes,
         }
 
 
+# --------------------------------------------------------------------------- preview
 class MatchHighlighter(QSyntaxHighlighter):
-    """QSyntaxHighlighter to highlight search terms matching current queries."""
+    """Marks the search terms in the text preview, like find-in-page."""
+
     def __init__(self, parent: QTextDocument, terms: List[str]):
         super().__init__(parent)
         self.rules: List[Tuple[re.Pattern, QTextCharFormat]] = []
         self._fmt = QTextCharFormat()
-        self._fmt.setBackground(QColor("#FFE082"))  # Soft amber background
+        self._fmt.setBackground(QColor("#ffe082"))
         self._fmt.setForeground(QColor("#000000"))
-        self._fmt.setFontWeight(QFont.Weight.Bold)
         self._build_rules(terms)
 
     def _build_rules(self, terms: List[str]) -> None:
         self.rules = []
         for term in terms:
             if len(term) >= 2:
-                # Escape wildcards/regex metacharacters; ignore case
                 self.rules.append((re.compile(re.escape(term), re.IGNORECASE), self._fmt))
 
     def set_terms(self, terms: List[str]) -> None:
         self._build_rules(terms)
         self.rehighlight()
 
-    def highlightBlock(self, text: Optional[str]) -> None:
+    def highlightBlock(self, text: Optional[str]) -> None:  # noqa: N802
         if not text:
             return
         for pat, fmt in self.rules:
@@ -589,10 +450,10 @@ class MatchHighlighter(QSyntaxHighlighter):
 
 
 class PreviewLoaderThread(QThread):
-    """Background loader thread to read and preview files safely.
+    """Reads a file's start and metadata off the GUI thread, then hashes it.
 
-    The thread is cancelled cooperatively (never ``terminate()``d): killing a thread that
-    holds the GIL or an open file handle can deadlock or crash the whole process.
+    Cancelled cooperatively (never ``terminate()``d): killing a thread that holds the
+    GIL or an open file handle can deadlock or crash the whole process.
     """
     loaded = pyqtSignal(str, str, dict)  # path, content_preview, meta
     hashes_ready = pyqtSignal(str, str, str)  # path, md5, sha256
@@ -627,15 +488,14 @@ class PreviewLoaderThread(QThread):
         try:
             p = Path(self.path)
             if not p.exists():
-                self.error.emit("File does not exist.")
+                self.error.emit("The file no longer exists.")
                 return
 
             meta = dict(get_file_metadata(self.path))
             meta.setdefault("extension", p.suffix.lower())
-            meta["md5"] = "Calculating..." if p.is_file() else "N/A (directory)"
-            meta["sha256"] = meta["md5"]
+            pending = "Calculating…" if p.is_file() else "Not available for folders"
+            meta["md5"] = meta["sha256"] = pending
 
-            # Simple content preview loading
             mime, _ = mimetypes.guess_type(self.path)
             if p.is_dir():
                 try:
@@ -644,24 +504,24 @@ class PreviewLoaderThread(QThread):
                         n += 1
                         if n >= 100000:
                             break
-                    count = f"{n}+" if n >= 100000 else str(n)
+                    count = f"{n:,}+" if n >= 100000 else f"{n:,}"
                 except OSError:
-                    count = "?"
-                content = f"Directory: {p.name}\nContains {count} items."
+                    count = "an unknown number of"
+                content = f"Folder with {count} items."
             elif mime and mime.startswith("image/"):
                 content = "IMAGE_FILE"
             elif mime and mime.startswith("video/"):
-                content = "VIDEO_FILE"
+                content = "No preview for video files."
             elif mime == "application/pdf":
-                content = "PDF_FILE"
+                content = "No preview for PDF files. Open the file to read it."
             else:
                 try:
                     with open(self.path, "rb") as f:
                         raw = f.read(8192)
                     text = self._decode_preview(raw)
-                    content = text[:4000] if text is not None else "Binary file - no text preview."
-                except Exception:
-                    content = "Binary or unreadable file."
+                    content = text[:4000] if text is not None else "No preview for this type of file."
+                except OSError as exc:
+                    content = f"The file could not be read: {exc.strerror or exc}"
 
             if self._is_cancelled():
                 return
@@ -676,7 +536,7 @@ class PreviewLoaderThread(QThread):
             except OSError:
                 return
             if size > self.MAX_HASH_SIZE:
-                note = "File too large (>512 MB)"
+                note = "Not calculated for files over 512 MB"
                 self.hashes_ready.emit(self.path, note, note)
                 return
             try:
@@ -690,8 +550,8 @@ class PreviewLoaderThread(QThread):
                         h_md5.update(chunk)
                         h_sha256.update(chunk)
                 self.hashes_ready.emit(self.path, h_md5.hexdigest(), h_sha256.hexdigest())
-            except Exception as e:
-                msg = f"Error: {e}"
+            except OSError as e:
+                msg = f"Could not read the file: {e.strerror or e}"
                 self.hashes_ready.emit(self.path, msg, msg)
         except Exception as e:
             if not self._is_cancelled():
@@ -699,11 +559,14 @@ class PreviewLoaderThread(QThread):
 
 
 class PreviewPanel(QFrame):
-    """Tabbed preview pane displaying file summaries, image thumbs, metadata, tags."""
+    """Name, location, a text/image preview and file details for the selection."""
+
+    DETAIL_FIELDS = ("Location", "Size", "Created", "Modified", "MD5", "SHA-256")
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFrameShape(QFrame.Shape.NoFrame)
         self.setObjectName("PreviewPanel")
+        self.setFrameShape(QFrame.Shape.NoFrame)
 
         self.current_path = ""
         self.loader_thread: Optional[PreviewLoaderThread] = None
@@ -712,168 +575,79 @@ class PreviewPanel(QFrame):
         self.search_terms: List[str] = []
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(SPACE_XS)
 
-        # Header Title
-        self.file_title = QLabel("Select a file to preview")
-        self.file_title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        self.file_title.setWordWrap(True)
+        self.file_title = ElidedLabel()
+        self.file_title.setFont(theme.ui_font(1.1, QFont.Weight.DemiBold))
+        self.file_title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.file_title)
+        self.file_location = ElidedLabel(mode=Qt.TextElideMode.ElideMiddle)
+        theme.make_secondary(self.file_location)
+        layout.addWidget(self.file_location)
+        layout.addSpacing(SPACE_S)
 
-        # Tabs
         self.tabs = QTabWidget()
-        
-        # Preview Tab
+        self.tabs.setDocumentMode(True)
+
         self.preview_tab = QWidget()
         preview_layout = QVBoxLayout(self.preview_tab)
-        preview_layout.setContentsMargins(0, 5, 0, 0)
-        
-        self.text_preview = QTextEdit()
+        preview_layout.setContentsMargins(0, SPACE_S, 0, 0)
+        self.text_preview = QPlainTextEdit()
         self.text_preview.setReadOnly(True)
-        self.text_preview.setFont(QFont("Consolas", 9))
-        self.text_preview.setPlaceholderText("No preview available.")
-        
+        self.text_preview.setFont(theme.fixed_font())
+        self.text_preview.setAccessibleName("File preview")
         self.image_preview = QLabel()
         self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_preview.setVisible(False)
         self.image_preview.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-
+        self.image_preview.setAccessibleName("Image preview")
         preview_layout.addWidget(self.text_preview)
         preview_layout.addWidget(self.image_preview)
         self.tabs.addTab(self.preview_tab, "Preview")
 
-        # Details Tab
         self.details_tab = QWidget()
-        self.details_layout = QGridLayout(self.details_tab)
-        self.details_layout.setContentsMargins(10, 10, 10, 10)
-        self.details_layout.setSpacing(10)
-        
+        form = QFormLayout(self.details_tab)
+        form.setContentsMargins(0, SPACE_M, 0, 0)
+        form.setHorizontalSpacing(SPACE_M)
+        form.setVerticalSpacing(SPACE_S)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.meta_labels: Dict[str, QLabel] = {}
-        fields = [("Path", 0), ("Size", 1), ("Created", 2), ("Modified", 3), ("MD5 Hash", 4), ("SHA256 Hash", 5)]
-        for label, row in fields:
-            lbl_title = QLabel(f"{label}:")
-            lbl_title.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            lbl_val = QLabel("")
-            lbl_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            lbl_val.setWordWrap(True)
-            self.details_layout.addWidget(lbl_title, row, 0, Qt.AlignmentFlag.AlignTop)
-            self.details_layout.addWidget(lbl_val, row, 1)
-            self.meta_labels[label] = lbl_val
-
-        self.details_layout.setColumnStretch(1, 1)
-        # SHA256 is long — let it wrap naturally
-        if "SHA256 Hash" in self.meta_labels:
-            self.meta_labels["SHA256 Hash"].setWordWrap(True)
-        self.details_layout.setRowStretch(len(fields), 1)
+        for field in self.DETAIL_FIELDS:
+            title = SecondaryLabel(field)
+            value = QLabel("")
+            value.setWordWrap(True)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            value.setAccessibleName(field)
+            if field in ("MD5", "SHA-256"):
+                value.setFont(theme.fixed_font())
+            form.addRow(title, value)
+            self.meta_labels[field] = value
         self.tabs.addTab(self.details_tab, "Details")
+        layout.addWidget(self.tabs, 1)
 
-        layout.addWidget(self.tabs)
-
-        # Loading / Progress Bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setFixedHeight(3)
-        layout.addWidget(self.progress_bar)
-
-        self.apply_theme(False)
+        self._show_nothing()
 
         # Never let Qt destroy a QThread that is still running at shutdown.
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self.shutdown)
 
-    def apply_theme(self, is_dark: bool):
-        """Apply dark or light stylesheet to the preview panel."""
-        if is_dark:
-            self.setStyleSheet("""
-                QFrame#PreviewPanel {
-                    background-color: #1C1C1E;
-                    border-left: 1px solid #2C2C2E;
-                }
-                QTabWidget::pane {
-                    border: 1px solid #2C2C2E;
-                    background-color: #18181A;
-                }
-                QTabBar::tab {
-                    font-family: 'Segoe UI';
-                    font-size: 10px;
-                    padding: 6px 12px;
-                    background: #2C2C2E;
-                    color: #EBEBF5;
-                    border: 1px solid #3A3A3C;
-                    border-bottom: none;
-                    border-top-left-radius: 4px;
-                    border-top-right-radius: 4px;
-                }
-                QTabBar::tab:selected {
-                    background: #18181A;
-                    color: #FFFFFF;
-                    border-color: #3A3A3C;
-                }
-                QTextEdit {
-                    border: none;
-                    background: #18181A;
-                    color: #EBEBF5;
-                    font-family: 'Consolas';
-                    font-size: 9px;
-                }
-                QLabel {
-                    font-family: 'Segoe UI';
-                    font-size: 10px;
-                    color: #EBEBF5;
-                }
-                QProgressBar {
-                    background: #2C2C2E;
-                    border: none;
-                }
-                QProgressBar::chunk {
-                    background: #0A84FF;
-                }
-            """)
-        else:
-            self.setStyleSheet("""
-                QFrame#PreviewPanel {
-                    background-color: #F8F9FA;
-                    border-left: 1px solid #E0E0E0;
-                }
-                QTabWidget::pane {
-                    border: 1px solid #DDDDDD;
-                    background-color: #FFFFFF;
-                }
-                QTabBar::tab {
-                    font-family: 'Segoe UI';
-                    font-size: 10px;
-                    padding: 6px 12px;
-                    background: #EFEFEF;
-                    border: 1px solid #CCCCCC;
-                    border-bottom: none;
-                    border-top-left-radius: 4px;
-                    border-top-right-radius: 4px;
-                }
-                QTabBar::tab:selected {
-                    background: #FFFFFF;
-                    border-color: #DDDDDD;
-                }
-                QTextEdit {
-                    border: none;
-                    background: #FFFFFF;
-                    color: #222222;
-                }
-                QLabel {
-                    font-family: 'Segoe UI';
-                    font-size: 10px;
-                    color: #333333;
-                }
-                QProgressBar {
-                    background: #E0E0E0;
-                    border: none;
-                }
-                QProgressBar::chunk {
-                    background: #007AFF;
-                }
-            """)
+    def _show_nothing(self) -> None:
+        self.file_title.setText("No file selected")
+        self.file_location.setText("Select a result to preview it.")
+        self.text_preview.clear()
+        self.text_preview.setPlaceholderText("")
+        for lbl in self.meta_labels.values():
+            lbl.setText("")
+
+    def clear(self) -> None:
+        self._retire_loader()
+        self.current_path = ""
+        self.image_preview.clear()
+        self.image_preview.setVisible(False)
+        self.text_preview.setVisible(True)
+        self._show_nothing()
 
     def set_search_terms(self, terms: List[str]):
         self.search_terms = terms
@@ -911,18 +685,19 @@ class PreviewPanel(QFrame):
         if not path or path == self.current_path:
             return
         self.current_path = path
-        self.file_title.setText(Path(path).name)
+        p = Path(path)
+        self.file_title.setText(theme.display_text(p.name or path))
+        self.file_location.setText(theme.display_text(str(p.parent)))
 
-        # Clean preview states
         self.text_preview.clear()
+        self.text_preview.setPlaceholderText("Loading preview…")
         self.image_preview.clear()
         self.image_preview.setVisible(False)
         self.text_preview.setVisible(True)
+        for lbl in self.meta_labels.values():
+            lbl.setText("")
 
         self._retire_loader()
-
-        self.progress_bar.setVisible(True)
-
         self.loader_thread = PreviewLoaderThread(path)
         self.loader_thread.loaded.connect(self._on_preview_loaded)
         self.loader_thread.hashes_ready.connect(self._on_hashes_ready)
@@ -931,28 +706,26 @@ class PreviewPanel(QFrame):
 
     @staticmethod
     def _format_ts(meta: dict, *keys: str) -> str:
-        import datetime
         for key in keys:
             value = meta.get(key)
             if value:
-                try:
-                    return datetime.datetime.fromtimestamp(float(value)).strftime('%Y-%m-%d %H:%M:%S')
-                except (OverflowError, OSError, ValueError, TypeError):
-                    break
+                return theme.format_timestamp_iso(value)
         return "Unknown"
 
     def _load_image(self, path: str) -> None:
         reader = QImageReader(path)
         reader.setAutoTransform(True)
         area = self.preview_tab.size()
-        target = QSize(max(area.width() - 10, 200), max(area.height() - 10, 200))
+        target = QSize(max(area.width() - SPACE_S, 200), max(area.height() - SPACE_S, 200))
         src = reader.size()
         if src.isValid() and (src.width() > target.width() or src.height() > target.height()):
             # Decode straight to the display size: avoids holding a huge bitmap in memory.
             reader.setScaledSize(src.scaled(target, Qt.AspectRatioMode.KeepAspectRatio))
         image = reader.read()
         if image.isNull():
-            self.image_preview.setText("Failed to load image.")
+            self.image_preview.setVisible(False)
+            self.text_preview.setVisible(True)
+            self.text_preview.setPlainText("This image could not be loaded.")
         else:
             self.image_preview.setPixmap(QPixmap.fromImage(image))
 
@@ -960,27 +733,21 @@ class PreviewPanel(QFrame):
     def _on_preview_loaded(self, path, content, meta):
         if path != self.current_path:
             return
-        self.progress_bar.setVisible(False)
-
-        # Populate Metadata fields
-        self.meta_labels["Path"].setText(str(meta.get("path", path)))
-        self.meta_labels["Size"].setText(format_size(int(meta.get("size", 0) or 0)))
+        self.text_preview.setPlaceholderText("No preview available.")
+        size = int(meta.get("size", 0) or 0)
+        self.meta_labels["Location"].setText(theme.display_text(str(Path(str(meta.get("path", path))).parent)))
+        self.meta_labels["Size"].setText("" if meta.get("is_dir") else theme.format_size_exact(size))
         self.meta_labels["Created"].setText(self._format_ts(meta, "created", "ctime"))
         self.meta_labels["Modified"].setText(self._format_ts(meta, "modified", "mtime"))
-        self.meta_labels["MD5 Hash"].setText(str(meta.get("md5", "—")))
-        self.meta_labels["SHA256 Hash"].setText(str(meta.get("sha256", "—")))
+        self.meta_labels["MD5"].setText(str(meta.get("md5", "")))
+        self.meta_labels["SHA-256"].setText(str(meta.get("sha256", "")))
 
-        # Render Content Preview
         if content == "IMAGE_FILE":
             self.text_preview.setVisible(False)
             self.image_preview.setVisible(True)
             self._load_image(path)
-        elif content == "VIDEO_FILE":
-            self.text_preview.setPlainText(f"Video File: {Path(path).name}\nType: {meta.get('extension', '')}\nDimensions & duration playback require media extensions.")
-        elif content == "PDF_FILE":
-            self.text_preview.setPlainText(f"PDF Document: {Path(path).name}\nOpen the file with custom tools to read document content.")
         else:
-            # Plain text on purpose: setText() would render .html/.md sources as rich text.
+            # Plain text on purpose: rich text would render .html/.md sources.
             self.text_preview.setPlainText(content)
             if self.search_terms:
                 if self.highlighter is None:
@@ -992,274 +759,253 @@ class PreviewPanel(QFrame):
     def _on_hashes_ready(self, path, md5_hex, sha256_hex):
         if path != self.current_path:
             return
-        self.meta_labels["MD5 Hash"].setText(md5_hex)
-        self.meta_labels["SHA256 Hash"].setText(sha256_hex)
+        self.meta_labels["MD5"].setText(md5_hex)
+        self.meta_labels["SHA-256"].setText(sha256_hex)
 
     @pyqtSlot(str)
     def _on_preview_error(self, err_msg):
-        self.progress_bar.setVisible(False)
-        self.text_preview.setPlainText(f"Error loading preview: {err_msg}")
+        self.text_preview.setPlaceholderText("")
+        self.text_preview.setPlainText(f"No preview: {err_msg}")
         # Allow re-selecting the same file to retry.
         self.current_path = ""
 
 
+# --------------------------------------------------------------------------- settings
+def tray_wording() -> str:
+    if theme.IS_MAC:
+        return "Keep running in the menu bar when the window is closed"
+    if theme.IS_WINDOWS:
+        return "Keep running in the notification area when the window is closed"
+    return "Keep running in the system tray when the window is closed"
+
+
 class SettingsDialog(QDialog):
-    """Configuration Settings management dialog."""
+    """Settings (Preferences on macOS): appearance, results, folders, exclusions."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.resize(550, 420)
+        self.setWindowTitle(theme.settings_label())
         self.setModal(True)
+        self.resize(560, 460)
+        self.indexing_changed = False
+        cfg = config_manager.config
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(15, 15, 15, 15)
-
-        # Tab view
+        layout.setContentsMargins(SPACE_L, SPACE_L, SPACE_L, SPACE_L)
+        layout.setSpacing(SPACE_L)
         self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, 1)
 
-        # Tab 1: Indexing Paths
-        self.paths_tab = QWidget()
-        paths_layout = QVBoxLayout(self.paths_tab)
-        
-        self.paths_list = QListWidget()
-        self.paths_list.addItems(config_manager.config.index_paths)
-        paths_layout.addWidget(QLabel("Indexed Folders:"))
-        paths_layout.addWidget(self.paths_list)
-
-        paths_buttons = QHBoxLayout()
-        self.add_path_btn = QPushButton("Add Folder...")
-        self.add_path_btn.clicked.connect(self.add_indexed_path)
-        self.remove_path_btn = QPushButton("Remove Selected")
-        self.remove_path_btn.clicked.connect(self.remove_indexed_path)
-        paths_buttons.addWidget(self.add_path_btn)
-        paths_buttons.addWidget(self.remove_path_btn)
-        paths_buttons.addStretch()
-        paths_layout.addLayout(paths_buttons)
-        self.tabs.addTab(self.paths_tab, "Indexed Folders")
-
-        # Tab 2: Performance
-        self.perf_tab = QWidget()
-        perf_form = QFormLayout(self.perf_tab)
-        
-        self.auto_index_spin = QSpinBox()
-        self.auto_index_spin.setRange(10, 3600)
-        self.auto_index_spin.setValue(config_manager.config.auto_index_interval)
-        perf_form.addRow(QLabel("Auto Indexing Interval (sec):"), self.auto_index_spin)
-
-        self.max_size_spin = QSpinBox()
-        self.max_size_spin.setRange(50, 10000)
-        self.max_size_spin.setValue(config_manager.config.max_index_size)
-        perf_form.addRow(QLabel("Max Index Size (MB):"), self.max_size_spin)
+        # -- General
+        general = QWidget()
+        form = QFormLayout(general)
+        form.setContentsMargins(SPACE_L, SPACE_L, SPACE_L, SPACE_L)
+        form.setHorizontalSpacing(SPACE_M)
+        form.setVerticalSpacing(SPACE_M)
+        self.appearance_combo = QComboBox()
+        for text, mode in (("Use system setting", "system"), ("Light", "light"), ("Dark", "dark")):
+            self.appearance_combo.addItem(text, mode)
+        self.appearance_combo.setCurrentIndex(max(0, self.appearance_combo.findData(theme.current_appearance())))
+        form.addRow("Appearance", self.appearance_combo)
 
         self.max_results_spin = QSpinBox()
-        self.max_results_spin.setRange(10, 5000)
-        self.max_results_spin.setValue(config_manager.config.max_results)
-        perf_form.addRow(QLabel("Max Search Results:"), self.max_results_spin)
-        self.tabs.addTab(self.perf_tab, "Performance")
+        self.max_results_spin.setRange(10, 100000)
+        self.max_results_spin.setSingleStep(100)
+        self.max_results_spin.setGroupSeparatorShown(True)
+        self.max_results_spin.setValue(cfg.max_results)
+        form.addRow("Maximum results", self.max_results_spin)
 
-        # Tab 3: Exclude Patterns
-        self.exclude_tab = QWidget()
-        exclude_layout = QVBoxLayout(self.exclude_tab)
-        exclude_layout.addWidget(QLabel("Global Exclude Patterns (one per line):"))
-        self.exclude_edit = QTextEdit()
-        self.exclude_edit.setPlainText("\n".join(config_manager.config.exclude_patterns))
-        exclude_layout.addWidget(self.exclude_edit)
-        self.tabs.addTab(self.exclude_tab, "Exclude Patterns")
+        self.tray_check = QCheckBox(tray_wording())
+        self.tray_check.setChecked(theme.setting_bool("close_to_tray", False))
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            form.addRow("", self.tray_check)
+        else:
+            self.tray_check.setVisible(False)
+        for row in range(form.rowCount()):
+            label = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+            field = form.itemAt(row, QFormLayout.ItemRole.FieldRole)
+            if label and field and isinstance(label.widget(), QLabel):
+                label.widget().setBuddy(field.widget())
+                field.widget().setAccessibleName(label.widget().text())
+        self.tabs.addTab(general, "General")
 
-        layout.addWidget(self.tabs)
+        # -- Indexing
+        indexing = QWidget()
+        col = QVBoxLayout(indexing)
+        col.setContentsMargins(SPACE_L, SPACE_L, SPACE_L, SPACE_L)
+        col.setSpacing(SPACE_S)
+        folders_lbl = QLabel("Folders to index")
+        folders_lbl.setFont(theme.ui_font(1.0, QFont.Weight.DemiBold))
+        col.addWidget(folders_lbl)
+        self.paths_list = QListWidget()
+        self.paths_list.setAccessibleName("Folders to index")
+        self.paths_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.paths_list.addItems(cfg.index_paths)
+        folders_lbl.setBuddy(self.paths_list)
+        col.addWidget(self.paths_list, 1)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(SPACE_S)
+        self.add_path_btn = QPushButton("Add folder…")
+        self.add_path_btn.clicked.connect(self.add_indexed_path)
+        self.remove_path_btn = QPushButton("Remove")
+        self.remove_path_btn.clicked.connect(self.remove_indexed_path)
+        self.remove_path_btn.setEnabled(False)
+        self.paths_list.itemSelectionChanged.connect(
+            lambda: self.remove_path_btn.setEnabled(bool(self.paths_list.selectedItems())))
+        buttons.addWidget(self.add_path_btn)
+        buttons.addWidget(self.remove_path_btn)
+        buttons.addStretch()
+        col.addLayout(buttons)
 
-        # Dialog Buttons
-        self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        col.addSpacing(SPACE_M)
+        exclude_lbl = QLabel("Skip these names")
+        exclude_lbl.setFont(theme.ui_font(1.0, QFont.Weight.DemiBold))
+        col.addWidget(exclude_lbl)
+        self.exclude_edit = QPlainTextEdit()
+        self.exclude_edit.setAccessibleName("Skip these names")
+        self.exclude_edit.setPlainText("\n".join(cfg.exclude_patterns))
+        self.exclude_edit.setTabChangesFocus(True)
+        exclude_lbl.setBuddy(self.exclude_edit)
+        col.addWidget(self.exclude_edit, 1)
+        col.addWidget(SecondaryLabel("One folder name or pattern per line, for example node_modules or *.tmp."))
+
+        col.addSpacing(SPACE_M)
+        self.content_check = QCheckBox("Index text inside files")
+        self.content_check.setChecked(bool(getattr(cfg, "index_content", False)))
+        col.addWidget(self.content_check)
+        col.addWidget(SecondaryLabel("Lets you search file contents. Indexing is slower and the index gets larger."))
+        self.tabs.addTab(indexing, "Indexing")
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.button_box.accepted.connect(self.save_settings)
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
 
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #F8F9FA;
-            }
-            QTabWidget::pane {
-                border: 1px solid #CCCCCC;
-                border-radius: 4px;
-                padding: 10px;
-                background-color: #FFFFFF;
-            }
-            QLineEdit, QSpinBox, QListWidget, QTextEdit {
-                border: 1px solid #CCCCCC;
-                border-radius: 4px;
-                padding: 5px;
-                font-family: 'Segoe UI';
-                font-size: 11px;
-            }
-            QPushButton {
-                font-family: 'Segoe UI';
-                font-size: 11px;
-                padding: 5px 12px;
-                background-color: #007AFF;
-                color: white;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #0056B3;
-            }
-        """)
+    @property
+    def appearance(self) -> str:
+        return self.appearance_combo.currentData() or "system"
 
     def add_indexed_path(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Index")
+        folder = QFileDialog.getExistingDirectory(self, "Add folder to index")
         if folder:
             # Qt returns forward slashes on Windows; store native paths and compare
             # case/separator-insensitively so the same folder is never listed twice.
             folder = os.path.normpath(folder)
-            key = os.path.normcase(folder)
             for i in range(self.paths_list.count()):
-                if os.path.normcase(os.path.normpath(self.paths_list.item(i).text())) == key:
+                if paths_equal(self.paths_list.item(i).text(), folder):
                     return
             self.paths_list.addItem(folder)
 
     def remove_indexed_path(self):
-        selected = self.paths_list.selectedItems()
-        for s in selected:
+        for s in self.paths_list.selectedItems():
             self.paths_list.takeItem(self.paths_list.row(s))
 
     def save_settings(self):
+        cfg = config_manager.config
         paths = [self.paths_list.item(i).text() for i in range(self.paths_list.count())]
         excludes = [pat.strip() for pat in self.exclude_edit.toPlainText().split("\n") if pat.strip()]
-
-        config_manager.config.index_paths = paths
-        config_manager.config.exclude_patterns = excludes
-        config_manager.config.auto_index_interval = self.auto_index_spin.value()
-        config_manager.config.max_index_size = self.max_size_spin.value()
-        config_manager.config.max_results = self.max_results_spin.value()
-        
+        index_content = self.content_check.isChecked()
+        self.indexing_changed = (paths != list(cfg.index_paths)
+                                 or excludes != list(cfg.exclude_patterns)
+                                 or index_content != bool(getattr(cfg, "index_content", False)))
+        old = (list(cfg.index_paths), list(cfg.exclude_patterns), cfg.max_results,
+               getattr(cfg, "index_content", False))
+        cfg.index_paths = paths
+        cfg.exclude_patterns = excludes
+        cfg.max_results = self.max_results_spin.value()
+        cfg.index_content = index_content
         try:
             config_manager.save()
-            self.accept()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save configuration: {e}")
+            cfg.index_paths, cfg.exclude_patterns, cfg.max_results, cfg.index_content = old
+            QMessageBox.warning(self, "Settings not saved",
+                                f"The settings could not be saved.\n\n{e}")
+            return
+        settings = theme.ui_settings()
+        settings.setValue("appearance", self.appearance)
+        settings.setValue("close_to_tray", self.tray_check.isChecked())
+        self.accept()
 
 
 class AboutDialog(QDialog):
-    """About dialog with project metadata."""
+    """Name, version, what it does, versions of the runtime, license."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("About Fast File Search Pro")
-        self.setFixedSize(380, 240)
+        self.setWindowTitle(f"About {theme.APP_NAME}")
         self.setModal(True)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
 
-        title = QLabel("Fast File Search Pro")
-        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(SPACE_XL, SPACE_XL, SPACE_XL, SPACE_L)
+        layout.setSpacing(SPACE_L)
+        icon = app_icon()
+        if not icon.isNull():
+            icon_lbl = QLabel()
+            icon_lbl.setPixmap(icon.pixmap(48, 48))
+            icon_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
+            layout.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignTop)
 
-        desc = QLabel("A local file search utility that indexes your folders in the background using SQLite trigrams. Includes real-time directory monitoring and advanced size and extension filters.")
+        col = QVBoxLayout()
+        col.setSpacing(SPACE_XS)
+        title = QLabel(theme.APP_NAME)
+        title.setFont(theme.ui_font(1.3, QFont.Weight.DemiBold))
+        col.addWidget(title)
+        self.version_lbl = SecondaryLabel(f"Version {app_version()}")
+        self.version_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        col.addWidget(self.version_lbl)
+        col.addSpacing(SPACE_M)
+        desc = QLabel("Finds files and folders by name in the folders you choose. "
+                      "The index is stored on this computer only.")
         desc.setWordWrap(True)
-        desc.setFont(QFont("Segoe UI", 10))
-        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(desc)
+        col.addWidget(desc)
+        col.addSpacing(SPACE_M)
+        py = ".".join(str(v) for v in sys.version_info[:3])
+        runtime = SecondaryLabel(f"Qt {QT_VERSION_STR}, PyQt {PYQT_VERSION_STR}, Python {py}\nMIT License")
+        runtime.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        col.addWidget(runtime)
+        col.addSpacing(SPACE_L)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        box.rejected.connect(self.reject)
+        box.accepted.connect(self.accept)
+        col.addWidget(box)
+        layout.addLayout(col, 1)
+        self.setFixedWidth(440)
 
 
-        details = QLabel("Version: 1.0.0\nFramework: PyQt6 (Qt 6)\nLicense: MIT License")
-        details.setFont(QFont("Segoe UI", 9.5))
-        details.setStyleSheet("color: #666;")
-        details.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(details)
+# --------------------------------------------------------------------------- export
+def export_results(parent: QWidget, results: List[dict]) -> Optional[str]:
+    """Ask for a file and write the results as CSV or JSON.
 
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
-        close_btn.setFixedSize(80, 28)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        btn_layout.addWidget(close_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #FFFFFF;
-            }
-            QPushButton {
-                font-family: 'Segoe UI';
-                background-color: #007AFF;
-                color: white;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #0056B3;
-            }
-        """)
-
-
-class ExportDialog(QDialog):
-    """Search results export to JSON/CSV formatted dialog."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Export Search Results")
-        self.setFixedSize(300, 160)
-        
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(10)
-
-        layout.addWidget(QLabel("Export formats:"))
-        
-        self.csv_radio = QPushButton("Export as CSV...")
-        self.csv_radio.clicked.connect(self.export_csv)
-        self.json_radio = QPushButton("Export as JSON...")
-        self.json_radio.clicked.connect(self.export_json)
-
-        layout.addWidget(self.csv_radio)
-        layout.addWidget(self.json_radio)
-        layout.addStretch()
-
-        self.results_data: List[dict] = []
-
-    def set_results(self, data: List[dict]):
-        self.results_data = data
-
-    def export_csv(self):
-        if not self.results_data:
-            QMessageBox.warning(self, "Warning", "No search results to export.")
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "Save CSV file", "", "CSV Files (*.csv)")
-        if path:
-            import csv
-            try:
-                with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["Name", "Extension", "Size", "Modified", "Path", "Score"])
-                    for item in self.results_data:
-                        writer.writerow([
-                            item.get("name", ""),
-                            item.get("extension", ""),
-                            item.get("size", 0),
-                            item.get("modified", 0),
-                            item.get("path", ""),
-                            item.get("score", 0.0)
-                        ])
-                QMessageBox.information(self, "Export Complete", "Results exported successfully to CSV.")
-                self.accept()
-            except Exception as e:
-                QMessageBox.critical(self, "Export Failed", f"Failed to save CSV file: {e}")
-
-    def export_json(self):
-        if not self.results_data:
-            QMessageBox.warning(self, "Warning", "No search results to export.")
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "Save JSON file", "", "JSON Files (*.json)")
-        if path:
-            import json
-            try:
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(self.results_data, f, indent=2, ensure_ascii=False)
-                QMessageBox.information(self, "Export Complete", "Results exported successfully to JSON.")
-                self.accept()
-            except Exception as e:
-                QMessageBox.critical(self, "Export Failed", f"Failed to save JSON file: {e}")
+    Returns a status message for the status bar, or None when cancelled.  Errors are
+    shown in a dialog.
+    """
+    if not results:
+        return "There are no results to export."
+    path, chosen = QFileDialog.getSaveFileName(
+        parent, "Export results", "search-results.csv", "CSV (*.csv);;JSON (*.json)")
+    if not path:
+        return None
+    as_json = path.lower().endswith(".json") or (chosen.startswith("JSON") and not path.lower().endswith(".csv"))
+    if as_json and not path.lower().endswith(".json"):
+        path += ".json"
+    try:
+        if as_json:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+        else:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Name", "Extension", "Size", "Modified", "Path", "Score"])
+                for item in results:
+                    writer.writerow([item.get("name", ""), item.get("extension", ""),
+                                     item.get("size", 0), item.get("modified", 0),
+                                     item.get("path", ""), item.get("score", 0.0)])
+    except OSError as e:
+        QMessageBox.warning(parent, "Export failed",
+                            f'Could not write "{Path(path).name}": {e.strerror or e}')
+        return None
+    n = len(results)
+    return f'Exported {n:,} {"result" if n == 1 else "results"} to "{Path(path).name}".'

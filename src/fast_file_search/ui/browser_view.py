@@ -2,243 +2,219 @@ from __future__ import annotations
 
 import os
 from collections import Counter
-from pathlib import Path, PurePath
-from typing import List, Optional
+from pathlib import PurePath
+from typing import List, Optional, Tuple
 
+from PyQt6.QtCore import QDir, QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QFileSystemModel, QGuiApplication, QPainter, QPalette, QPen
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
-    QTreeView, QMenu, QMessageBox, QFrame, QHeaderView, QStyledItemDelegate,
-    QFileDialog, QProgressDialog, QApplication
+    QApplication, QFileDialog, QFrame, QHBoxLayout, QMenu, QMessageBox, QProgressDialog,
+    QSizePolicy, QStyle, QStyledItemDelegate, QToolButton, QToolTip, QTreeView, QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QUrl, QDir
-from PyQt6.QtGui import QIcon, QAction, QGuiApplication, QFileSystemModel, QPainter, QColor, QDesktopServices
 
 from ..config import config_manager
+from ..utils.platform_utils import is_path_under, path_key
+from . import file_actions, theme
+from .theme import SPACE_M, SPACE_S, SPACE_XS
+
+_STATUS_TEXT = {
+    "indexed": "Indexed",
+    "partial": "Contains indexed folders",
+    "excluded": "Excluded from the index",
+}
 
 
 class IndexStatusDelegate(QStyledItemDelegate):
-    """Custom delegate to draw colored dots representing indexing status for folders."""
+    """Small marker at the right of folder rows: filled dot = indexed, ring = contains
+    indexed folders, dash = excluded.  The tooltip says the same in words."""
+
     def __init__(self, parent, get_status_callback):
         super().__init__(parent)
         self.get_status_callback = get_status_callback
 
     def paint(self, painter: Optional[QPainter], option, index):
-        # Paint default item first
         super().paint(painter, option, index)
+        if painter is None or index.column() != 0:
+            return
+        status = self.get_status_callback(index)
+        if not status:
+            return
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        pal = option.palette
+        if selected:
+            color = pal.color(QPalette.ColorRole.HighlightedText)
+        elif status == "excluded":
+            color = theme.secondary_text_color(pal)
+        else:
+            color = pal.color(QPalette.ColorRole.Highlight)
+        r = option.rect
+        d = 6.0
+        cx = r.right() - SPACE_M
+        cy = r.center().y() + 0.5
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if status == "indexed":
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(QRectF(cx - d / 2, cy - d / 2, d, d))
+        elif status == "partial":
+            painter.setPen(QPen(color, 1.5))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QRectF(cx - d / 2, cy - d / 2, d, d))
+        else:
+            painter.setPen(QPen(color, 1.5))
+            painter.drawLine(QPointF(cx - d / 2, cy), QPointF(cx + d / 2, cy))
+        painter.restore()
 
-        # Draw a status indicator dot in the first column next to directory items
-        if painter is not None and index.column() == 0:
+    def helpEvent(self, event, view, option, index):  # noqa: N802
+        if event is not None and index.isValid() and index.column() == 0:
             status = self.get_status_callback(index)
             if status:
-                color_map = {
-                    "indexed": QColor("#4CAF50"),   # Vibrant Green
-                    "partial": QColor("#FFC107"),   # Amber Yellow
-                    "excluded": QColor("#F44336"),  # Crimson Red
-                }
-                color = color_map.get(status, QColor("#9E9E9E"))
+                name = index.data(Qt.ItemDataRole.DisplayRole) or ""
+                QToolTip.showText(event.globalPos(), f"{name}\n{_STATUS_TEXT[status]}", view)
+                return True
+        return super().helpEvent(event, view, option, index)
 
-                painter.save()
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-                painter.setBrush(color)
-                painter.setPen(Qt.PenStyle.NoPen)
 
-                # Right aligned inside the cell
-                r = option.rect
-                dot_size = 7
-                painter.drawEllipse(
-                    r.right() - 20,
-                    r.top() + (r.height() - dot_size) // 2,
-                    dot_size,
-                    dot_size
-                )
-                painter.restore()
+def ancestor_targets(path: str) -> List[Tuple[str, str]]:
+    """``[(label, path)]`` from the root down to ``path``.
+
+    ``PurePath.parts`` understands drives ("C:\\"), UNC shares ("\\\\server\\share\\")
+    and the POSIX root ("/") for the platform we run on.
+    """
+    parts = PurePath(os.path.normpath(path)).parts
+    out = []
+    for i, part in enumerate(parts):
+        target = str(PurePath(*parts[: i + 1]))
+        out.append((part.rstrip("\\/") or part, target))
+    return out
 
 
 class BreadcrumbBar(QWidget):
-    """Path breadcrumb navigation bar with clickable segments, folder chooser, and recent dropdown."""
-    path_selected = pyqtSignal(str)   # navigate only (crumb click / recent entry)
-    folder_chosen = pyqtSignal(str)   # explicit "Select Folder" pick (navigate and index)
+    """Location row: parent folder, current folder (menu with its ancestors and recent
+    folders) and "Add folder…"."""
+    path_selected = pyqtSignal(str)   # navigate only
+    folder_chosen = pyqtSignal(str)   # explicit "Add folder…" pick (navigate and index)
 
     MAX_RECENT = 15
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_path = ""
-        self.is_dark = False
+        self.recent_paths: List[str] = []
 
-        self.main_layout = QHBoxLayout(self)
-        self.main_layout.setContentsMargins(4, 4, 4, 4)
-        self.main_layout.setSpacing(6)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(SPACE_XS)
 
-        # Select Folder Button
-        self.select_folder_btn = QPushButton("📁 Select Folder")
-        self.select_folder_btn.setToolTip("Choose a folder from your disk to browse and index")
-        self.select_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.select_folder_btn.clicked.connect(self._on_select_folder_clicked)
-        self.main_layout.addWidget(self.select_folder_btn)
+        self.up_btn = QToolButton()
+        self.up_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogToParent))
+        self.up_btn.setAutoRaise(True)
+        self.up_btn.setToolTip("Parent folder")
+        self.up_btn.setAccessibleName("Parent folder")
+        self.up_btn.clicked.connect(self.go_up)
+        layout.addWidget(self.up_btn)
 
-        # Recent items dropdown
-        self.recent_combo = QComboBox()
-        self.recent_combo.setFixedSize(30, 28)
-        self.recent_combo.setToolTip("Recent folders history")
-        self.recent_combo.addItem("🕒")
-        self.recent_combo.activated.connect(self._on_recent_selected)
-        self.main_layout.addWidget(self.recent_combo)
+        self.path_btn = QToolButton()
+        self.path_btn.setAutoRaise(True)
+        self.path_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.path_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.path_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.path_btn.setAccessibleName("Current folder")
+        self.path_menu = QMenu(self)
+        self.path_menu.aboutToShow.connect(self._fill_path_menu)
+        self.path_btn.setMenu(self.path_menu)
+        layout.addWidget(self.path_btn, 1)
 
-        # Container for breadcrumb buttons
-        self.buttons_container = QWidget()
-        self.buttons_layout = QHBoxLayout(self.buttons_container)
-        self.buttons_layout.setContentsMargins(0, 0, 0, 0)
-        self.buttons_layout.setSpacing(2)
-        self.main_layout.addWidget(self.buttons_container)
+        self.add_btn = QToolButton()
+        self.add_btn.setText("Add folder…")
+        self.add_btn.setToolTip("Choose a folder to browse and add to the index")
+        self.add_btn.clicked.connect(self._on_select_folder_clicked)
+        layout.addWidget(self.add_btn)
 
-        self.main_layout.addStretch()
+        self._update_controls()
 
-        # Copy current path button
-        self.copy_btn = QPushButton("📋")
-        self.copy_btn.setFixedSize(30, 28)
-        self.copy_btn.setToolTip("Copy folder path to clipboard")
-        self.copy_btn.clicked.connect(self.copy_current_path)
-        self.main_layout.addWidget(self.copy_btn)
-
-        self.apply_theme(False)
-
+    # -- actions
     def _on_select_folder_clicked(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Browse & Index")
+        folder = QFileDialog.getExistingDirectory(self, "Add folder to index")
         if folder:
             # Qt hands back forward slashes on Windows; use the native form so the same
             # folder is never stored under two spellings.
             self.folder_chosen.emit(os.path.normpath(folder))
 
-    def apply_theme(self, is_dark: bool):
-        self.is_dark = is_dark
-        if is_dark:
-            self.setStyleSheet("""
-                QWidget {
-                    background-color: #1C1C1E;
-                }
-                QPushButton {
-                    font-family: 'Segoe UI';
-                    font-size: 11px;
-                    background-color: #2C2C2E;
-                    border: 1px solid #3A3A3C;
-                    border-radius: 4px;
-                    padding: 4px 8px;
-                    color: #FFFFFF;
-                }
-                QPushButton:hover {
-                    background-color: #3A3A3C;
-                    border-color: #48484A;
-                }
-                QComboBox {
-                    background-color: #2C2C2E;
-                    border: 1px solid #3A3A3C;
-                    border-radius: 4px;
-                    color: #FFFFFF;
-                    padding-left: 2px;
-                }
-                QLabel {
-                    color: #8E8E93;
-                }
-            """)
-        else:
-            self.setStyleSheet("""
-                QWidget {
-                    background-color: #F8F9FA;
-                }
-                QPushButton {
-                    font-family: 'Segoe UI';
-                    font-size: 11px;
-                    background-color: #FFFFFF;
-                    border: 1px solid #E0E0E0;
-                    border-radius: 4px;
-                    padding: 4px 8px;
-                    color: #333333;
-                }
-                QPushButton:hover {
-                    background-color: #EAEAEA;
-                    border-color: #CCCCCC;
-                }
-                QComboBox {
-                    background-color: #FFFFFF;
-                    border: 1px solid #E0E0E0;
-                    border-radius: 4px;
-                    color: #333333;
-                    padding-left: 2px;
-                }
-                QLabel {
-                    color: #999999;
-                }
-            """)
-        self.update_breadcrumb_styles()
+    def go_up(self):
+        if not self.current_path:
+            return
+        parent = os.path.dirname(os.path.normpath(self.current_path))
+        if parent and path_key(parent) != path_key(self.current_path):
+            self.path_selected.emit(parent)
 
-    def update_breadcrumb_styles(self):
-        color = "#FFFFFF" if self.is_dark else "#333333"
-        sep_color = "#8E8E93" if self.is_dark else "#999999"
-        for i in range(self.buttons_layout.count()):
-            widget = self.buttons_layout.itemAt(i).widget()
-            if isinstance(widget, QPushButton):
-                widget.setStyleSheet(f"color: {color}; font-weight: bold; border: none; background: transparent;")
-            elif isinstance(widget, QLabel):
-                widget.setStyleSheet(f"color: {sep_color}; font-size: 13px;")
+    def copy_current_path(self):
+        if self.current_path:
+            QGuiApplication.clipboard().setText(self.current_path)
 
+    def _fill_path_menu(self):
+        menu = self.path_menu
+        menu.clear()
+        if not self.current_path:
+            return
+        for label, target in reversed(ancestor_targets(self.current_path)):
+            act = menu.addAction(theme.display_text(label))
+            act.setData(target)
+            act.triggered.connect(lambda _=False, p=target: self.path_selected.emit(p))
+        others = [p for p in reversed(self.recent_paths) if path_key(p) != path_key(self.current_path)]
+        if others:
+            menu.addSection("Recent")
+            for p in others:
+                act = menu.addAction(theme.display_text(p))
+                act.setData(p)
+                act.triggered.connect(lambda _=False, p=p: self.path_selected.emit(p))
+        menu.addSeparator()
+        menu.addAction("Copy path", self.copy_current_path)
+
+    # -- state
     def set_path(self, path: str):
         if not path:
             return
         self.current_path = path
+        key = path_key(path)
+        self.recent_paths = [p for p in self.recent_paths if path_key(p) != key] + [path]
+        del self.recent_paths[:-self.MAX_RECENT]
+        self._update_controls()
 
-        # Update combo box recent history list safely (bounded; index 0 is the clock icon)
-        self.recent_combo.blockSignals(True)
-        if path not in [self.recent_combo.itemText(i) for i in range(self.recent_combo.count())]:
-            self.recent_combo.addItem(path)
-            while self.recent_combo.count() > self.MAX_RECENT + 1:
-                self.recent_combo.removeItem(1)
-        self.recent_combo.setCurrentIndex(0)
-        self.recent_combo.blockSignals(False)
+    def _update_controls(self):
+        has = bool(self.current_path)
+        self.up_btn.setEnabled(has and os.path.dirname(os.path.normpath(self.current_path))
+                               not in ("", os.path.normpath(self.current_path)))
+        self.path_btn.setEnabled(has)
+        self.path_btn.setToolTip(theme.display_text(self.current_path))
+        self._elide_path_text()
 
-        # Clear old buttons
-        for i in reversed(range(self.buttons_layout.count())):
-            item = self.buttons_layout.itemAt(i)
-            widget = item.widget() if item is not None else None
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
+    def _elide_path_text(self):
+        if not self.current_path:
+            self.path_btn.setText("No folder")
+            return
+        crumbs = ancestor_targets(self.current_path)
+        name = theme.display_text(crumbs[-1][0] if crumbs else self.current_path)
+        # Leave room for the menu arrow and the button's own padding.
+        width = max(0, self.path_btn.width() - 3 * SPACE_M)
+        self.path_btn.setText(self.path_btn.fontMetrics().elidedText(name, Qt.TextElideMode.ElideMiddle, width)
+                              or name[:1])
 
-        # Rebuild breadcrumb buttons. PurePath.parts understands drives ("C:\\"), UNC shares
-        # ("\\\\server\\share\\") and the POSIX root ("/") for the platform we run on.
-        parts = PurePath(os.path.normpath(path)).parts
-        for i, part in enumerate(parts):
-            target = str(PurePath(*parts[: i + 1]))
-            label = part.rstrip("\\/") or part
-
-            btn = QPushButton(label)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda checked=False, p=target: self.path_selected.emit(p))
-            self.buttons_layout.addWidget(btn)
-
-            if i < len(parts) - 1:
-                sep = QLabel("›")
-                self.buttons_layout.addWidget(sep)
-
-        self.update_breadcrumb_styles()
-
-    def _on_recent_selected(self, index):
-        if index > 0:
-            path = self.recent_combo.itemText(index)
-            self.path_selected.emit(path)
-
-    def copy_current_path(self):
-        if self.current_path:
-            clipboard = QGuiApplication.clipboard()
-            clipboard.setText(self.current_path)
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._elide_path_text()
 
 
 class BrowserView(QFrame):
-    """QTreeView-based file explorer integration with breadcrumbs and index indicators."""
+    """Folder tree of the current location, with index markers."""
     path_changed = pyqtSignal(str)
     folders_dropped = pyqtSignal(list)
     reindex_folder = pyqtSignal(str)
-    select_folder = pyqtSignal(str)  # Emitted when user explicitly picks a new root folder
+    select_folder = pyqtSignal(str)  # user explicitly picked a folder to add to the index
+
+    PRESETS = (("Name only", "Minimal"), ("Name, size and type", "Media"), ("All columns", "Detailed"))
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -247,117 +223,46 @@ class BrowserView(QFrame):
 
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
-        self.main_layout.setSpacing(5)
+        self.main_layout.setSpacing(SPACE_S)
         # Folders dragged in from the OS file manager are handled by dropEvent() below.
         self.setAcceptDrops(True)
 
-        # 1. Breadcrumb Bar
         self.breadcrumb_bar = BreadcrumbBar()
-        # Clicking a crumb / recent entry only navigates; only the explicit "Select Folder"
-        # button adds a folder to the index (otherwise clicking "C:" would index a whole drive).
+        # Navigating never adds a folder to the index; only "Add folder…" does.
         self.breadcrumb_bar.path_selected.connect(self.navigate_to_path)
         self.breadcrumb_bar.folder_chosen.connect(self._on_folder_explicitly_selected)
         self.main_layout.addWidget(self.breadcrumb_bar)
 
-        # 2. File System Model & Tree View
-        self.file_model = QFileSystemModel()
+        self.file_model = QFileSystemModel(self)
         self.file_model.setFilter(QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot)
 
         self.tree_view = QTreeView()
         self.tree_view.setModel(self.file_model)
-        self.tree_view.setAlternatingRowColors(True)
+        self.tree_view.setAccessibleName("Folders")
+        self.tree_view.setUniformRowHeights(True)
         self.tree_view.setDragEnabled(True)
-        # The tree must not accept drops itself: the (read-only) model would reject them and
-        # Qt would never offer the event to this widget.
+        # The tree must not accept drops itself: the read-only model would reject them
+        # and Qt would never offer the event to this widget.
         self.tree_view.setAcceptDrops(False)
         self.tree_view.setDropIndicatorShown(False)
+        self.tree_view.setSortingEnabled(True)
+        self.tree_view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
 
-        # Apply header formatting
         header = self.tree_view.header()
-        assert header is not None
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, header.ResizeMode.Stretch)
 
-        # Connect delegate for status indicators
         self.delegate = IndexStatusDelegate(self.tree_view, self.get_folder_indexing_status)
         self.tree_view.setItemDelegate(self.delegate)
 
-        # Signals for single click & double click navigation
         self.tree_view.clicked.connect(self._on_item_clicked)
         self.tree_view.doubleClicked.connect(self._on_item_double_clicked)
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.open_context_menu)
-
         self.main_layout.addWidget(self.tree_view)
 
-        # Custom presets state
-        self.current_preset = "Detailed"
-        self.apply_theme(False)
-
-    def apply_theme(self, is_dark: bool):
-        self.breadcrumb_bar.apply_theme(is_dark)
-        if is_dark:
-            self.setStyleSheet("""
-                QFrame#BrowserView {
-                    background-color: #1C1C1E;
-                    border-right: 1px solid #2C2C2E;
-                }
-                QTreeView {
-                    border: none;
-                    color: #FFFFFF;
-                    background-color: #1C1C1E;
-                    alternate-background-color: #18181A;
-                }
-                QTreeView::item {
-                    color: #FFFFFF;
-                }
-                QTreeView::item:hover {
-                    background-color: #2C2C2E;
-                }
-                QTreeView::item:selected {
-                    background-color: #0A84FF;
-                    color: #FFFFFF;
-                }
-                QHeaderView::section {
-                    background-color: #252528;
-                    color: #FFFFFF;
-                    border: 1px solid #2C2C2E;
-                    padding: 4px;
-                    font-weight: bold;
-                }
-            """)
-        else:
-            self.setStyleSheet("""
-                QFrame#BrowserView {
-                    background-color: #FFFFFF;
-                    border-right: 1px solid #E0E0E0;
-                }
-                QTreeView {
-                    border: none;
-                    color: #222222;
-                    background-color: #FFFFFF;
-                    alternate-background-color: #F9F9FB;
-                }
-                QTreeView::item {
-                    color: #222222;
-                }
-                QTreeView::item:hover {
-                    background-color: #F2F2F7;
-                }
-                QTreeView::item:selected {
-                    background-color: #007AFF;
-                    color: #FFFFFF;
-                }
-                QHeaderView::section {
-                    background-color: #F2F2F7;
-                    color: #222222;
-                    border: 1px solid #E0E0E0;
-                    padding: 4px;
-                    font-weight: bold;
-                }
-            """)
+        self.current_preset = "Minimal"
+        self.apply_column_preset(theme.ui_settings().value("browser/columns", "Minimal") or "Minimal")
 
     def set_root_path(self, path: str):
         if not path or not os.path.exists(path):
@@ -371,120 +276,91 @@ class BrowserView(QFrame):
         self.path_changed.emit(path)
 
     def _on_folder_explicitly_selected(self, path: str):
-        """Called when user explicitly picks a folder via 'Select Folder' button."""
         self.set_root_path(path)
         self.path_changed.emit(path)
-        self.select_folder.emit(path)  # Tells MainWindow to add to index_paths and index
-
-    @staticmethod
-    def _norm(path: str) -> str:
-        return os.path.normcase(os.path.normpath(path)).replace("\\", "/")
+        self.select_folder.emit(path)  # MainWindow adds it to index_paths and indexes it
 
     def get_folder_indexing_status(self, index) -> Optional[str]:
-        """Calculates color state for index mapping indicator."""
+        """"indexed", "partial" (contains indexed folders), "excluded" or None."""
         if not self.file_model.isDir(index):  # cached by the model; no syscall per repaint
             return None
         path = self.file_model.filePath(index)
         if not path:
             return None
-        norm = self._norm(path)
-
-        # Excluded check (blank patterns would otherwise match every path)
+        key = path_key(path)
         for pat in config_manager.config.exclude_patterns:
-            if pat and (pat in path or self._norm(pat) in norm):
+            # blank patterns would otherwise match every path
+            if pat and (pat in path or path_key(pat) in key):
                 return "excluded"
-
-        # Fully indexed check
-        prefix = norm.rstrip("/") + "/"
         for ip in config_manager.config.index_paths:
             if not ip:
                 continue
-            ip_norm = self._norm(ip)
-            ip_prefix = ip_norm.rstrip("/") + "/"
-            if norm == ip_norm or prefix.startswith(ip_prefix):
+            if is_path_under(path, ip):
                 return "indexed"
-            if ip_prefix.startswith(prefix):
+            if is_path_under(ip, path):
                 return "partial"
-
         return None
 
     def _on_item_clicked(self, index):
-        path = self.file_model.filePath(index)
-        self.path_changed.emit(path)
+        self.path_changed.emit(self.file_model.filePath(index))
 
     def _on_item_double_clicked(self, index):
         path = self.file_model.filePath(index)
         if not path:
             return
         if os.path.isdir(path):
-            # Double clicking a directory sets browser view root into that directory!
             self.set_root_path(path)
             self.path_changed.emit(path)
-        elif os.path.isfile(path):
-            # Double clicking a file opens it using OS default application
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        else:
+            self._report(file_actions.open_path(path))
 
-    # --- ACTIONS & CUSTOM COLUMN PRESETS ---
+    def _report(self, error: Optional[str]) -> None:
+        if error:
+            QMessageBox.warning(self, theme.APP_NAME, error)
 
+    # -- columns
     def apply_column_preset(self, preset_name: str):
-        """Show/hide columns dynamically based on presets."""
+        """Show/hide the size, type and date columns."""
+        if preset_name not in ("Minimal", "Media", "Detailed"):
+            preset_name = "Minimal"
         self.current_preset = preset_name
         header = self.tree_view.header()
-        assert header is not None
-
-        if preset_name == "Minimal":
-            header.setSectionHidden(1, True)
-            header.setSectionHidden(2, True)
-            header.setSectionHidden(3, True)
-        elif preset_name == "Media":
-            header.setSectionHidden(1, False)
-            header.setSectionHidden(2, False)
-            header.setSectionHidden(3, True)
-        else:  # Detailed
-            header.setSectionHidden(1, False)
-            header.setSectionHidden(2, False)
-            header.setSectionHidden(3, False)
+        hidden = {"Minimal": (1, 2, 3), "Media": (3,), "Detailed": ()}[preset_name]
+        for col in (1, 2, 3):
+            header.setSectionHidden(col, col in hidden)
+        self.tree_view.setHeaderHidden(preset_name == "Minimal")
+        theme.ui_settings().setValue("browser/columns", preset_name)
 
     def open_context_menu(self, position):
         index = self.tree_view.indexAt(position)
         if not index.isValid():
             return
-
         path = self.file_model.filePath(index)
         is_dir = os.path.isdir(path)
-
         menu = QMenu(self)
 
         if is_dir:
-            open_folder_act = QAction("Open & Navigate to Folder", self)
-            open_folder_act.triggered.connect(lambda: self.set_root_path(path))
-            menu.addAction(open_folder_act)
-
-            idx_now_act = QAction("Index this folder now", self)
-            idx_now_act.triggered.connect(lambda: self.reindex_folder.emit(path))
-            menu.addAction(idx_now_act)
-
-            exclude_act = QAction("Exclude folder from index", self)
-            exclude_act.triggered.connect(lambda: self.exclude_folder(path))
-            menu.addAction(exclude_act)
-
+            menu.addAction("Browse this folder", lambda: self.navigate_to_path(path))
+        else:
+            menu.addAction("Open", lambda: self._report(file_actions.open_path(path)))
+        menu.addAction(theme.reveal_label(), lambda: self._report(file_actions.reveal(path)))
+        menu.addAction("Copy path", lambda: QGuiApplication.clipboard().setText(path))
+        if is_dir:
             menu.addSeparator()
+            menu.addAction("Update index for this folder", lambda: self.reindex_folder.emit(path))
+            menu.addAction("Exclude from index", lambda: self.exclude_folder(path))
+            menu.addAction("Folder statistics…", lambda: self.show_folder_stats(path))
 
-            stats_act = QAction("Show folder stats...", self)
-            stats_act.triggered.connect(lambda: self.show_folder_stats(path))
-            menu.addAction(stats_act)
-
-            menu.addSeparator()
-
-        preset_menu = menu.addMenu("Column Preset")
-        for preset in ["Detailed", "Minimal", "Media"]:
-            act = QAction(preset, self)
+        menu.addSeparator()
+        columns = menu.addMenu("Columns")
+        for label, preset in self.PRESETS:
+            act = QAction(label, columns)
             act.setCheckable(True)
             act.setChecked(self.current_preset == preset)
-            act.triggered.connect(lambda checked, p=preset: self.apply_column_preset(p))
-            preset_menu.addAction(act)
+            act.triggered.connect(lambda _=False, p=preset: self.apply_column_preset(p))
+            columns.addAction(act)
 
-        menu.exec(self.tree_view.mapToGlobal(position))
+        menu.exec(self.tree_view.viewport().mapToGlobal(position))
 
     def exclude_folder(self, path: str):
         if path not in config_manager.config.exclude_patterns:
@@ -493,7 +369,7 @@ class BrowserView(QFrame):
             self.tree_view.viewport().update()
 
     def show_folder_stats(self, path: str):
-        """Walk path to count sizes/types and display properties."""
+        """Count files, total size and common types below ``path``."""
         total_size = 0
         file_count = 0
         ext_counter: Counter = Counter()
@@ -501,49 +377,44 @@ class BrowserView(QFrame):
 
         # The walk runs on the GUI thread, so keep the event loop alive and let the user
         # cancel instead of freezing the window on huge trees.
-        progress = QProgressDialog("Scanning folder...", "Cancel", 0, 0, self)
-        progress.setWindowTitle("Folder Statistics")
+        progress = QProgressDialog("Counting files…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Folder statistics")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(400)
 
-        try:
-            for root, dirs, files in os.walk(path, onerror=lambda e: None):
-                for f in files:
-                    file_count += 1
-                    fp = os.path.join(root, f)
-                    try:
-                        total_size += os.path.getsize(fp)
-                        ext_counter[os.path.splitext(f)[1].lower()] += 1
-                    except OSError:
-                        pass
-                    if file_count % 500 == 0:
-                        progress.setLabelText(f"Scanning folder... {file_count} files")
-                        QApplication.processEvents()
-                        if progress.wasCanceled():
-                            cancelled = True
-                            break
-                if cancelled:
-                    break
-        except Exception as e:
-            progress.cancel()
-            QMessageBox.critical(self, "Error", f"Could not read directory statistics: {e}")
-            return
+        for root, dirs, files in os.walk(path, onerror=lambda e: None):
+            for f in files:
+                file_count += 1
+                try:
+                    total_size += os.path.getsize(os.path.join(root, f))
+                    ext_counter[os.path.splitext(f)[1].lower()] += 1
+                except OSError:
+                    pass
+                if file_count % 500 == 0:
+                    progress.setLabelText(f"Counting files… {theme.format_count(file_count)}")
+                    QApplication.processEvents()
+                    if progress.wasCanceled():
+                        cancelled = True
+                        break
+            if cancelled:
+                break
         progress.cancel()
 
-        ext_count = ext_counter.most_common(5)
-        ext_str = ", ".join([f"{ext or '(none)'} ({cnt})" for ext, cnt in ext_count])
+        top = ", ".join(f"{ext or 'no extension'} ({theme.format_count(cnt)})"
+                        for ext, cnt in ext_counter.most_common(5))
+        box = QMessageBox(self)
+        box.setWindowTitle("Folder statistics")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(theme.display_text(os.path.basename(os.path.normpath(path)) or path))
+        lines = [
+            f"Files: {theme.format_count(file_count)}" + (" (counting stopped early)" if cancelled else ""),
+            f"Total size: {theme.format_size(total_size)}",
+            f"Most common types: {top or 'none'}",
+        ]
+        box.setInformativeText("\n".join(lines))
+        box.exec()
 
-        from ..utils.file_utils import format_size
-        QMessageBox.information(
-            self, "Folder Statistics",
-            f"Path: {path}\n"
-            f"Total Files: {file_count}{' (scan cancelled, partial)' if cancelled else ''}\n"
-            f"Total Size: {format_size(total_size)}\n"
-            f"Top Extensions: {ext_str or 'None'}"
-        )
-
-    # --- DRAG AND DROP ---
-
+    # --- drag and drop
     @staticmethod
     def _dropped_folders(event) -> List[str]:
         mime = event.mimeData()
@@ -552,19 +423,19 @@ class BrowserView(QFrame):
         paths = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
         return [p for p in paths if p and os.path.isdir(p)]
 
-    def dragEnterEvent(self, event):
+    def dragEnterEvent(self, event):  # noqa: N802
         if self._dropped_folders(event):
             event.acceptProposedAction()
         else:
             event.ignore()
 
-    def dragMoveEvent(self, event):
+    def dragMoveEvent(self, event):  # noqa: N802
         if self._dropped_folders(event):
             event.acceptProposedAction()
         else:
             event.ignore()
 
-    def dropEvent(self, event):
+    def dropEvent(self, event):  # noqa: N802
         folders = [os.path.normpath(p) for p in self._dropped_folders(event)]
         if folders:
             self.folders_dropped.emit(folders)
