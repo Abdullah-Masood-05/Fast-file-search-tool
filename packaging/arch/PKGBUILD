@@ -6,7 +6,7 @@
 pkgname=fast-file-search-pro
 pkgver=1.3.0
 pkgrel=1
-pkgdesc="High-performance desktop file search with a PyQt6 GUI (self-contained build)"
+pkgdesc="High-performance desktop file search with a PySide6 GUI (self-contained build)"
 arch=('x86_64')
 url="https://github.com/Abdullah-Masood-05/Fast-file-search-tool"
 license=('MIT')

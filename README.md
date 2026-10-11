@@ -4,11 +4,11 @@
   # Fast File Search Pro
 
   [![Language](https://img.shields.io/badge/language-Python-blue)](#)
-  [![GUI](https://img.shields.io/badge/GUI-PyQt6-brightgreen)](#)
+  [![GUI](https://img.shields.io/badge/GUI-PySide6-brightgreen)](#)
   [![License](https://img.shields.io/badge/license-MIT-green)](#)
   [![Builder](https://img.shields.io/badge/build-uv-blueviolet)](#)
 
-  A high-performance desktop file search utility built with Python and PyQt6.
+  A high-performance desktop file search utility built with Python and PySide6 (Qt 6).
 </div>
 
 ---
@@ -91,21 +91,18 @@ uv run pytest tests/ -v
 
 ## Building from Source
 
-`build.py` drives [Nuitka](https://nuitka.net) on Windows and Linux, and
-[PyInstaller](https://pyinstaller.org) on macOS, because Nuitka does not support PyQt6 on
-macOS. All flags, version info and icons are in one place, and the version comes from
-`pyproject.toml`:
+`build.py` drives [Nuitka](https://nuitka.net) on all three platforms (all flags, version
+info and icons in one place; the version comes from `pyproject.toml`):
 
 ```bash
 uv sync
 uv run python build.py                  # standalone folder: dist/FastFileSearchPro/ (macOS: dist/Fast File Search Pro.app)
 uv run python build.py --mode onefile   # single file (Windows/Linux)
-uv run --with pyinstaller python build.py   # macOS
 uv run python build.py --dry-run        # print the Nuitka command only
 ```
 
 Requirements: a C compiler (Windows: Visual Studio Build Tools with the C++ x64 workload;
-Linux: `gcc` and `patchelf`; macOS: Xcode command line tools for `codesign`).
+Linux: `gcc` and `patchelf`; macOS: Xcode command line tools).
 
 On Windows, `.\build.ps1` wraps `build.py` with a compiler fallback (MSVC → MinGW64 → Docker)
 and `.\build.ps1 -Installer` also builds the Inno Setup installer from `packaging\windows\setup.iss`.

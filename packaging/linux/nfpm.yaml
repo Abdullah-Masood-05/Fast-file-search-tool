@@ -14,7 +14,7 @@ vendor: Abdullah Masood
 homepage: https://github.com/Abdullah-Masood-05/Fast-file-search-tool
 license: MIT
 description: |-
-  High-performance desktop file search with a PyQt6 GUI.
+  High-performance desktop file search with a PySide6 GUI.
   Fast File Search Pro indexes folders into a persistent SQLite trigram index,
   supports boolean queries, extension and size filters, live file-system
   monitoring and a preview panel. Self-contained build (Python and Qt bundled).
@@ -126,4 +126,4 @@ deb:
     Bugs: https://github.com/Abdullah-Masood-05/Fast-file-search-tool/issues
 rpm:
   group: Applications/File
-  summary: High-performance desktop file search (PyQt6)
+  summary: High-performance desktop file search (PySide6)

@@ -73,7 +73,7 @@ function Invoke-Mingw {
     # Nuitka 4.1.3 refuses --mingw64 on Python >= 3.13, so run it from an isolated
     # Python 3.12 environment (uv downloads 3.12 + packages once, repo .venv untouched).
     $runner = @('run', '--no-project', '--isolated', '--python', '3.12',
-                '--with', 'nuitka==4.1.3', '--with', 'zstandard', '--with', 'PyQt6>=6.0.0', '--with', 'watchdog>=3.0.0', 'python')
+                '--with', 'nuitka==4.1.3', '--with', 'zstandard', '--with', 'PySide6-Essentials>=6.8', '--with', 'watchdog>=3.0.0', 'python')
     Invoke-BuildPy 'MinGW64' 'mingw' $runner
 }
 
