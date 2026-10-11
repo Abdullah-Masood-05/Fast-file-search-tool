@@ -36,6 +36,22 @@ ResultRole = Qt.ItemDataRole.UserRole + 1
 FavoriteRole = Qt.ItemDataRole.UserRole + 2
 PathRole = Qt.ItemDataRole.UserRole + 3
 
+# Enum members and flag combinations are resolved once: PySide6 builds them through Python's
+# enum machinery, which is slow when done per cell (the view calls flags() for every row).
+_DISPLAY = Qt.ItemDataRole.DisplayRole
+_DECORATION = Qt.ItemDataRole.DecorationRole
+_TOOLTIP = Qt.ItemDataRole.ToolTipRole
+_ALIGNMENT = Qt.ItemDataRole.TextAlignmentRole
+_FONT = Qt.ItemDataRole.FontRole
+_FOREGROUND = Qt.ItemDataRole.ForegroundRole
+_ACCESSIBLE = Qt.ItemDataRole.AccessibleTextRole
+_ALIGN_RIGHT = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+_ALIGN_LEFT = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+_NO_FLAGS = Qt.ItemFlag.NoItemFlags
+_ITEM_FLAGS = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+               | Qt.ItemFlag.ItemIsDragEnabled)
+_DESCENDING = Qt.SortOrder.DescendingOrder
+
 # PySide6 needs the two-argument overload of layout(AboutTo)BeChanged picked explicitly.
 _LAYOUT_ARGS = ('QList<QPersistentModelIndex>', 'QAbstractItemModel::LayoutChangeHint')
 
@@ -197,7 +213,7 @@ class ResultsModel(QAbstractTableModel):
         if key is None:
             pos = {id(r): i for i, r in enumerate(self._all)}
             return sorted(rows, key=lambda r: pos.get(id(r), 0))
-        return sorted(rows, key=key, reverse=self._sort_order == Qt.SortOrder.DescendingOrder)
+        return sorted(rows, key=key, reverse=self._sort_order == _DESCENDING)
 
     def sort(self, column: int, order: Qt.SortOrder = Qt.SortOrder.AscendingOrder) -> None:
         self._sort_col = column
@@ -231,12 +247,16 @@ class ResultsModel(QAbstractTableModel):
             return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         return None
 
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        r = self.result(index.row()) if index.isValid() else None
-        if r is None:
+    def data(self, index, role=_DISPLAY):
+        if not index.isValid():
             return None
+        row = index.row()
+        rows = self._rows
+        if not 0 <= row < len(rows):
+            return None
+        r = rows[row]
         col = index.column()
-        if role == Qt.ItemDataRole.DisplayRole:
+        if role == _DISPLAY:
             if col == NAME:
                 return display_text(r.name)
             if col == FOLDER:
@@ -247,9 +267,10 @@ class ResultsModel(QAbstractTableModel):
                 return theme.format_date_short(r.modified)
             if col == TYPE:
                 return _type_label(r)
-        elif role == Qt.ItemDataRole.DecorationRole and col == NAME:
-            return self._icons.icon(r)
-        elif role == Qt.ItemDataRole.ToolTipRole:
+        elif role == _DECORATION:
+            if col == NAME:
+                return self._icons.icon(r)
+        elif role == _TOOLTIP:
             if col == NAME:
                 fav = "\nFavorite" if r.path in self._favorites else ""
                 return display_text(r.path) + fav
@@ -259,16 +280,17 @@ class ResultsModel(QAbstractTableModel):
                 return theme.format_size_exact(r.size)
             if col == MODIFIED:
                 return theme.format_date_full(r.modified)
-        elif role == Qt.ItemDataRole.TextAlignmentRole:
-            if col == SIZE:
-                return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        elif role == Qt.ItemDataRole.FontRole and col in (SIZE, MODIFIED):
-            return self._tabular
-        elif role == Qt.ItemDataRole.ForegroundRole and col in (FOLDER, TYPE):
-            return theme.secondary_text_color()
-        elif role == Qt.ItemDataRole.AccessibleTextRole and col == NAME:
-            return display_text(r.name) + (", favorite" if r.path in self._favorites else "")
+        elif role == _ALIGNMENT:
+            return _ALIGN_RIGHT if col == SIZE else _ALIGN_LEFT
+        elif role == _FONT:
+            if col == SIZE or col == MODIFIED:
+                return self._tabular
+        elif role == _FOREGROUND:
+            if col == FOLDER or col == TYPE:
+                return theme.secondary_text_color()
+        elif role == _ACCESSIBLE:
+            if col == NAME:
+                return display_text(r.name) + (", favorite" if r.path in self._favorites else "")
         elif role == ResultRole:
             return r
         elif role == FavoriteRole:
@@ -278,9 +300,7 @@ class ResultsModel(QAbstractTableModel):
         return None
 
     def flags(self, index):
-        if not index.isValid():
-            return Qt.ItemFlag.NoItemFlags
-        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
+        return _ITEM_FLAGS if index.isValid() else _NO_FLAGS
 
     def mimeTypes(self):  # noqa: N802
         return ["text/uri-list", "text/plain"]
