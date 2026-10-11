@@ -7,15 +7,15 @@ import threading
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
-from PyQt6.QtCore import (
+from PySide6.QtCore import (
     QAbstractItemModel, QAbstractTableModel, QEvent, QFileInfo, QMimeData, QModelIndex,
-    QPointF, QRectF, QSize, QStringListModel, Qt, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot,
+    QPointF, QRectF, QSize, QStringListModel, Qt, QThread, QTimer, QUrl, Signal, Slot,
 )
-from PyQt6.QtGui import (
+from PySide6.QtGui import (
     QAction, QFont, QFontMetrics, QGuiApplication, QIcon, QKeyEvent, QPainter, QPalette,
     QPolygonF,
 )
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCompleter, QFileDialog, QFileIconProvider, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QStackedWidget, QStyle,
     QStyledItemDelegate, QStyleOptionViewItem, QToolButton, QTreeView, QVBoxLayout, QWidget,
@@ -35,6 +35,9 @@ HEADERS = ("Name", "Folder", "Size", "Modified", "Type")
 ResultRole = Qt.ItemDataRole.UserRole + 1
 FavoriteRole = Qt.ItemDataRole.UserRole + 2
 PathRole = Qt.ItemDataRole.UserRole + 3
+
+# PySide6 needs the two-argument overload of layout(AboutTo)BeChanged picked explicitly.
+_LAYOUT_ARGS = ('QList<QPersistentModelIndex>', 'QAbstractItemModel::LayoutChangeHint')
 
 
 def _type_label(r: SearchResult) -> str:
@@ -200,7 +203,7 @@ class ResultsModel(QAbstractTableModel):
         self._sort_col = column
         self._sort_order = order
         hint = QAbstractItemModel.LayoutChangeHint.VerticalSortHint
-        self.layoutAboutToBeChanged.emit([], hint)
+        self.layoutAboutToBeChanged[_LAYOUT_ARGS].emit([], hint)
         old = self.persistentIndexList()
         objs = [self.result(i.row()) if i.isValid() else None for i in old]
         self._rows = self._sorted(self._rows)
@@ -208,7 +211,7 @@ class ResultsModel(QAbstractTableModel):
         new = [self.index(pos[id(r)], i.column()) if r is not None and id(r) in pos else QModelIndex()
                for i, r in zip(old, objs)]
         self.changePersistentIndexList(old, new)
-        self.layoutChanged.emit([], hint)
+        self.layoutChanged[_LAYOUT_ARGS].emit([], hint)
 
     # -- Qt model API
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
@@ -406,9 +409,9 @@ class ResultDelegate(QStyledItemDelegate):
 class ResultsView(QTreeView):
     """Results list.  Enter opens, Ctrl/Cmd+Enter reveals, Up on the first row and Esc
     go back to the search field."""
-    open_requested = pyqtSignal()
-    reveal_requested = pyqtSignal()
-    focus_search_requested = pyqtSignal()
+    open_requested = Signal()
+    reveal_requested = Signal()
+    focus_search_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -453,7 +456,7 @@ class ResultsView(QTreeView):
 # --------------------------------------------------------------------------- suggestions
 class SuggestionWorkerThread(QThread):
     """Fetches autocomplete suggestions off the GUI thread."""
-    suggestions_ready = pyqtSignal(str, list)  # query, suggestions
+    suggestions_ready = Signal(str, object)  # query, suggestions
 
     def __init__(self, autocomplete: Autocomplete):
         super().__init__()
@@ -513,12 +516,12 @@ class SuggestionWorkerThread(QThread):
 # --------------------------------------------------------------------------- search view
 class SearchView(QWidget):
     """Search field (``search_bar``), suggestions, results list and empty states."""
-    search_triggered = pyqtSignal(str)
-    file_selected = pyqtSignal(str)
-    status_message = pyqtSignal(str)
-    cleared = pyqtSignal()
-    hide_requested = pyqtSignal()
-    selection_changed = pyqtSignal()
+    search_triggered = Signal(str)
+    file_selected = Signal(str)
+    status_message = Signal(str)
+    cleared = Signal()
+    hide_requested = Signal()
+    selection_changed = Signal()
 
     def __init__(
         self,
@@ -806,7 +809,7 @@ class SearchView(QWidget):
         else:
             self.completer.popup().hide()
 
-    @pyqtSlot(str, list)
+    @Slot(str, object)
     def _on_suggestions_ready(self, query: str, suggestions: list):
         current = self.search_input.text().strip()
         if (not current or current != query or query == self._last_searched

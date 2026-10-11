@@ -38,12 +38,8 @@ pluggy==1.6.0
     #   pytest-qt
 pygments==2.20.0
     # via pytest
-pyqt6==6.11.0
+pyside6-essentials==6.12.0
     # via fast-file-search-pro (pyproject.toml)
-pyqt6-qt6==6.11.1
-    # via pyqt6
-pyqt6-sip==13.11.1
-    # via pyqt6
 pytest==9.1.1
     # via
     #   fast-file-search-pro (pyproject.toml)
@@ -52,9 +48,13 @@ pytest-qt==4.5.0
     # via fast-file-search-pro (pyproject.toml)
 pytokens==0.4.1
     # via black
+shiboken6==6.12.0
+    # via pyside6-essentials
 typing-extensions==4.16.0
     # via
     #   mypy
     #   pytest-qt
 watchdog==6.0.0
+    # via fast-file-search-pro (pyproject.toml)
+zstandard==0.25.0
     # via fast-file-search-pro (pyproject.toml)

@@ -11,12 +11,12 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from PyQt6.QtCore import QDate, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import (
+from PySide6.QtCore import QDate, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import (
     QColor, QFont, QIcon, QImageReader, QPainter, QPalette, QPixmap, QSyntaxHighlighter,
     QTextCharFormat, QTextDocument,
 )
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMessageBox,
     QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QSystemTrayIcon, QTabWidget,
@@ -209,7 +209,7 @@ _DATE_PRESETS = [
 
 class FilterPanel(QFrame):
     """Type, size, date, path and exclude filters for the current search."""
-    filters_changed = pyqtSignal()
+    filters_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -455,9 +455,9 @@ class PreviewLoaderThread(QThread):
     Cancelled cooperatively (never ``terminate()``d): killing a thread that holds the
     GIL or an open file handle can deadlock or crash the whole process.
     """
-    loaded = pyqtSignal(str, str, dict)  # path, content_preview, meta
-    hashes_ready = pyqtSignal(str, str, str)  # path, md5, sha256
-    error = pyqtSignal(str)
+    loaded = Signal(str, str, object)  # path, content_preview, meta
+    hashes_ready = Signal(str, str, str)  # path, md5, sha256
+    error = Signal(str)
 
     MAX_HASH_SIZE = 512 * 1024 * 1024
 
@@ -729,7 +729,7 @@ class PreviewPanel(QFrame):
         else:
             self.image_preview.setPixmap(QPixmap.fromImage(image))
 
-    @pyqtSlot(str, str, dict)
+    @Slot(str, str, object)
     def _on_preview_loaded(self, path, content, meta):
         if path != self.current_path:
             return
@@ -755,14 +755,14 @@ class PreviewPanel(QFrame):
                 else:
                     self.highlighter.set_terms(self.search_terms)
 
-    @pyqtSlot(str, str, str)
+    @Slot(str, str, str)
     def _on_hashes_ready(self, path, md5_hex, sha256_hex):
         if path != self.current_path:
             return
         self.meta_labels["MD5"].setText(md5_hex)
         self.meta_labels["SHA-256"].setText(sha256_hex)
 
-    @pyqtSlot(str)
+    @Slot(str)
     def _on_preview_error(self, err_msg):
         self.text_preview.setPlaceholderText("")
         self.text_preview.setPlainText(f"No preview: {err_msg}")
@@ -936,7 +936,8 @@ class AboutDialog(QDialog):
         self.setWindowTitle(f"About {theme.APP_NAME}")
         self.setModal(True)
 
-        from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
+        from PySide6 import __version__ as PYSIDE_VERSION_STR
+        from PySide6.QtCore import qVersion
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(SPACE_XL, SPACE_XL, SPACE_XL, SPACE_L)
@@ -963,7 +964,7 @@ class AboutDialog(QDialog):
         col.addWidget(desc)
         col.addSpacing(SPACE_M)
         py = ".".join(str(v) for v in sys.version_info[:3])
-        runtime = SecondaryLabel(f"Qt {QT_VERSION_STR}, PyQt {PYQT_VERSION_STR}, Python {py}\nMIT License")
+        runtime = SecondaryLabel(f"Qt {qVersion()}, PySide {PYSIDE_VERSION_STR}, Python {py}\nMIT License")
         runtime.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         col.addWidget(runtime)
         col.addSpacing(SPACE_L)

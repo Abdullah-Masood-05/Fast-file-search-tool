@@ -5,10 +5,10 @@ from collections import Counter
 from pathlib import PurePath
 from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import QDir, QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QFileSystemModel, QGuiApplication, QPainter, QPalette, QPen
-from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QHBoxLayout, QMenu, QMessageBox, QProgressDialog,
+from PySide6.QtCore import QDir, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QAction, QGuiApplication, QPainter, QPalette, QPen
+from PySide6.QtWidgets import (
+    QApplication, QFileDialog, QFileSystemModel, QFrame, QHBoxLayout, QMenu, QMessageBox, QProgressDialog,
     QSizePolicy, QStyle, QStyledItemDelegate, QToolButton, QToolTip, QTreeView, QVBoxLayout,
     QWidget,
 )
@@ -94,8 +94,8 @@ def ancestor_targets(path: str) -> List[Tuple[str, str]]:
 class BreadcrumbBar(QWidget):
     """Location row: parent folder, current folder (menu with its ancestors and recent
     folders) and "Add folder…"."""
-    path_selected = pyqtSignal(str)   # navigate only
-    folder_chosen = pyqtSignal(str)   # explicit "Add folder…" pick (navigate and index)
+    path_selected = Signal(str)   # navigate only
+    folder_chosen = Signal(str)   # explicit "Add folder…" pick (navigate and index)
 
     MAX_RECENT = 15
 
@@ -209,10 +209,10 @@ class BreadcrumbBar(QWidget):
 
 class BrowserView(QFrame):
     """Folder tree of the current location, with index markers."""
-    path_changed = pyqtSignal(str)
-    folders_dropped = pyqtSignal(list)
-    reindex_folder = pyqtSignal(str)
-    select_folder = pyqtSignal(str)  # user explicitly picked a folder to add to the index
+    path_changed = Signal(str)
+    folders_dropped = Signal(object)  # List[str]
+    reindex_folder = Signal(str)
+    select_folder = Signal(str)  # user explicitly picked a folder to add to the index
 
     PRESETS = (("Name only", "Minimal"), ("Name, size and type", "Media"), ("All columns", "Detailed"))
 

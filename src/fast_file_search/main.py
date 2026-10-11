@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication
 
 from .config import config_manager
 from .ui.main_window import MainWindow
@@ -12,7 +12,7 @@ from .utils.platform_utils import get_default_index_root
 
 def main():
     # Enable High DPI scaling for crisp visuals
-    # In PyQt6, High-DPI scaling is enabled by default, but we set style hint for scaling
+    # In PySide6, High-DPI scaling is enabled by default, but we set style hint for scaling
     app = QApplication(sys.argv)
     app.setApplicationName("Fast File Search Pro")
     # Wayland/X11 match the window to its .desktop entry (icon, taskbar grouping)

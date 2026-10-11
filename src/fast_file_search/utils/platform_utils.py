@@ -162,11 +162,11 @@ def dedupe_roots(paths: Iterable[str]) -> List[str]:
 
 def _qt_app():
     """The running QGuiApplication if called on its (GUI) thread, else None."""
-    if "PyQt6.QtGui" not in sys.modules:
+    if "PySide6.QtGui" not in sys.modules:
         return None
     try:
-        from PyQt6.QtCore import QThread
-        from PyQt6.QtGui import QGuiApplication
+        from PySide6.QtCore import QThread
+        from PySide6.QtGui import QGuiApplication
 
         app = QGuiApplication.instance()
         if app is not None and QThread.currentThread() == app.thread():
@@ -269,8 +269,8 @@ def open_path(path: str | Path) -> bool:
         return False
     if _qt_app() is not None:
         try:
-            from PyQt6.QtCore import QUrl
-            from PyQt6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
 
             if QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.absolute()))):
                 return True
@@ -317,7 +317,7 @@ def move_to_trash(path: str | Path) -> bool:
     if not os.path.lexists(p):
         return False
     try:
-        from PyQt6.QtCore import QFile
+        from PySide6.QtCore import QFile
 
         result = QFile.moveToTrash(str(p.absolute()))
         ok = result[0] if isinstance(result, tuple) else bool(result)
@@ -400,8 +400,8 @@ def _qt_color_scheme() -> Optional[str]:
     if _qt_app() is None:
         return None
     try:
-        from PyQt6.QtCore import Qt
-        from PyQt6.QtGui import QGuiApplication
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QGuiApplication
 
         scheme = QGuiApplication.styleHints().colorScheme()
         if scheme == Qt.ColorScheme.Dark:

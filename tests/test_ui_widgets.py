@@ -5,8 +5,8 @@ import sys
 import time
 
 import pytest
-from PyQt6.QtCore import QDate, QSettings, Qt
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QDate, QSettings, Qt
+from PySide6.QtWidgets import QApplication
 
 from fast_file_search.persistent_index import PersistentIndex
 from fast_file_search.search import SearchResponse, SearchResult
@@ -223,7 +223,7 @@ def test_suggestion_is_applied_as_a_search(search_view):
 
 
 def test_suggestion_popup_keyboard(search_view, qapp):
-    from PyQt6.QtTest import QTest
+    from PySide6.QtTest import QTest
 
     view = search_view
     view.show()
@@ -338,8 +338,8 @@ def test_ancestors_handle_unc_and_drive_root():
 
 
 def test_browser_accepts_folder_drops(qapp, tmp_path):
-    from PyQt6.QtCore import QMimeData, QPointF, QUrl
-    from PyQt6.QtGui import QDropEvent
+    from PySide6.QtCore import QMimeData, QPointF, QUrl
+    from PySide6.QtGui import QDropEvent
     from fast_file_search.ui.browser_view import BrowserView
 
     view = BrowserView()
@@ -559,7 +559,7 @@ def test_find_resource_locates_icon_and_misses_cleanly():
 
 
 def test_highlighter_set_terms_rebuilds_rules(qapp):
-    from PyQt6.QtGui import QTextDocument
+    from PySide6.QtGui import QTextDocument
     from fast_file_search.ui.widgets import MatchHighlighter
 
     doc = QTextDocument()
@@ -572,7 +572,7 @@ def test_highlighter_set_terms_rebuilds_rules(qapp):
 # ---------------------------------------------------------------- dialogs
 
 def test_settings_dialog_detects_equivalent_paths(qapp, tmp_path, monkeypatch):
-    from PyQt6.QtWidgets import QFileDialog
+    from PySide6.QtWidgets import QFileDialog
     from fast_file_search.ui.widgets import SettingsDialog
 
     dlg = SettingsDialog()
@@ -623,7 +623,7 @@ def test_about_dialog_opens_and_shows_version(qapp):
 
 def test_export_writes_csv_and_json(qapp, tmp_path, monkeypatch):
     import json
-    from PyQt6.QtWidgets import QFileDialog
+    from PySide6.QtWidgets import QFileDialog
     from fast_file_search.ui.widgets import export_results
 
     rows = [r.to_dict() for r in _results(3)]
@@ -639,7 +639,7 @@ def test_export_writes_csv_and_json(qapp, tmp_path, monkeypatch):
 
 
 def test_empty_state_replaces_buttons_without_leftovers(qapp):
-    from PyQt6.QtWidgets import QPushButton
+    from PySide6.QtWidgets import QPushButton
     from fast_file_search.ui.widgets import EmptyState
 
     es = EmptyState()
@@ -659,7 +659,7 @@ def test_empty_state_replaces_buttons_without_leftovers(qapp):
 # ---------------------------------------------------------------- theme helpers
 
 def test_secondary_text_meets_contrast_in_light_and_dark(qapp):
-    from PyQt6.QtGui import QPalette
+    from PySide6.QtGui import QPalette
     from fast_file_search.ui import theme
 
     label = theme.SecondaryLabel("x")

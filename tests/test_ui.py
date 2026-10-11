@@ -8,10 +8,10 @@ import sys
 import time
 
 import pytest
-from PyQt6.QtCore import QSettings, Qt
-from PyQt6.QtGui import QAction, QGuiApplication, QKeySequence
-from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
 
 
 @pytest.fixture(scope="session")
@@ -285,7 +285,7 @@ def test_trash_unavailable_offers_permanent_delete_only_after_confirmation(qapp,
 
 
 def test_os_errors_are_shown_in_plain_language(qapp, window, monkeypatch):
-    from PyQt6.QtWidgets import QMessageBox
+    from PySide6.QtWidgets import QMessageBox
     from fast_file_search.ui import file_actions
 
     shown = []
@@ -305,7 +305,7 @@ def test_empty_state_no_folders(qapp, env, monkeypatch, tmp_path):
         assert [b.text() for b in es.buttons] == ["Add folder…", "Index home folder"]
         picked = tmp_path / "picked"
         picked.mkdir()
-        from PyQt6.QtWidgets import QFileDialog
+        from PySide6.QtWidgets import QFileDialog
         monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(picked)))
         es.buttons[0].click()
         assert env.index_paths == [os.path.normpath(str(picked))]
@@ -373,7 +373,7 @@ def test_layout_state_is_remembered(qapp, env, sample):
 
 
 def test_close_quits_without_tray(qapp, window, monkeypatch):
-    from PyQt6.QtGui import QCloseEvent
+    from PySide6.QtGui import QCloseEvent
 
     window.tray_icon = None
     ev = QCloseEvent()

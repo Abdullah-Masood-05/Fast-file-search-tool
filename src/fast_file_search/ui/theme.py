@@ -16,9 +16,9 @@ import re
 import sys
 from typing import Optional
 
-from PyQt6.QtCore import QDateTime, QEvent, QLocale, QObject, QSettings, Qt
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPalette
-from PyQt6.QtWidgets import QApplication, QLabel, QWidget
+from PySide6.QtCore import QDateTime, QEvent, QLocale, QObject, QSettings, Qt
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPalette
+from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
 # --------------------------------------------------------------------------- spacing
 SPACE_XS = 4

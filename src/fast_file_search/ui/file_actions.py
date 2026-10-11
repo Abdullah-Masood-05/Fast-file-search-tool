@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import QFile, QMimeDatabase
+from PySide6.QtCore import QFile, QMimeDatabase
 
 from ..utils import platform_utils
 
@@ -149,7 +149,7 @@ def move_to_trash(path: str) -> Tuple[bool, Optional[str]]:
         if helper is not None:
             ok = bool(helper(path))
         else:  # pragma: no cover - older core module
-            ok = bool(QFile.moveToTrash(path)[0])
+            ok = bool(QFile.moveToTrash(path))
     except Exception:
         ok = False
     return (True, None) if ok else (False, None)

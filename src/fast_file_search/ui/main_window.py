@@ -4,9 +4,9 @@ import os
 import re
 from typing import List, Optional
 
-from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
+from PySide6.QtWidgets import (
     QApplication, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QSplitter,
     QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget,
 )
@@ -32,10 +32,10 @@ class IndexerThread(QThread):
     By default it performs an *incremental* update (only new/changed/deleted entries
     are touched). ``force_rebuild=True`` re-reads every entry of the given roots.
     """
-    progress = pyqtSignal(int, int)  # processed, total (total == 0: unknown)
-    root_started = pyqtSignal(str)   # the indexed folder now being scanned
-    done = pyqtSignal(object)        # IndexStats
-    error = pyqtSignal(str)
+    progress = Signal(int, int)  # processed, total (total == 0: unknown)
+    root_started = Signal(str)   # the indexed folder now being scanned
+    done = Signal(object)        # IndexStats
+    error = Signal(str)
 
     def __init__(
         self,
@@ -96,8 +96,8 @@ class IndexerThread(QThread):
 
 class SearchWorker(QThread):
     """Runs a search off the GUI thread."""
-    results_ready = pyqtSignal(object, str)  # SearchResponse, raw_query
-    error = pyqtSignal(str)
+    results_ready = Signal(object, str)  # SearchResponse, raw_query
+    error = Signal(str)
 
     def __init__(self, search_engine, raw_query: str, extended_query: str, filters: dict,
                  max_results: int, index_paths: list):
@@ -218,8 +218,8 @@ def _plural(n: int, word: str, plural: Optional[str] = None) -> str:
 class MainWindow(QMainWindow):
     """Search field on top; folders and filters, results, and preview below."""
     # Emitted from the file-watcher's worker threads; Qt delivers them on the GUI thread.
-    watcher_event = pyqtSignal(str, str)
-    watcher_error = pyqtSignal(str)
+    watcher_event = Signal(str, str)
+    watcher_error = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -585,12 +585,12 @@ class MainWindow(QMainWindow):
     def _folder_name(path: str) -> str:
         return display_text(os.path.basename(os.path.normpath(path)) or path)
 
-    @pyqtSlot(str)
+    @Slot(str)
     def _on_index_root_started(self, root: str):
         self._index_root = root
         self.status_lbl.setToolTip(display_text(root))
 
-    @pyqtSlot(int, int)
+    @Slot(int, int)
     def on_indexer_progress(self, processed, total):
         self._index_processed = processed
         name = self._folder_name(self._index_root) if self._index_root else "folders"
@@ -604,7 +604,7 @@ class MainWindow(QMainWindow):
         if self.search_view.empty_state.kind == "indexing":
             self._refresh_empty_state()
 
-    @pyqtSlot(object)
+    @Slot(object)
     def on_indexer_finished(self, stats: Optional[IndexStats]):
         self.progress_bar.setVisible(False)
         self.status_lbl.setToolTip("")
@@ -622,7 +622,7 @@ class MainWindow(QMainWindow):
         self.update_extensions_dropdown()
         self.browser_view.tree_view.viewport().update()
 
-    @pyqtSlot(str)
+    @Slot(str)
     def on_indexer_error(self, err_msg):
         self.progress_bar.setVisible(False)
         self._set_status(f"Indexing failed: {err_msg}")
@@ -668,13 +668,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._set_status(f"Live updates are off: {e}")
 
-    @pyqtSlot(str, str)
+    @Slot(str, str)
     def on_file_watcher_change(self, event_type: str, path: str):
         """A watched file changed (delivered on the GUI thread)."""
         self._count_timer.start()
         self.browser_view.tree_view.viewport().update()
 
-    @pyqtSlot(str)
+    @Slot(str)
     def _on_watcher_error(self, message: str):
         self._set_status(f"Live updates stopped: {message}")
 
@@ -748,7 +748,7 @@ class MainWindow(QMainWindow):
         sender = self.sender()
         return self._shutdown_done or (sender is not None and sender is not self.search_worker)
 
-    @pyqtSlot(object, str)
+    @Slot(object, str)
     def _on_search_completed(self, resp, raw_query: str):
         if self._is_stale():
             return
@@ -789,7 +789,7 @@ class MainWindow(QMainWindow):
             message = "Check the spelling, the filters or the indexed folders."
         sv.show_empty("no-matches", title, message, actions)
 
-    @pyqtSlot(str)
+    @Slot(str)
     def _on_search_failed(self, err_msg: str):
         if self._is_stale():
             return

@@ -487,7 +487,7 @@ def test_open_path_windows(tmp_path, recorder, monkeypatch):
 
 
 def test_move_to_trash_linux_fallback(tmp_path, recorder, monkeypatch):
-    from PyQt6.QtCore import QFile
+    from PySide6.QtCore import QFile
 
     f = tmp_path / "doomed.txt"
     f.write_text("x")
@@ -506,7 +506,7 @@ def test_move_to_trash_linux_fallback(tmp_path, recorder, monkeypatch):
 
 
 def test_move_to_trash_reports_failure(tmp_path, recorder, monkeypatch):
-    from PyQt6.QtCore import QFile
+    from PySide6.QtCore import QFile
 
     f = tmp_path / "kept.txt"
     f.write_text("x")
@@ -552,7 +552,7 @@ def test_theme_linux_without_gsettings(monkeypatch):
 
 
 def test_clipboard_prefers_qt(monkeypatch):
-    from PyQt6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
 
