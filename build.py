@@ -12,6 +12,10 @@ Outputs (under --output-dir, default ``dist``):
            onefile     dist/fast-file-search-pro
   macOS    standalone  "dist/Fast File Search Pro.app" (ad-hoc signed app bundle)
 
+On macOS the bundle is built with PyInstaller instead of Nuitka: Nuitka refuses
+PyQt6 on macOS ("PyQt6 on macOS is not supported, use PySide6 instead"). Install it
+for that run, e.g. ``uv run --with pyinstaller python build.py``.
+
 ``files.ico`` is always shipped next to the executable (Contents/MacOS on macOS)
 because ``fast_file_search.ui.widgets.find_resource`` looks there, and all non-code
 files inside the ``fast_file_search`` package (stylesheets, icons, ...) are included.
@@ -185,6 +189,41 @@ def fix_macos_bundle(app: Path, version: str) -> None:
         print("warning: codesign not found, bundle left unsigned", file=sys.stderr)
 
 
+def pyinstaller_args(args: argparse.Namespace) -> list[str]:
+    """PyInstaller command for the macOS .app bundle (see the module docstring)."""
+    out = Path(args.output_dir).resolve()
+    work = out / "pyinstaller-build"
+    return [
+        sys.executable, "-m", "PyInstaller",
+        "--noconfirm", "--clean", "--windowed",
+        "--name", APP_NAME,
+        f"--icon={ICNS}",
+        f"--osx-bundle-identifier={BUNDLE_ID}",
+        f"--paths={SRC}",
+        f"--collect-submodules={PACKAGE}",
+        f"--collect-data={PACKAGE}",
+        f"--add-data={ICO}:.",
+        f"--distpath={out}",
+        f"--workpath={work}",
+        f"--specpath={work}",
+        *args.nuitka_extra,
+        str(ENTRY),
+    ]
+
+
+def publish_pyinstaller(args: argparse.Namespace, version: str) -> Path:
+    out = Path(args.output_dir).resolve()
+    final = out / f"{APP_NAME}.app"
+    if not final.is_dir():
+        raise SystemExit(f"expected app bundle not found: {final}")
+    # PyInstaller also leaves the plain onedir build next to the bundle.
+    _rm(out / APP_NAME)
+    if not args.keep_build_dir:
+        _rm(out / "pyinstaller-build")
+    fix_macos_bundle(final, version)
+    return final
+
+
 def publish(args: argparse.Namespace, version: str) -> Path:
     """Move Nuitka's output to its stable location and return it."""
     out = Path(args.output_dir).resolve()
@@ -259,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
         print(version)
         return 0
 
-    cmd = nuitka_args(args, version)
+    cmd = pyinstaller_args(args) if IS_MACOS else nuitka_args(args, version)
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SRC), env.get("PYTHONPATH")]))
     print(f"Fast File Search Pro {version} | {platform.system()} {platform.machine()} | "
@@ -271,11 +310,14 @@ def main(argv: list[str] | None = None) -> int:
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     clean_previous(args)
     started = time.monotonic()
+    if IS_MACOS:
+        _rm(Path(args.output_dir).resolve() / f"{APP_NAME}.app")
     code = subprocess.call(cmd, env=env, cwd=ROOT)
+    tool = "PyInstaller" if IS_MACOS else "Nuitka"
     if code != 0:
-        print(f"Nuitka failed with exit code {code}", file=sys.stderr)
+        print(f"{tool} failed with exit code {code}", file=sys.stderr)
         return code
-    final = publish(args, version)
+    final = publish_pyinstaller(args, version) if IS_MACOS else publish(args, version)
     print(f"OK ({time.monotonic() - started:.0f}s): {final}")
     return 0
 

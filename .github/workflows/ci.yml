@@ -134,7 +134,13 @@ jobs:
             nuitka-${{ matrix.platform }}-
 
       - name: Build standalone (Nuitka)
+        if: runner.os != 'macOS'
         run: uv run python build.py --mode standalone
+
+      # Nuitka refuses PyQt6 on macOS, so the .app bundle is built with PyInstaller.
+      - name: Build app bundle (PyInstaller, macOS)
+        if: runner.os == 'macOS'
+        run: uv run --with "pyinstaller>=6.10" python build.py --mode standalone
 
       - name: Build portable onefile (Windows)
         if: runner.os == 'Windows'
@@ -291,7 +297,7 @@ jobs:
           After installing a package, start **Fast File Search Pro** from your application menu or run \`fast-file-search-pro\`.
 
           ### Known limitations
-          - **macOS builds are new and lightly tested.** They are produced and launch-tested by CI only. They have not been tried by hand on a real Mac, and they are not notarized (see the Gatekeeper note above).
+          - **macOS builds are new and lightly tested.** They are built with PyInstaller rather than Nuitka, because Nuitka does not support PyQt6 on macOS. They are produced and launch-tested by CI only, have not been tried by hand on a real Mac, and are not notarized (see the Gatekeeper note above).
           - **Linux desktop integration varies by desktop.** "Show in File Manager" uses the freedesktop \`FileManager1\` D-Bus interface and falls back to opening the parent folder. Move to Trash needs \`gio\`, \`trash-put\` or \`kioclient5\`. These were tested with mocks, not on every desktop.
           - **Linux scans stay on one filesystem.** A scan rooted at \`/\` does not enter a separate \`/home\` partition or btrfs subvolumes (Fedora's default layout). Add those folders as index roots directly. The default root (your home folder) is not affected.
           - **macOS \`~/Library\` is indexed** when you index your home folder. Add \`Library\` to the exclude patterns if you don't want its caches in results.

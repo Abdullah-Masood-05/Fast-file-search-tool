@@ -91,18 +91,21 @@ uv run pytest tests/ -v
 
 ## Building from Source
 
-`build.py` drives [Nuitka](https://nuitka.net) on all three platforms (all flags, version
-info and icons in one place; the version comes from `pyproject.toml`):
+`build.py` drives [Nuitka](https://nuitka.net) on Windows and Linux, and
+[PyInstaller](https://pyinstaller.org) on macOS, because Nuitka does not support PyQt6 on
+macOS. All flags, version info and icons are in one place, and the version comes from
+`pyproject.toml`:
 
 ```bash
 uv sync
 uv run python build.py                  # standalone folder: dist/FastFileSearchPro/ (macOS: dist/Fast File Search Pro.app)
 uv run python build.py --mode onefile   # single file (Windows/Linux)
+uv run --with pyinstaller python build.py   # macOS
 uv run python build.py --dry-run        # print the Nuitka command only
 ```
 
 Requirements: a C compiler (Windows: Visual Studio Build Tools with the C++ x64 workload;
-Linux: `gcc` and `patchelf`; macOS: Xcode command line tools).
+Linux: `gcc` and `patchelf`; macOS: Xcode command line tools for `codesign`).
 
 On Windows, `.\build.ps1` wraps `build.py` with a compiler fallback (MSVC → MinGW64 → Docker)
 and `.\build.ps1 -Installer` also builds the Inno Setup installer from `packaging\windows\setup.iss`.
