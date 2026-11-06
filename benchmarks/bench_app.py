@@ -1,20 +1,25 @@
 #!/usr/bin/env python
-"""Performance baseline / regression benchmark for Fast File Search Pro.
+"""End-to-end benchmark of the 2.0 app: the real ``main.main()`` with the real engine process.
 
-The script is binding-agnostic: it imports the app (which decides between PyQt6
-and PySide6), detects which Qt binding the app actually loaded, and measures.
+    uv run python benchmarks/bench_app.py                       # 30k-file synthetic tree -> dist/bench/app-<platform>.json
+    uv run python benchmarks/bench_app.py --files 300000 --out bench-app.json
+    uv run python benchmarks/bench_app.py --tree D:\\some\\tree    # use an existing tree (not modified)
+    uv run python benchmarks/bench_app.py --compare A.json B.json   # side by side, flags regressions (>10% and >5 ms/MB)
+    uv run python benchmarks/bench_app.py --screenshots dist\\bench --tag v2  # light/dark PNGs of the real window
 
-Run (from anywhere; put the app's ``src`` on PYTHONPATH, or run in an env where
-the package is installed):
+Measured (see ``metrics`` in the JSON; ``headline`` repeats the numbers CI checks):
+  startup (fresh process, warm index):  to first paint, to engine Ready, to first results
+  fresh index:                          entries/s from Ready to idle (cold index, 16 ms heartbeat + typing)
+  heartbeat:                            GUI-thread lateness while indexing + typing, and while typing on the idle index
+  search through the client:            round trip per query class (1/2/3-char, word, miss) and overall p95
+  keystroke -> results:                 last keystroke to the results being on screen (includes the 120 ms debounce)
+  watcher burst:                        N files created under a live root until a search sees all of them
+  memory:                               RSS of the GUI process and of the engine process
 
-    set PYTHONPATH=<checkout>\\src
-    python benchmarks\\bench_app.py                      # -> dist\\bench\\<binding>-<version>.json
-    python benchmarks\\bench_app.py --out my.json --files 10000 --repeats 5
-    python benchmarks\\bench_app.py --compare dist\\bench\\baseline-pyqt6.json dist\\bench\\pyside6-6.x.json
-    python benchmarks\\bench_app.py --screenshots dist\\bench --tag pyside6   # light/dark PNGs
-
-It always runs offscreen, with the cache/data dir and QSettings redirected to a
-temp directory, so real user data is never touched.
+Everything per-user (config, index cache, Qt settings, logs) is redirected into a temp sandbox, so a run never
+touches real data. The GUI runs on whatever Qt platform is available (offscreen unless QT_QPA_PLATFORM is set).
+The benchmark child processes re-run this file; the spawned engine process re-imports it harmlessly (all work
+is under ``__main__``).
 """
 from __future__ import annotations
 
@@ -29,28 +34,420 @@ import subprocess
 import sys
 import tempfile
 import time
-from importlib import import_module
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+HERE = Path(__file__).resolve().parent
+QUERIES = {
+    "1char": "e", "2char": "in", "3char": "gif", "word": "readme", "rare": "gifttop",
+    "unicode": "日本", "miss": "zzzqq",
+}
+TYPING_WORDS = ["gifttop", "index", "readme", "lodash", "userprofile", "zzzqq", "button", "invoice"]
+SANDBOX_VARS = (("HOME", "home"), ("USERPROFILE", "home"), ("APPDATA", "appdata"), ("LOCALAPPDATA", "localappdata"),
+                ("XDG_CONFIG_HOME", "xdg-config"), ("XDG_CACHE_HOME", "xdg-cache"), ("XDG_DATA_HOME", "xdg-data"),
+                ("XDG_STATE_HOME", "xdg-state"), ("FAST_FILE_SEARCH_CACHE_DIR", "cache"))
 
-STEMS = ["report", "invoice", "photo", "résumé", "notes", "budget", "日本語", "archive", "draft", "readme"]
-TOPICS = ["alpha", "beta", "gamma", "delta", "omega", "sigma", "kappa"]
-EXTS = ["pdf", "txt", "docx", "jpg", "png", "py", "md", "csv", "xlsx", "mp3", "zip", "json"]
-COLS = ["name", "folder", "size", "modified", "type"]
+
+# ----------------------------------------------------------------------------- shared helpers
+def sandbox_env(sandbox: Path, env: dict | None = None) -> dict:
+    """Redirect every per-user location into ``sandbox`` (in ``env`` or os.environ)."""
+    target = os.environ if env is None else env
+    for name, sub in SANDBOX_VARS:
+        d = sandbox / sub
+        d.mkdir(parents=True, exist_ok=True)
+        target[name] = str(d)
+    target.setdefault("QT_QPA_PLATFORM", "offscreen")
+    if sys.platform == "win32":
+        target.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")   # the offscreen plugin has no fonts otherwise
+    target["FFS_POWER"] = "ac"
+    return target
 
 
-# ----------------------------------------------------------------------------- stats
+def pct(xs, p):
+    if not xs:
+        return None
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, max(0, math.ceil(p / 100 * len(xs)) - 1))]
+
+
+def rss_mb(pid: int | None = None):
+    """Resident set size of ``pid`` (default: this process) in MB, or None."""
+    pid = pid or os.getpid()
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class PMC(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
+                            ("PeakPagefileUsage", ctypes.c_size_t)]
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            h = k32.OpenProcess(0x1000 | 0x0010, False, pid)    # QUERY_LIMITED_INFORMATION | VM_READ
+            if not h:
+                return None
+            pmc = PMC()
+            pmc.cb = ctypes.sizeof(PMC)
+            ok = psapi.GetProcessMemoryInfo(wintypes.HANDLE(h), ctypes.byref(pmc), pmc.cb)
+            k32.CloseHandle(wintypes.HANDLE(h))
+            return pmc.WorkingSetSize / 2 ** 20 if ok else None
+        if sys.platform.startswith("linux"):
+            with open(f"/proc/{pid}/status") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+        return int(out.stdout.strip()) / 1024
+    except Exception:
+        return None
+
+
+def summary(late):
+    return {"n": len(late), "p50": round(pct(late, 50) or 0, 2), "p99": round(pct(late, 99) or 0, 2),
+            "max": round(max(late), 2) if late else None,
+            "over_30ms": sum(1 for x in late if x > 30), "over_50ms": sum(1 for x in late if x > 50)}
+
+
+# ----------------------------------------------------------------------------- child: drives the real app
+def _child_common(sandbox: Path, tree: Path | None):
+    sandbox_env(sandbox)
+    sys.path.insert(0, str(REPO / "src"))
+    if tree is not None:
+        from fast_file_search.config import get_config_manager
+        cm = get_config_manager()
+        cm.config.index_paths = [str(tree)]
+        cm.save()
+
+
+class _Heartbeat:
+    def __init__(self, qt, interval=16):
+        QTimer, QElapsedTimer, Qt = qt
+        self.interval = interval
+        self.t = QTimer()
+        self.t.setTimerType(Qt.TimerType.PreciseTimer)
+        self.t.setInterval(interval)
+        self.t.timeout.connect(self._tick)
+        self.clock = QElapsedTimer()
+        self.last = 0
+        self.late = []
+
+    def start(self):
+        self.late = []
+        self.clock.start()
+        self.last = self.clock.nsecsElapsed()
+        self.t.start()
+
+    def _tick(self):
+        now = self.clock.nsecsElapsed()
+        self.late.append(max(0.0, (now - self.last) / 1e6 - self.interval))
+        self.last = now
+
+    def take(self):
+        late, self.late = self.late, []
+        return late
+
+
+def _run_app(driver_factory, out_path: Path, out: dict) -> int:
+    """main.main([]) with MainWindow replaced by a subclass that starts the driver."""
+    import fast_file_search.main as app_main
+    import fast_file_search.ui.main_window as mw_mod
+    from PySide6.QtCore import QTimer
+
+    Orig = mw_mod.MainWindow
+
+    class Window(Orig):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self._t_applied = None
+            self._applied_total = None
+            QTimer.singleShot(0, lambda: driver_factory(self))
+
+        def _on_search_result(self, res):
+            super()._on_search_result(res)
+            if res.offset == 0 and self._displayed_key == self._req_key:
+                self._t_applied = time.perf_counter()
+
+    mw_mod.MainWindow = Window
+    try:
+        out["rc"] = app_main.main([])
+    finally:
+        mw_mod.MainWindow = Orig
+        out_path.write_text(json.dumps(out, indent=1, ensure_ascii=False), encoding="utf-8")
+    return 0
+
+
+def _is_idle(win):
+    st = win._status
+    return (st is not None and st.state == "idle" and bool(st.roots)
+            and all(r.state == "ok" and r.last_scan_end is not None for r in st.roots))
+
+
+def child_startup(sandbox: Path, out_path: Path) -> int:
+    """One launch against the already-built index: first paint, Ready, first results."""
+    t0 = float(os.environ["BENCH_T0"])
+    _child_common(sandbox, None)
+    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtTest import QTest
+
+    out: dict = {}
+    marks: dict = {}
+
+    class PaintWatcher(QObject):
+        def eventFilter(self, obj, ev):
+            if ev.type() == QEvent.Type.Paint and "paint" not in marks:
+                marks["paint"] = time.time()
+            return False
+
+    def driver(win):
+        watcher = PaintWatcher(win)
+        win._paint_watcher = watcher
+        win.installEventFilter(watcher)
+        win.central_widget.installEventFilter(watcher)
+        client = win.client
+        client.ready.connect(lambda r: marks.setdefault("ready", time.time()))
+        client.search_result.connect(lambda r: marks.setdefault("results", time.time()) if r.total else None)
+        client.ready.connect(lambda r: client.search("gif", suggestions=False))
+        end = time.monotonic() + 60
+        while time.monotonic() < end and "results" not in marks:
+            QTest.qWait(5)
+        QTest.qWait(500)
+        out["first_paint_ms"] = (marks.get("paint", float("nan")) - t0) * 1000
+        out["ready_ms"] = (marks.get("ready", float("nan")) - t0) * 1000
+        out["first_results_ms"] = (marks.get("results", float("nan")) - t0) * 1000
+        out["spawn_to_ready_ms"] = getattr(client, "spawn_to_ready_ms", None)
+        st = client.last_status
+        out["entries"] = st.total_entries if st else None
+        out["rss_gui_mb"] = rss_mb()
+        out["rss_engine_mb"] = rss_mb(client.engine_pid)
+        win.close_and_quit()
+
+    return _run_app(driver, out_path, out)
+
+
+def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> int:
+    """Fresh index with typing, search latency, keystroke latency, watcher burst, RSS."""
+    _child_common(sandbox, tree)
+    from PySide6.QtCore import QElapsedTimer, QEvent, QEventLoop, Qt, QTimer
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    out: dict = {"tree": str(tree)}
+
+    def key(f, ch):
+        if ch.isascii():
+            QTest.keyClicks(f, ch)
+            return
+        for t in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            QApplication.sendEvent(f, QKeyEvent(t, 0, Qt.KeyboardModifier.NoModifier, ch))
+
+    def driver(win):
+        try:
+            run(win)
+        except Exception:
+            import traceback
+            out["error"] = traceback.format_exc()
+            traceback.print_exc()
+        finally:
+            win.close_and_quit()
+
+    def run(win):
+        client = win.client
+        hb = _Heartbeat((QTimer, QElapsedTimer, Qt))
+        hb.start()
+        win.activateWindow()
+        f = win.bar.field
+        # ---- fresh index while typing
+        end = time.monotonic() + 120
+        while not client.is_ready and time.monotonic() < end:
+            QTest.qWait(5)
+        t_ready = time.perf_counter()
+        out["spawn_to_ready_ms"] = getattr(client, "spawn_to_ready_ms", None)
+        keys, w, key_ms = 0, 0, []
+        deadline = time.monotonic() + 900
+        while time.monotonic() < deadline and not _is_idle(win):
+            word = TYPING_WORDS[w % len(TYPING_WORDS)]
+            w += 1
+            f.setFocus()
+            f.clear()
+            for ch in word:
+                t = time.perf_counter()
+                key(f, ch)
+                key_ms.append((time.perf_counter() - t) * 1000)
+                keys += 1
+                QTest.qWait(90)
+            QTest.qWait(150)
+        t_idle = time.perf_counter()
+        st = win._status
+        out["index"] = {"entries": st.total_entries, "folders": st.total_folders,
+                        "ready_to_idle_s": round(t_idle - t_ready, 3),
+                        "entries_per_s": round(st.total_entries / max(1e-3, t_idle - t_ready)),
+                        "keys_typed": keys}
+        out["heartbeat_indexing_typing"] = summary(hb.take())
+        out["key_handling_ms"] = {"p50": round(pct(key_ms, 50) or 0, 2), "p99": round(pct(key_ms, 99) or 0, 2)}
+        out["rss_after_index_gui_mb"] = rss_mb()
+        out["rss_after_index_engine_mb"] = rss_mb(client.engine_pid)
+        print("index:", out["index"], flush=True)
+        QTest.qWait(1000)
+
+        # ---- search latency through the client (no UI debounce)
+        got = {}
+
+        loop = QEventLoop()
+
+        def on_res(res):
+            if not res.refresh and res.offset == 0:
+                got.setdefault(res.gen, (time.perf_counter(), res))
+                loop.quit()
+
+        def wait_for_gen(gen, timeout):
+            """Block in the Qt event loop (not a spin loop: a spinning main thread starves the
+            client's reader thread of the GIL and would inflate the numbers)."""
+            end = time.monotonic() + timeout
+            while gen not in got and time.monotonic() < end:
+                QTimer.singleShot(int(max(1, (end - time.monotonic()) * 1000)), loop.quit)
+                loop.exec()
+        client.search_result.connect(on_res)
+        lat = {name: [] for name in QUERIES}
+        engine_ms = {name: [] for name in QUERIES}
+        totals = {}
+        reps = int(os.environ.get("BENCH_SEARCH_REPS", "15"))
+        for rep in range(reps + 2):
+            for name, text in QUERIES.items():
+                t = time.perf_counter()
+                gen = client.search(text, suggestions=False, limit=200)
+                wait_for_gen(gen, 30)
+                if gen not in got:
+                    continue
+                t2, res = got.pop(gen)
+                totals[name] = res.total
+                if rep >= 2:                      # two warm-up rounds
+                    lat[name].append((t2 - t) * 1000)
+                    engine_ms[name].append(res.elapsed_ms)
+                QTest.qWait(5)
+        client.search_result.disconnect(on_res)
+        allv = [x for v in lat.values() for x in v]
+        out["search_client_ms"] = {
+            n: {"p50": round(pct(v, 50), 2), "p95": round(pct(v, 95), 2), "max": round(max(v), 2),
+                "engine_p50": round(pct(engine_ms[n], 50), 2), "total": totals.get(n)}
+            for n, v in lat.items() if v}
+        out["search_client_all"] = {"p50": round(pct(allv, 50), 2), "p95": round(pct(allv, 95), 2),
+                                   "max": round(max(allv), 2), "n": len(allv)}
+        print("search through the client:", out["search_client_all"], flush=True)
+
+        # ---- keystroke -> results on screen, heartbeat running
+        hb.take()
+        kr = {}
+        for rep in range(4):
+            for word in TYPING_WORDS:
+                f.setFocus()
+                f.clear()
+                QTest.qWait(150)
+                win._t_applied = None
+                t_last = 0.0
+                for ch in word:
+                    key(f, ch)
+                    t_last = time.perf_counter()
+                    QTest.qWait(90)
+                e = time.monotonic() + 10
+                while (win._req_raw != word or win._t_applied is None
+                       or win._displayed_key != win._req_key) and time.monotonic() < e:
+                    QTest.qWait(5)
+                if win._t_applied is not None and rep:      # drop the first round
+                    kr.setdefault(word, []).append((win._t_applied - t_last) * 1000)
+                QTest.qWait(100)
+        allk = [x for v in kr.values() for x in v]
+        out["keystroke_to_results_ms"] = {"p50": round(pct(allk, 50), 1), "p95": round(pct(allk, 95), 1),
+                                          "max": round(max(allk), 1), "debounce_ms": 120, "n": len(allk)}
+        out["heartbeat_typing_idle"] = summary(hb.take())
+        print("keystroke -> results:", out["keystroke_to_results_ms"], flush=True)
+
+        # ---- watcher burst under the live root
+        burst_dir = tree / "zz_bench_burst"
+        burst_dir.mkdir(exist_ok=True)
+        token = "zzburstfile"
+        gen_box = {}
+
+        def on_burst(res):
+            if not res.refresh:
+                gen_box[res.gen] = res.total
+        client.search_result.connect(on_burst)
+        t_burst = time.perf_counter()
+        for i in range(burst_files):
+            (burst_dir / f"{token}{i}.dat").write_bytes(b"b")
+        t_written = time.perf_counter()
+        seen_at = None
+        end = time.monotonic() + 120
+        while time.monotonic() < end:
+            g = client.search(token, suggestions=False, limit=1)
+            e2 = time.monotonic() + 5
+            while g not in gen_box and time.monotonic() < e2:
+                QTest.qWait(5)
+            if gen_box.get(g) == burst_files:
+                seen_at = time.perf_counter()
+                break
+            QTest.qWait(50)
+        client.search_result.disconnect(on_burst)
+        out["watcher_burst"] = {"files": burst_files, "write_s": round(t_written - t_burst, 2),
+                                "searchable_after_write_s": round(seen_at - t_written, 2) if seen_at else None,
+                                "ok": seen_at is not None}
+        print("watcher burst:", out["watcher_burst"], flush=True)
+        shutil.rmtree(burst_dir, ignore_errors=True)
+
+        out["rss_final_gui_mb"] = rss_mb()
+        out["rss_final_engine_mb"] = rss_mb(client.engine_pid)
+        out["engine_pid"] = client.engine_pid
+
+    return _run_app(driver, out_path, out)
+
+
+def child_shots(sandbox: Path, outdir: Path, tag: str) -> int:
+    """Light and dark PNGs of the real window on a small real tree."""
+    docs = sandbox / "shots-tree"
+    docs.mkdir(parents=True, exist_ok=True)
+    stems = ["report", "invoice", "photo", "notes", "budget", "archive", "draft", "readme"]
+    for i in range(80):
+        ext = ["txt", "md", "py", "csv", "json", "pdf"][i % 6]
+        p = docs / f"{stems[i % 8]}_{i:03d}.{ext}"
+        p.write_text(f"Quarterly report {i}\nlorem ipsum report notes\n" * 30, encoding="utf-8")
+    _child_common(sandbox, docs)
+    from PySide6.QtTest import QTest
+
+    def driver(win):
+        try:
+            end = time.monotonic() + 60
+            while not _is_idle(win) and time.monotonic() < end:
+                QTest.qWait(20)
+            win.resize(1280, 800)
+            f = win.bar.field
+            f.setFocus()
+            QTest.keyClicks(f, "report")
+            QTest.qWait(700)
+            win.results.select_row(0)
+            outdir.mkdir(parents=True, exist_ok=True)
+            for mode in ("light", "dark"):
+                win.set_appearance(mode)
+                QTest.qWait(500)
+                if hasattr(win.bar, "hide_popup"):
+                    win.bar.hide_popup()
+                    QTest.qWait(100)
+                target = outdir / f"{tag}_{mode}.png"
+                print(f"screenshot {target} saved={win.grab().save(str(target))}", flush=True)
+        finally:
+            win.close_and_quit()
+
+    return _run_app(driver, sandbox / "shots.json", {})
+
+
+# ----------------------------------------------------------------------------- parent: orchestration
 def summarize(values):
     v = sorted(values)
-    n = len(v)
-    return {
-        "median": statistics.median(v),
-        "min": v[0],
-        "p95": v[min(n - 1, max(0, math.ceil(0.95 * n) - 1))],
-        "n": n,
-    }
+    return {"median": statistics.median(v), "min": v[0], "p95": pct(v, 95), "n": len(v)}
 
 
 class Recorder:
@@ -58,660 +455,218 @@ class Recorder:
         self.metrics = {}
 
     def add(self, name, values, unit="ms", better="lower"):
-        if not isinstance(values, (list, tuple)):
-            values = [values]
+        if values is None:
+            return
+        values = [x for x in (values if isinstance(values, (list, tuple)) else [values])
+                  if x is not None and not (isinstance(x, float) and math.isnan(x))]
+        if not values:
+            return
         d = summarize(values)
-        d["unit"] = unit
-        d["better"] = better
+        d.update(unit=unit, better=better)
         self.metrics[name] = d
-        return d
 
 
-def timed(fn, repeats, warmup=1):
-    for _ in range(warmup):
-        fn()
-    out = []
-    for _ in range(repeats):
-        t = time.perf_counter()
-        fn()
-        out.append((time.perf_counter() - t) * 1000.0)
-    return out
+def run_child(mode_args, sandbox: Path, timeout: int):
+    env = sandbox_env(sandbox, dict(os.environ))
+    env["BENCH_T0"] = repr(time.time())
+    cmd = [sys.executable, str(Path(__file__).resolve()), *mode_args]
+    p = subprocess.run(cmd, env=env, timeout=timeout, capture_output=True, text=True, encoding="utf-8",
+                       errors="replace")
+    sys.stdout.write(p.stdout)
+    if p.returncode != 0:
+        sys.stderr.write(p.stderr[-4000:])
+        raise RuntimeError(f"benchmark child {mode_args[0]} failed with {p.returncode}")
+    return p
 
 
-def rss_mb():
-    try:
-        import psutil
-        return psutil.Process().memory_info().rss / (1024 * 1024)
-    except Exception:
-        try:
-            import resource
-            r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            return r / (1024 * 1024) if sys.platform == "darwin" else r / 1024
-        except Exception:
-            return None
-
-
-# ----------------------------------------------------------------------------- Qt glue
-class Qt:
-    """Resolved after the app has been imported."""
-    binding = version = qt_version = ""
-    core = widgets = gui = None
-
-
-def resolve_binding():
-    import fast_file_search.ui.main_window as mw
-    name = None
-    for attr in ("QMainWindow", "QThread"):
-        obj = getattr(mw, attr, None)
-        mod = getattr(obj, "__module__", "") or ""
-        if mod.split(".")[0] in ("PySide6", "PyQt6"):
-            name = mod.split(".")[0]
-            break
-    if name is None:
-        name = next((n for n in ("PySide6", "PyQt6") if n in sys.modules), None)
-    if name is None:
-        raise RuntimeError("could not detect the Qt binding used by the app")
-    Qt.binding = name
-    Qt.core = import_module(name + ".QtCore")
-    Qt.widgets = import_module(name + ".QtWidgets")
-    Qt.gui = import_module(name + ".QtGui")
-    Qt.qt_version = Qt.core.qVersion()
-    if name == "PySide6":
-        Qt.version = import_module("PySide6").__version__
-    else:
-        Qt.version = Qt.core.PYQT_VERSION_STR
-    Qt.Signal = getattr(Qt.core, "Signal", None) or getattr(Qt.core, "pyqtSignal")
-    return mw
-
-
-def isolate_env(tmp: Path):
-    """Point every per-user location (config.json lives under %APPDATA%, not the
-    cache dir) at tmp so a benchmark run can never read or write real user data."""
-    for name, sub in (("FAST_FILE_SEARCH_CACHE_DIR", "cache"), ("APPDATA", "appdata"), ("LOCALAPPDATA", "localappdata"),
-                      ("XDG_CONFIG_HOME", "xdg_config"), ("XDG_DATA_HOME", "xdg_data"), ("XDG_CACHE_HOME", "xdg_cache")):
-        d = tmp / sub
-        d.mkdir(parents=True, exist_ok=True)
-        os.environ[name] = str(d)
-    os.environ["QT_QPA_PLATFORM"] = "offscreen"
-
-
-def setup_isolation(tmp: Path):
-    """Redirect QSettings (UI state) into tmp; call after the app is imported."""
-    c = Qt.core
-    settings_dir = tmp / "qsettings"
-    settings_dir.mkdir(parents=True, exist_ok=True)
-    for scope in (c.QSettings.Scope.UserScope, c.QSettings.Scope.SystemScope):
-        c.QSettings.setPath(c.QSettings.Format.IniFormat, scope, str(settings_dir))
-
-
-def make_app():
-    app = Qt.widgets.QApplication.instance() or Qt.widgets.QApplication(["bench"])
-    app.setApplicationName("Fast File Search Pro")
-    return app
-
-
-def pump(app, cond=None, timeout=60.0, rounds=3):
-    """Process events until cond() is true (or, without cond, a few rounds)."""
-    if cond is None:
-        for _ in range(rounds):
-            app.processEvents()
-        return True
-    end = time.perf_counter() + timeout
-    while not cond():
-        app.processEvents()
-        if time.perf_counter() > end:
-            return False
-    return True
-
-
-def finish(data):
-    sys.stdout.write(json.dumps(data) if not isinstance(data, str) else data)
-    sys.stdout.flush()
-    os._exit(0)  # skip interpreter/Qt teardown (threads, tray) - we measure, not shut down
-
-
-# ----------------------------------------------------------------------------- (a) startup child
-def child_startup():
-    tmp = Path(os.environ["BENCH_TMP"])
-    t0 = time.perf_counter()
-    mw = resolve_binding()
-    t1 = time.perf_counter()
-    setup_isolation(tmp)
-    app = make_app()
-    t2 = time.perf_counter()
-    win = mw.MainWindow()
-    t3 = time.perf_counter()
-    win.show()
-    app.processEvents()
-    t4 = time.perf_counter()
-    app.processEvents()
-    finish({
-        "import_ms": (t1 - t0) * 1000, "qapp_ms": (t2 - t1) * 1000,
-        "construct_ms": (t3 - t2) * 1000, "show_ms": (t4 - t3) * 1000,
-        "construct_show_ms": (t4 - t2) * 1000, "total_ms": (t4 - t0) * 1000,
-        "rss_mb": rss_mb(),
-    })
-
-
-def bench_startup(rec, tmp, runs=5):
-    rows = []
-    for i in range(runs + 1):  # first run warms OS file cache / .pyc, discarded
-        d = tmp / f"startup_{i}"
-        d.mkdir()
-        env = dict(os.environ, BENCH_TMP=str(d))
-        saved = dict(os.environ)
-        isolate_env(d)
-        env = dict(os.environ, BENCH_TMP=str(d))
-        os.environ.clear(); os.environ.update(saved)
-        t = time.perf_counter()
-        p = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--child-startup"],
-                           env=env, capture_output=True, text=True, timeout=300)
-        wall = (time.perf_counter() - t) * 1000
-        try:
-            r = json.loads(p.stdout.strip().splitlines()[-1])
-        except Exception:
-            raise RuntimeError(f"startup child failed:\n{p.stdout}\n{p.stderr}")
-        r["process_wall_ms"] = wall
-        if i:
-            rows.append(r)
-    for key, label in (("import_ms", "import_main_window"), ("qapp_ms", "create_qapplication"),
-                       ("construct_ms", "mainwindow_construct"), ("show_ms", "mainwindow_show"),
-                       ("construct_show_ms", "mainwindow_construct_show"),
-                       ("total_ms", "import_to_shown_total"), ("process_wall_ms", "process_wall_cold")):
-        rec.add(f"startup.{label}", [r[key] for r in rows])
-    if rows[0].get("rss_mb"):
-        rec.add("memory.startup_child_rss", [r["rss_mb"] for r in rows], unit="MB")
-
-
-# ----------------------------------------------------------------------------- data helpers
-def make_results(n):
-    from fast_file_search.search import SearchResult
-    out = []
-    for i in range(n):
-        stem, topic, ext = STEMS[i % 10], TOPICS[(i // 3) % 7], EXTS[(i * 7) % 12]
-        name = f"{stem}_{topic}_{i:06d}.{ext}"
-        out.append(SearchResult(
-            path=os.path.join(os.sep, "bench", f"dir_{i % 200:04d}", name), name=name, extension=ext,
-            size=(i * 7919) % 5_000_000, modified=1_600_000_000 + (i * 977) % 90_000_000,
-            is_folder=(i % 50 == 0), score=float((i * 31) % 997) / 10.0, matches=[stem]))
-    return out
-
-
-def make_response(n):
-    from fast_file_search.search import SearchResponse
-    return SearchResponse(results=make_results(n), total_count=n, page=1, page_size=n,
-                          total_pages=1, query_time_ms=1.0)
-
-
-def generate_tree(root: Path, total: int):
-    """Deterministic tree of ~total entries (folders + files); returns the list of file paths."""
-    per_dir = 74
-    ndirs = max(1, total // (per_dir + 1))
-    files = []
-    for d in range(ndirs):
-        label = "café" if d % 7 == 0 else ("データ" if d % 11 == 0 else "plain")
-        folder = root / f"dir_{d:04d}_{label}"
-        folder.mkdir(parents=True)
-        for k in range(per_dir):
-            i = d * per_dir + k
-            stem, topic = STEMS[i % 10], TOPICS[(i // 3) % 7]
-            ext = EXTS[(i * 7 + d) % 12]
-            p = folder / f"{stem}_{topic}_{i:05d}.{ext}"
-            p.write_bytes(b"x" * (i % 50 + 1))
-            files.append(p)
-    return files, ndirs
-
-
-def db_size(path: Path):
-    return sum(f.stat().st_size for f in path.parent.glob(path.name + "*") if f.is_file()) / (1024 * 1024)
-
-
-# ----------------------------------------------------------------------------- (b)(c) index + search
-def bench_index_and_search(rec, tmp, nfiles, repeats):
-    from fast_file_search.config import AppConfig
-    from fast_file_search.indexer import Indexer
-    from fast_file_search.persistent_index import PersistentIndex
-    from fast_file_search.search import SearchEngine
-
-    root = tmp / "tree"
+def make_tree(target: Path, files: int):
+    sys.path.insert(0, str(HERE))
+    from gen_tree import generate
     t = time.perf_counter()
-    files, ndirs = generate_tree(root, nfiles)
-    print(f"  generated {len(files) + ndirs} entries in {time.perf_counter() - t:.1f}s", flush=True)
-    entries = len(files) + ndirs
-    cfg = AppConfig(index_paths=[str(root)])
-
-    # Full scan: fresh DB each repeat.
-    secs, last = [], None
-    for r in range(max(2, repeats // 2 + 1)):
-        dbp = tmp / f"full_{r}" / "index.db"
-        idx = PersistentIndex(db_path=dbp)
-        ix = Indexer(config=cfg, persistent_index=idx)
-        t = time.perf_counter()
-        stats = ix.index_path(str(root))
-        secs.append(time.perf_counter() - t)
-        seen = stats.total_files + stats.total_folders
-        if r == 0 and abs(seen - entries) > entries * 0.02:
-            print(f"  WARNING: indexer saw {seen} entries, expected {entries}", flush=True)
-        if last is not None:
-            last.close()
-        last = idx
-        last_path = dbp
-    rec.add("index.full_scan", [s * 1000 for s in secs])
-    rec.add("index.full_scan_rate", [entries / s for s in secs], unit="entries/s", better="higher")
-    rec.add("index.db_size", db_size(last_path), unit="MB")
-
-    # Incremental, no change, then 1% modified.
-    ix = Indexer(config=cfg, persistent_index=last)
-    nochange = []
-    for _ in range(3):
-        t = time.perf_counter()
-        ix.incremental_update(str(root))
-        nochange.append((time.perf_counter() - t) * 1000)
-    rec.add("index.incremental_nochange", nochange)
-    step = max(1, len(files) // max(1, len(files) // 100))
-    inc = []
-    for r in range(3):
-        chosen = files[r::step][: max(1, len(files) // 100)]
-        for p in chosen:
-            p.write_bytes(b"y" * (60 + r))
-            st = p.stat()
-            os.utime(p, (st.st_atime, st.st_mtime + 10 + r))
-        t = time.perf_counter()
-        stats = ix.incremental_update(str(root))
-        inc.append((time.perf_counter() - t) * 1000)
-        if r == 0:
-            print(f"  incremental: updated={stats.updated} added={stats.added} "
-                  f"unchanged={stats.unchanged} of {len(chosen)} touched", flush=True)
-    rec.add("index.incremental_1pct", inc)
-    rec.add("index.incremental_1pct_rate", [entries / (x / 1000) for x in inc], unit="entries/s", better="higher")
-
-    # Search
-    engine = SearchEngine(persistent_index=last)
-    queries = {
-        "substring_report": "report",
-        "substring_invoice_alpha": "invoice_alpha",
-        "substring_unicode": "résumé",
-        "wildcard": "pho*gamma_000??",
-        "regex": r"re:^invoice_(alpha|beta)_\d{5}\.pdf$",
-        "ext_filter": "report ext:pdf",
-        "multi_term_and": "report alpha 001",
-    }
-    counts = {}
-
-    def run(q):
-        def f():
-            engine.invalidate_cache()
-            resp = engine.search_persistent(q, 1, 1000)
-            counts[q] = resp.total_count
-        return f
-
-    for name, q in queries.items():
-        rec.add(f"search.{name}", timed(run(q), max(7, repeats * 2), warmup=2))
-        rec.metrics[f"search.{name}"]["result_count"] = counts[q]
-    last.close()
+    n, d = generate(str(target), files, max(10, files // 15), seed=7)
+    print(f"generated {n + d} entries ({n} files) in {time.perf_counter() - t:.1f}s", flush=True)
+    return n + d
 
 
-# ----------------------------------------------------------------------------- (d)(e)(f) UI
-def bench_ui(rec, tmp, app, win, repeats):
-    c = Qt.core
-    sv = win.search_view
-    # MainWindow keeps its own filter panel; fall back to a standalone one.
-    fp = getattr(win, "filter_panel", None)
-    if fp is None:
-        from fast_file_search.ui.widgets import FilterPanel
-        fp = FilterPanel()
-    win.resize(1280, 800)
-    pump(app)
-    rec.add("memory.rss_after_startup", rss_mb() or 0, unit="MB")
-    terms = ["report"]
-    responses = {n: make_response(n) for n in (1000, 10000)}
-
-    def load(n):
-        t = time.perf_counter()
-        sv.set_results(responses[n], terms)
-        t_call = time.perf_counter() - t
-        pump(app)
-        t_pump = time.perf_counter() - t
-        sv.results_view.grab()  # paint the visible rows
-        t_paint = time.perf_counter() - t
-        return t_call * 1000, t_pump * 1000, t_paint * 1000
-
-    cold = load(10000)
-    rec.add("ui.results_10000_first_load_cold", cold[2])
-    rec.add("memory.rss_after_10000_results", rss_mb() or 0, unit="MB")
-    sv.set_results(make_response(0), terms)
-    pump(app)
-
-    for n in (1000, 10000):
-        rows = []
-        reps = repeats if n == 1000 else max(3, repeats - 1)
-        load(n)  # warm
-        for _ in range(reps):
-            sv.set_results(make_response(0), terms)
-            pump(app)
-            rows.append(load(n))
-        rec.add(f"ui.results_{n}.set_results_call", [r[0] for r in rows])
-        rec.add(f"ui.results_{n}.until_events_processed", [r[1] for r in rows])
-        rec.add(f"ui.results_{n}.until_first_paint", [r[2] for r in rows])
-
-    # Sorting (10k rows loaded)
-    sv.set_results(responses[10000], terms)
-    pump(app)
-    asc, desc = c.Qt.SortOrder.AscendingOrder, c.Qt.SortOrder.DescendingOrder
-    ncols = min(len(COLS), sv.model.columnCount())
-    for col in range(ncols):
-        for order, tag in ((asc, "asc"), (desc, "desc")):
-            def f(col=col, order=order):
-                sv.model.sort(col, order)
-                pump(app)
-                sv.results_view.grab()
-            rec.add(f"ui.sort_10000.{COLS[col]}_{tag}", timed(f, repeats))
-    if hasattr(sv, "sort_by_relevance"):
-        rec.add("ui.sort_10000.relevance", timed(lambda: (sv.sort_by_relevance(), pump(app)), repeats))
-
-    # Favorites filter toggling over 10k rows
-    def fav():
-        sv.toggle_fav_filter(True)
-        pump(app)
-        sv.toggle_fav_filter(False)
-        pump(app)
-    rec.add("ui.favorites_filter_toggle_10000", timed(fav, repeats))
-
-    # Filter panel changes
-    fp.update_extensions(sorted(set(EXTS) | {f"ext{i}" for i in range(40)}))
-    pump(app)
-
-    def filter_cycle():
-        for k in (1, 3, 5):
-            if fp.ext_combo.count() > k:
-                fp.ext_combo.setCurrentIndex(k)
-            if fp.size_combo.count() > k % fp.size_combo.count():
-                fp.size_combo.setCurrentIndex(k % fp.size_combo.count())
-            if fp.date_combo.count() > 1:
-                fp.date_combo.setCurrentIndex(k % fp.date_combo.count())
-            fp.regex_input.setText(r"dir_\d+")
-            fp.exclude_input.setText("*.tmp, node_modules")
-            fp.get_filter_values()
-            pump(app, rounds=1)
-        fp.reset_filters()
-        fp.get_filter_values()
-        pump(app)
-    rec.add("ui.filter_panel_change_cycle", timed(filter_cycle, repeats))
-
-    # (e) Preview
-    pv = getattr(win, "preview_panel", None)
-    if pv is not None:
-        line = "The quick brown fox jumps over the lazy dog - lorem ipsum report 0123456789\n"
-        for label, size in (("100KB", 100 * 1024), ("2MB", 2 * 1024 * 1024)):
-            p = tmp / f"preview_{label}.txt"
-            p.write_text(line * (size // len(line)), encoding="utf-8")
-            pv.set_search_terms(["lorem", "report"])
-
-            def text_shown():
-                return bool(pv.text_preview.toPlainText())
-
-            def load_prev():
-                pv.clear()
-                pump(app)
-                t = time.perf_counter()
-                pv.load_file(str(p))
-                ok = pump(app, text_shown, timeout=30)
-                t1 = (time.perf_counter() - t) * 1000
-                th = getattr(pv, "loader_thread", None)
-                if th is not None:
-                    pump(app, lambda: th.isFinished(), timeout=30)
-                t2 = (time.perf_counter() - t) * 1000
-                if not ok:
-                    raise RuntimeError("preview never loaded")
-                return t1, t2
-            load_prev()
-            rows = [load_prev() for _ in range(repeats)]
-            rec.add(f"preview.{label}.text_visible", [r[0] for r in rows])
-            rec.add(f"preview.{label}.loader_finished", [r[1] for r in rows])
-
-
-# ----------------------------------------------------------------------------- (g) signals / threads
-def bench_signals(rec, app, repeats):
-    c = Qt.core
-    Signal = Qt.Signal
-    N_SIG, N_TIMER = 20000, 10000
-
-    class Receiver(c.QObject):
-        def __init__(self):
-            super().__init__()
-            self.count = 0
-
-        def on_value(self, _v):
-            self.count += 1
-
-    class Emitter(c.QThread):
-        obj_sig = Signal(object)
-        int_sig = Signal(int)
-
-        def __init__(self, n, kind):
-            super().__init__()
-            self.n, self.kind = n, kind
-
-        def run(self):
-            if self.kind == "int":
-                emit = self.int_sig.emit
-            else:
-                emit = self.obj_sig.emit
-            payload = {"path": "x", "n": 1}
-            for i in range(self.n):
-                emit(i if self.kind == "int" else payload)
-
-    class Local(c.QObject):
-        sig = Signal(object)
-
-    def cross(kind):
-        def f():
-            rcv = Receiver()
-            th = Emitter(N_SIG, kind)
-            (th.int_sig if kind == "int" else th.obj_sig).connect(rcv.on_value)
-            t = time.perf_counter()
-            th.start()
-            if not pump(app, lambda: rcv.count >= N_SIG, timeout=120):
-                raise RuntimeError(f"only {rcv.count} signals arrived")
-            dt = time.perf_counter() - t
-            th.wait()
-            return dt
-        return f
-
-    for kind in ("object", "int"):
-        f = cross(kind)
-        f()
-        secs = [f() for _ in range(repeats)]
-        rec.add(f"signals.cross_thread_{kind}_{N_SIG}", [s * 1000 for s in secs])
-        rec.add(f"signals.cross_thread_{kind}_throughput", [N_SIG / s for s in secs],
-                unit="signals/s", better="higher")
-
-    def timers():
-        cnt = [0]
-
-        def cb():
-            cnt[0] += 1
-        t = time.perf_counter()
-        for _ in range(N_TIMER):
-            c.QTimer.singleShot(0, cb)
-        pump(app, lambda: cnt[0] >= N_TIMER, timeout=120)
-        return (time.perf_counter() - t) * 1000
-    timers()
-    rec.add(f"signals.singleshot0_{N_TIMER}", [timers() for _ in range(repeats)])
-
-    def same_thread():
-        loc, rcv = Local(), Receiver()
-        loc.sig.connect(rcv.on_value)
-        t = time.perf_counter()
-        for i in range(100000):
-            loc.sig.emit(i)
-        return (time.perf_counter() - t) * 1000
-    same_thread()
-    rec.add("signals.same_thread_emit_100000", [same_thread() for _ in range(repeats)])
-
-
-# ----------------------------------------------------------------------------- screenshots
-def screenshots(outdir: Path, tag: str):
-    tmp = Path(tempfile.mkdtemp(prefix="ffs_shot_"))
-    isolate_env(tmp)
+def qt_versions():
     try:
-        mw = resolve_binding()
-        setup_isolation(tmp)
-        app = make_app()
-        from fast_file_search.search import SearchResponse, SearchResult
-        from fast_file_search.ui import theme
-        # Real files so icons and the preview panel have something to show.
-        docs = tmp / "docs"
-        docs.mkdir()
-        results = []
-        for i in range(60):
-            stem, topic, ext = STEMS[i % 10], TOPICS[i % 7], ["txt", "md", "py", "csv", "json", "pdf"][i % 6]
-            p = docs / f"{stem}_{topic}_{i:03d}.{ext}"
-            p.write_text(f"Quarterly report {i}\nlorem ipsum report notes\n" * 40, encoding="utf-8")
-            st = p.stat()
-            results.append(SearchResult(path=str(p), name=p.name, extension=ext, size=st.st_size,
-                                        modified=int(st.st_mtime) - i * 86400 * 3, is_folder=False,
-                                        score=100.0 - i, matches=["report"]))
-        resp = SearchResponse(results=results, total_count=len(results), page=1, page_size=100,
-                              total_pages=1, query_time_ms=3.4)
-        win = mw.MainWindow()
-        win.resize(1280, 800)
-        win.show()
-        for mode in ("light", "dark"):
-            if hasattr(win, "set_appearance"):
-                win.set_appearance(mode)
-            else:
-                theme.apply_appearance(mode)
-            sv = win.search_view
-            sv.search_input.blockSignals(True)
-            sv.search_input.setText("report")
-            sv.search_input.blockSignals(False)
-            sv.set_results(resp, ["report"])
-            if hasattr(sv, "select_path"):
-                sv.select_path(results[0].path)
-            if hasattr(win, "preview_panel"):
-                win.preview_panel.set_search_terms(["report"])
-                win.preview_panel.clear()
-                win.preview_panel.load_file(results[0].path)
-            end = time.perf_counter() + 0.8
-            while time.perf_counter() < end:
-                app.processEvents()
-                time.sleep(0.005)
-            outdir.mkdir(parents=True, exist_ok=True)
-            target = outdir / f"{tag}_{mode}.png"
-            ok = win.grab().save(str(target))
-            print(f"screenshot {target} saved={ok}")
-        finish("")
+        import PySide6
+        from PySide6.QtCore import qVersion
+        return PySide6.__version__, qVersion()
+    except Exception:
+        return "unknown", "unknown"
+
+
+def benchmark(args) -> int:
+    tmp = Path(tempfile.mkdtemp(prefix="ffs_bench_"))
+    sandbox = tmp / "sandbox"
+    sandbox.mkdir()
+    try:
+        if args.tree:
+            tree = Path(args.tree).resolve()
+        else:
+            tree = tmp / "tree"
+            make_tree(tree, args.files)
+        rec = Recorder()
+        child_json = tmp / "run.json"
+        print("[1/2] fresh index, typing, search, watcher burst", flush=True)
+        run_child(["--child-run", str(sandbox), str(tree), str(child_json), str(args.burst_files)], sandbox,
+                  timeout=3600)
+        run = json.loads(child_json.read_text(encoding="utf-8"))
+        if "error" in run:
+            raise RuntimeError("benchmark driver failed:\n" + run["error"])
+
+        starts = []
+        print(f"[2/2] startup against the built index (x{args.startup_runs})", flush=True)
+        for i in range(args.startup_runs + 1):           # the first launch warms the OS cache, discarded
+            sj = tmp / f"startup_{i}.json"
+            run_child(["--child-startup", str(sandbox), str(sj)], sandbox, timeout=600)
+            row = json.loads(sj.read_text(encoding="utf-8"))
+            if i:
+                starts.append(row)
+
+        idx = run["index"]
+        rec.add("startup.first_paint", [r["first_paint_ms"] for r in starts])
+        rec.add("startup.engine_ready", [r["ready_ms"] for r in starts])
+        rec.add("startup.first_results", [r["first_results_ms"] for r in starts])
+        rec.add("index.fresh_rate", idx["entries_per_s"], unit="entries/s", better="higher")
+        rec.add("index.fresh_ready_to_idle", idx["ready_to_idle_s"] * 1000)
+        rec.add("index.spawn_to_ready_cold", run.get("spawn_to_ready_ms"))
+        rec.add("heartbeat.indexing_typing_p99", run["heartbeat_indexing_typing"]["p99"])
+        rec.add("heartbeat.indexing_typing_max", run["heartbeat_indexing_typing"]["max"])
+        rec.add("heartbeat.typing_idle_p99", run["heartbeat_typing_idle"]["p99"])
+        rec.add("heartbeat.typing_idle_max", run["heartbeat_typing_idle"]["max"])
+        rec.add("search.client_p95", run["search_client_all"]["p95"])
+        rec.add("search.client_p50", run["search_client_all"]["p50"])
+        for name, d in run["search_client_ms"].items():
+            rec.add(f"search.client.{name}", d["p50"])
+        rec.add("keystroke.to_results_p50", run["keystroke_to_results_ms"]["p50"])
+        rec.add("keystroke.to_results_p95", run["keystroke_to_results_ms"]["p95"])
+        rec.add("keystroke.handling_p99", run["key_handling_ms"]["p99"])
+        wb = run["watcher_burst"]
+        rec.add("watcher.burst_searchable_after_write", (wb["searchable_after_write_s"] or float("nan")) * 1000)
+        rec.add("memory.gui_rss_after_index", run["rss_after_index_gui_mb"], unit="MB")
+        rec.add("memory.engine_rss_after_index", run["rss_after_index_engine_mb"], unit="MB")
+        rec.add("memory.gui_rss_final", run["rss_final_gui_mb"], unit="MB")
+        rec.add("memory.engine_rss_final", run["rss_final_engine_mb"], unit="MB")
+        rec.add("memory.gui_rss_startup", [r["rss_gui_mb"] for r in starts], unit="MB")
+        rec.add("memory.engine_rss_startup", [r["rss_engine_mb"] for r in starts], unit="MB")
+
+        binding, qt = qt_versions()
+        import sqlite3
+        meta = {"binding": "PySide6", "version": binding, "qt_version": qt, "python": platform.python_version(),
+                "platform": platform.platform(), "machine": platform.machine(), "sqlite": sqlite3.sqlite_version,
+                "date": time.strftime("%Y-%m-%d %H:%M:%S"), "files": args.files, "entries": idx["entries"],
+                "startup_runs": args.startup_runs, "cpu_count": os.cpu_count()}
+        headline = {
+            "entries": idx["entries"],
+            "index_entries_per_s": idx["entries_per_s"],
+            "search_p95_ms": run["search_client_all"]["p95"],
+            "heartbeat_p99_ms": max(run["heartbeat_indexing_typing"]["p99"], run["heartbeat_typing_idle"]["p99"]),
+            "heartbeat_max_ms": max(run["heartbeat_indexing_typing"]["max"] or 0, run["heartbeat_typing_idle"]["max"] or 0),
+            "startup_first_paint_ms": rec.metrics["startup.first_paint"]["median"],
+            "startup_ready_ms": rec.metrics["startup.engine_ready"]["median"],
+            "keystroke_to_results_p95_ms": run["keystroke_to_results_ms"]["p95"],
+            "watcher_burst_ok": wb["ok"],
+            "gui_rss_mb": run["rss_final_gui_mb"],
+            "engine_rss_mb": run["rss_final_engine_mb"],
+        }
+        result = {"meta": meta, "headline": headline, "metrics": rec.metrics, "raw": {"run": run, "startup": starts}}
+        out = Path(args.out) if args.out else REPO / "dist" / "bench" / f"app-{sys.platform}-{idx['entries']}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        print_table(rec, meta)
+        print("\nheadline:", json.dumps(headline))
+        print(f"wrote {out}", flush=True)
+        return 0
     finally:
-        pass
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ----------------------------------------------------------------------------- compare
-def flatten(path):
-    d = json.loads(Path(path).read_text(encoding="utf-8"))
-    return d, d.get("metrics", {})
-
-
-ABS_FLOOR = {"ms": 5.0, "MB": 5.0}
-
-
-def compare(a_path, b_path):
-    red = "\033[31m" if (sys.stdout.isatty() or os.environ.get("FORCE_COLOR")) else ""
-    rst = "\033[0m" if red else ""
-    ma, A = flatten(a_path)
-    mb, B = flatten(b_path)
-    la = f"{ma['meta']['binding']} {ma['meta']['version']}"
-    lb = f"{mb['meta']['binding']} {mb['meta']['version']}"
-    print(f"A = {la} ({a_path})\nB = {lb} ({b_path})\n")
-    w = max(len(k) for k in set(A) | set(B))
-    print(f"{'metric':<{w}}  {'unit':>10}  {'A median':>12}  {'B median':>12}  {'change':>8}  flag")
-    regressions = 0
-    for k in sorted(set(A) | set(B), key=lambda x: (x.split('.')[0], x)):
-        a, b = A.get(k), B.get(k)
-        if not a or not b:
-            print(f"{k:<{w}}  {'':>10}  {'n/a' if not a else a['median']:>12}  {'n/a' if not b else b['median']:>12}")
-            continue
-        va, vb, unit = a["median"], b["median"], a.get("unit", "")
-        pct = ((vb - va) / va * 100.0) if va else 0.0
-        worse = (vb - va) if a.get("better", "lower") == "lower" else (va - vb)
-        worse_pct = (worse / va * 100.0) if va else 0.0
-        bad = worse_pct > 10.0 and abs(vb - va) > ABS_FLOOR.get(unit, 0.0)
-        flag = "REGRESSION" if bad else ("improved" if worse_pct < -10.0 and abs(vb - va) > ABS_FLOOR.get(unit, 0.0) else "")
-        regressions += bad
-        line = f"{k:<{w}}  {unit:>10}  {va:>12.2f}  {vb:>12.2f}  {pct:>+7.1f}%  {flag}"
-        print(f"{red}{line}{rst}" if bad else line)
-    print(f"\n{regressions} regression(s) (>10% worse and >5 ms / >5 MB absolute where applicable)")
-    return 1 if regressions else 0
-
-
-# ----------------------------------------------------------------------------- main
 def print_table(rec, meta):
-    print(f"\n=== {meta['binding']} {meta['version']} (Qt {meta['qt_version']}), Python {meta['python']} ===")
+    print(f"\n=== Fast File Search Pro 2.0 app benchmark ({meta['platform']}, Python {meta['python']}, "
+          f"{meta['binding']} / Qt {meta['qt_version']}, {meta['entries']:,} entries) ===")
     w = max(len(k) for k in rec.metrics)
     print(f"{'metric':<{w}}  {'unit':>10}  {'median':>12}  {'min':>12}  {'p95':>12}  n")
     for k, d in rec.metrics.items():
         print(f"{k:<{w}}  {d['unit']:>10}  {d['median']:>12.2f}  {d['min']:>12.2f}  {d['p95']:>12.2f}  {d['n']}")
 
 
-def main():
+# ----------------------------------------------------------------------------- compare
+ABS_FLOOR = {"ms": 5.0, "MB": 5.0}
+
+
+def compare(a_path, b_path) -> int:
+    red = "\033[31m" if (sys.stdout.isatty() or os.environ.get("FORCE_COLOR")) else ""
+    rst = "\033[0m" if red else ""
+    A = json.loads(Path(a_path).read_text(encoding="utf-8"))
+    B = json.loads(Path(b_path).read_text(encoding="utf-8"))
+
+    def label(d, p):
+        m = d.get("meta", {})
+        return f"{m.get('platform', '?')} {m.get('version', '')} ({p})"
+    print(f"A = {label(A, a_path)}\nB = {label(B, b_path)}\n")
+    MA, MB = A.get("metrics", {}), B.get("metrics", {})
+    w = max(len(k) for k in set(MA) | set(MB))
+    print(f"{'metric':<{w}}  {'unit':>10}  {'A median':>12}  {'B median':>12}  {'change':>8}  flag")
+    regressions = 0
+    for k in sorted(set(MA) | set(MB), key=lambda x: (x.split('.')[0], x)):
+        a, b = MA.get(k), MB.get(k)
+        if not a or not b:
+            print(f"{k:<{w}}  {'':>10}  {'n/a' if not a else a['median']:>12}  {'n/a' if not b else b['median']:>12}")
+            continue
+        va, vb, unit = a["median"], b["median"], a.get("unit", "")
+        change = ((vb - va) / va * 100.0) if va else 0.0
+        worse = (vb - va) if a.get("better", "lower") == "lower" else (va - vb)
+        worse_pct = (worse / va * 100.0) if va else 0.0
+        floor = ABS_FLOOR.get(unit, 0.0)
+        bad = worse_pct > 10.0 and abs(vb - va) > floor
+        flag = "REGRESSION" if bad else ("improved" if worse_pct < -10.0 and abs(vb - va) > floor else "")
+        regressions += bad
+        line = f"{k:<{w}}  {unit:>10}  {va:>12.2f}  {vb:>12.2f}  {change:>+7.1f}%  {flag}"
+        print(f"{red}{line}{rst}" if bad else line)
+    print(f"\n{regressions} regression(s) (>10% worse and >5 ms / >5 MB absolute where applicable)")
+    return 1 if regressions else 0
+
+
+# ----------------------------------------------------------------------------- main
+def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", help="JSON output path (default dist/bench/<binding>-<version>.json)")
+    ap.add_argument("--out", help="JSON output path (default dist/bench/app-<platform>-<entries>.json)")
     ap.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"))
-    ap.add_argument("--files", type=int, default=30000, help="synthetic tree size (files+folders)")
-    ap.add_argument("--repeats", type=int, default=7)
-    ap.add_argument("--startup-runs", type=int, default=5)
-    ap.add_argument("--skip", default="", help="comma list of sections to skip: startup,ui,signals,index")
-    ap.add_argument("--screenshots", metavar="DIR", help="save populated light/dark window PNGs and exit")
-    ap.add_argument("--tag", default="shot", help="file prefix for --screenshots")
-    ap.add_argument("--child-startup", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--files", type=int, default=30_000, help="synthetic tree size in files (folders are extra)")
+    ap.add_argument("--tree", help="benchmark an existing tree instead of generating one (not modified)")
+    ap.add_argument("--startup-runs", type=int, default=3)
+    ap.add_argument("--burst-files", type=int, default=2000)
+    ap.add_argument("--screenshots", metavar="DIR", help="save light/dark PNGs of the real window and exit")
+    ap.add_argument("--tag", default="v2", help="file prefix for --screenshots")
+    # internal: the app runs in child processes
+    ap.add_argument("--child-run", nargs=4, metavar=("SANDBOX", "TREE", "OUT", "BURST"), help=argparse.SUPPRESS)
+    ap.add_argument("--child-startup", nargs=2, metavar=("SANDBOX", "OUT"), help=argparse.SUPPRESS)
+    ap.add_argument("--child-shots", nargs=3, metavar=("SANDBOX", "DIR", "TAG"), help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if args.compare:
-        sys.exit(compare(*args.compare))
+        return compare(*args.compare)
+    if args.child_run:
+        s, t, o, b = args.child_run
+        return child_run(Path(s), Path(t), Path(o), int(b))
     if args.child_startup:
-        child_startup()
+        return child_startup(Path(args.child_startup[0]), Path(args.child_startup[1]))
+    if args.child_shots:
+        return child_shots(Path(args.child_shots[0]), Path(args.child_shots[1]), args.child_shots[2])
     if args.screenshots:
-        screenshots(Path(args.screenshots), args.tag)
-
-    skip = set(filter(None, args.skip.split(",")))
-    tmp = Path(tempfile.mkdtemp(prefix="ffs_bench_"))
-    isolate_env(tmp)
-    rec = Recorder()
-    try:
-        mw = resolve_binding()
-        meta = {
-            "binding": Qt.binding, "version": Qt.version, "qt_version": Qt.qt_version,
-            "python": platform.python_version(), "platform": platform.platform(),
-            "date": time.strftime("%Y-%m-%d %H:%M:%S"), "repeats": args.repeats,
-            "files": args.files,
-        }
-        print(f"Binding: {Qt.binding} {Qt.version} (Qt {Qt.qt_version}), Python {meta['python']}", flush=True)
-        if "startup" not in skip:
-            print("[a] startup (subprocess x%d)" % args.startup_runs, flush=True)
-            bench_startup(rec, tmp, args.startup_runs)
-        setup_isolation(tmp)
-        app = make_app()
-        if "ui" not in skip:
-            print("[d-f] UI, preview, memory", flush=True)
-            win = mw.MainWindow()
-            win.show()
-            bench_ui(rec, tmp, app, win, args.repeats)
-        if "signals" not in skip:
-            print("[g] signals / threads", flush=True)
-            bench_signals(rec, app, args.repeats)
-        if "index" not in skip:
-            print("[b-c] index build + search", flush=True)
-            bench_index_and_search(rec, tmp, args.files, args.repeats)
-        out = Path(args.out) if args.out else REPO / "dist" / "bench" / f"{Qt.binding.lower()}-{Qt.version}.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({"meta": meta, "metrics": rec.metrics}, indent=2, ensure_ascii=False),
-                       encoding="utf-8")
-        print_table(rec, meta)
-        print(f"\nwrote {out}", flush=True)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    os._exit(0)
+        tmp = Path(tempfile.mkdtemp(prefix="ffs_shot_"))
+        try:
+            run_child(["--child-shots", str(tmp / "sandbox"), str(Path(args.screenshots).resolve()), args.tag],
+                      tmp / "sandbox", timeout=300)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return 0
+    return benchmark(args)
 
 
 if __name__ == "__main__":
-    main()
+    import multiprocessing
+    multiprocessing.freeze_support()
+    sys.exit(main())

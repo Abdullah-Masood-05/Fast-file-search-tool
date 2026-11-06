@@ -66,8 +66,22 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      - name: Environment
+        shell: bash
+        run: |
+          uv run python -c "import platform, sqlite3, sys; print('python', sys.version.split()[0]); print('sqlite3', sqlite3.sqlite_version); print('platform', platform.platform(), platform.machine())"
+          {
+            echo "### Test environment (${{ matrix.os }})"
+            uv run python -c "import platform, sqlite3; print('- sqlite3 ' + sqlite3.sqlite_version); print('- ' + platform.platform() + ' ' + platform.machine())"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run tests
-        run: uv run pytest -v
+        run: uv run pytest -q
+
+      # Real engine processes, the 50k-entry GUI responsiveness test and the spawn ground truth.
+      - name: Run slow tests
+        if: matrix.os != 'windows-latest'
+        run: uv run pytest -q --run-slow
 
   build:
     name: Build (${{ matrix.platform }})
@@ -140,7 +154,8 @@ jobs:
         if: runner.os == 'Windows'
         run: uv run python build.py --mode onefile
 
-      - name: Smoke test
+      - name: Locate the built binary
+        id: bin
         run: |
           case "$RUNNER_OS" in
             Windows) bin="dist/FastFileSearchPro/FastFileSearchPro.exe" ;;
@@ -149,14 +164,65 @@ jobs:
               bin="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" ;;
             *)       bin="dist/FastFileSearchPro/fast-file-search-pro" ;;
           esac
-          "$bin" & pid=$!
+          test -f "$bin" || { echo "::error::binary not found: $bin"; exit 1; }
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
+
+      # Starts the engine through the real (frozen) multiprocessing spawn path, indexes the fixture and
+      # compares the search counts with an os.walk ground truth. Also reports sqlite and platform.
+      - name: Packaged self-test
+        env:
+          BIN: ${{ steps.bin.outputs.bin }}
+        run: |
+          mkdir -p selftest-out
+          "$BIN" --selftest tests/e2e/fixture_small "selftest-out/selftest-${{ matrix.platform }}.json"
+          python - "selftest-out/selftest-${{ matrix.platform }}.json" <<'PY'
+          import json, os, sys
+          r = json.load(open(sys.argv[1], encoding="utf-8"))
+          line = (f"selftest ok={r['ok']} frozen={r.get('frozen')} sqlite={r.get('sqlite_version')} "
+                  f"platform={r.get('platform')} child_qt_modules={r.get('child_qt_modules')} "
+                  f"timings={r.get('timings')}")
+          print(line)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write("### Packaged self-test (${{ matrix.platform }})\n\n- " + line + "\n")
+          sys.exit(0 if r["ok"] else 1)
+          PY
+
+      - name: Packaged GUI self-test
+        env:
+          BIN: ${{ steps.bin.outputs.bin }}
+        run: '"$BIN" --selftest-gui'
+
+      - name: Packaged self-test (portable onefile, Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p selftest-out
+          dist/FastFileSearchPro.exe --selftest tests/e2e/fixture_small selftest-out/selftest-windows-onefile.json
+          python -c "import json; r = json.load(open('selftest-out/selftest-windows-onefile.json', encoding='utf-8')); print('onefile selftest ok=%s sqlite=%s %s' % (r['ok'], r.get('sqlite_version'), r.get('platform')))"
+
+      - name: Upload self-test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: selftest-${{ matrix.platform }}
+          path: selftest-out/*.json
+          if-no-files-found: ignore
+
+      - name: Launch check (10 s)
+        env:
+          BIN: ${{ steps.bin.outputs.bin }}
+        run: |
+          "$BIN" & pid=$!
           sleep 10
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            echo "--- lsappinfo (expect a single Fast File Search Pro entry, no engine child in the Dock)"
+            lsappinfo list | grep -i -A2 "fast file search" || true
+          fi
           if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" || true
-            echo "OK: $bin is running"
+            echo "OK: $BIN is running"
           else
             wait "$pid" && code=0 || code=$?
-            echo "::error::$bin exited early with code $code"
+            echo "::error::$BIN exited early with code $code"
             exit 1
           fi
 
@@ -215,6 +281,79 @@ jobs:
           path: dist-installers/*
           if-no-files-found: error
 
+  bench:
+    name: Bench (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel, windows-latest, ubuntu-22.04]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Use a throwaway app cache dir
+        run: echo "FAST_FILE_SEARCH_CACHE_DIR=$RUNNER_TEMP/ffs-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+
+      - name: Install Qt runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 libdbus-1-3 libglib2.0-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-image0 \
+            libxcb-randr0 libxcb-render-util0 libxcb-xkb1
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Environment
+        run: |
+          uv run python -c "import platform, sqlite3, sys; print('python', sys.version.split()[0]); print('sqlite3', sqlite3.sqlite_version); print('platform', platform.platform(), platform.machine())"
+          nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "cpus: $NUMBER_OF_PROCESSORS"
+
+      - name: Generate the 300k tree
+        run: uv run python benchmarks/gen_tree.py "$RUNNER_TEMP/tree300k" --files 300000
+
+      - name: Engine benchmark (acceptance matrices, scale 1)
+        run: |
+          mkdir -p bench-out
+          extra=""
+          # macOS: walker threads 1, 2, 4, 8 on APFS, to settle the default (design I.1.2)
+          if [ "$RUNNER_OS" = "macOS" ]; then extra="--walker-threads 1,2,4,8"; fi
+          uv run python benchmarks/bench_engine.py --tree "$RUNNER_TEMP/tree300k" --scale 1 \
+            --out "bench-out/bench-engine-${{ matrix.os }}.json" $extra
+
+      - name: App benchmark (real window and engine process)
+        run: |
+          uv run python benchmarks/bench_app.py --tree "$RUNNER_TEMP/tree300k" \
+            --out "bench-out/bench-app-${{ matrix.os }}.json"
+
+      - name: Summary
+        if: always()
+        run: uv run python benchmarks/ci_summary.py bench-out "${{ matrix.os }}"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-${{ matrix.os }}
+          path: bench-out/*.json
+          if-no-files-found: error
+
   release:
     name: Publish release
     needs: build
@@ -261,6 +400,14 @@ jobs:
           cat > release-notes.md <<EOF
           ## Fast File Search Pro v$V
 
+          ### What's new in 2.0
+          - **New search engine.** Indexing and searching run in a separate engine process, so the window stays responsive while a large disk is indexed. Every match is reachable (there is no result cap), counts are exact, and results update live as files change.
+          - **Filter-aware suggestions.** Type and path suggestions come only from results that match your current filters. History suggestions are offered only when they would find something under those filters.
+          - **New interface.** A search bar with filter chips (type, size, date, location, excludes), a library sidebar, a results list with sorting, and a preview and details pane. Light and dark themes.
+          - **Search as you type.** Results appear as you type, with highlighted matches.
+          - **Live index.** The watcher keeps the index current; safety rescans catch anything a watcher misses.
+          - **Self-tested builds.** Every build runs a packaged self-test that starts the engine and checks its results against a file-system walk.
+
           ### Windows (x64)
           | File | Description |
           |---|---|
@@ -290,15 +437,22 @@ jobs:
 
           After installing a package, start **Fast File Search Pro** from your application menu or run \`fast-file-search-pro\`.
 
+          ### macOS folder permissions
+          Fast File Search Pro indexes file names in folders you choose. File contents are not read.
+
+          - **First launch:** macOS shows one permission prompt for each protected folder the app scans (Desktop, Documents, Downloads, and removable or network volumes). Choose **Allow** to let the app index that folder. If you choose **Don't Allow**, the app shows a warning for that folder and does not ask again. To change your answer, open *System Settings → Privacy & Security → Files and Folders* (or *Full Disk Access*) and switch Fast File Search Pro on.
+          - **One permission for everything:** grant *Full Disk Access* in *System Settings → Privacy & Security*. The app then does not need the per-folder permissions.
+          - **After an update:** the app is signed ad hoc (no Apple Developer ID), so macOS may treat each new build as a different app and forget earlier permissions. If a folder shows as not allowed after updating, allow it again in System Settings. This stays the case until the app is signed with a Developer ID.
+
           ### Known limitations
-          - **macOS builds are new and lightly tested.** They are built and launch-tested by CI only, have not been tried by hand on a real Mac, and are not notarized (see the Gatekeeper note above).
-          - **Linux desktop integration varies by desktop.** "Show in File Manager" uses the freedesktop \`FileManager1\` D-Bus interface and falls back to opening the parent folder. Move to Trash needs \`gio\`, \`trash-put\` or \`kioclient5\`. These were tested with mocks, not on every desktop.
+          - **macOS builds are CI-tested only and not notarized.** They are built, self-tested and launch-tested on GitHub's macOS runners, but have not been tried by hand on a real Mac. See the Gatekeeper note above.
+          - **Linux desktop integration varies by desktop.** "Show in File Manager" uses the freedesktop \`FileManager1\` D-Bus interface and falls back to opening the parent folder. Move to Trash needs \`gio\`, \`trash-put\` or \`kioclient5\`. These were tested with mocks, not on every desktop. There is no tray icon on some desktops (for example GNOME without an AppIndicator extension); there, closing the window quits the app.
           - **Linux scans stay on one filesystem.** A scan rooted at \`/\` does not enter a separate \`/home\` partition or btrfs subvolumes (Fedora's default layout). Add those folders as index roots directly. The default root (your home folder) is not affected.
-          - **macOS \`~/Library\` is indexed** when you index your home folder. Add \`Library\` to the exclude patterns if you don't want its caches in results.
-          - **No tray icon on some desktops** (for example GNOME without an AppIndicator extension). There, closing the window quits the app.
+          - **Unsigned executables.** None of the downloads are code-signed (Windows shows SmartScreen, macOS shows Gatekeeper).
+          - **Grid and column views are not included.** Results are shown as a list with a preview pane.
+          - **OR binds tighter than AND in queries.** \`a b | c\` means \`a AND (b OR c)\`. Use \`case:\` for exact-case matching; names match accent-insensitively by default.
+          - **macOS \`~/Library\` and Windows \`AppData\`** inside your home folder are skipped by default. Turn on the setting to include them.
           - **Windows long paths:** paths longer than 260 characters are reported as scan errors and skipped.
-          - **Search and results:** search runs when you press Enter, not as you type. The result list shows at most the configured maximum (default 1,000), and the status bar says when the list was cut off.
-          - **Unsigned executables:** none of the downloads are code-signed.
 
           ---
           Source code and issue tracker: $REPO_URL
