@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-15]
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
@@ -94,7 +94,7 @@ jobs:
           - platform: windows-x64
             os: windows-latest
           - platform: macos-arm64
-            os: macos-latest
+            os: macos-15
           - platform: macos-x86_64
             os: macos-15-intel
           # Oldest supported Ubuntu runner: glibc 2.35 is the binaries' runtime floor.
@@ -289,7 +289,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-15-intel, windows-latest, ubuntu-22.04]
+        os: [macos-15, macos-15-intel, windows-latest, ubuntu-22.04]
     env:
       QT_QPA_PLATFORM: offscreen
     defaults:
