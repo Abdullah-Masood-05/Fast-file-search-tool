@@ -42,8 +42,54 @@ def pytest_addoption(parser):
                      help="also run tests marked 'slow' (real processes, long runs)")
 
 
+_FAULT_FD = None
+
+
 def pytest_configure(config):
+    global _FAULT_FD
     config.addinivalue_line("markers", "slow: spawns real processes or runs long (needs --run-slow)")
+    # applog.setup_logging() redirects faulthandler into a crash log file; a native crash
+    # in a test would then die silently in CI. Keep our own dup of the real stderr (taken
+    # before pytest's capture swaps fd 2) and re-arm faulthandler on it around every test.
+    import faulthandler
+    try:
+        _FAULT_FD = os.dup(2)
+        faulthandler.enable(_FAULT_FD, all_threads=True)
+    except Exception:
+        _FAULT_FD = None
+        return
+    # Also swallow later redirects (applog.setup_logging called inside a test): the crash
+    # dump must reach the CI log, not a file in the sandbox that is deleted at exit.
+    real_enable = faulthandler.enable
+
+    def enable(file=None, all_threads=True):
+        real_enable(_FAULT_FD, all_threads=all_threads)
+
+    faulthandler.enable = enable
+
+
+def _rearm_faulthandler():
+    if _FAULT_FD is not None:
+        import faulthandler
+        faulthandler.enable(_FAULT_FD, all_threads=True)
+
+
+import pytest  # noqa: E402
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    _rearm_faulthandler()
+    try:
+        return (yield)
+    finally:
+        _rearm_faulthandler()
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=False)
+def pytest_runtest_call(item):
+    _rearm_faulthandler()
+    return (yield)
 
 
 def pytest_collection_modifyitems(config, items):
@@ -54,3 +100,11 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip)
+
+
+# --------------------------------------------------------------------------- timing
+@pytest.fixture(scope="session")
+def perf_scale():
+    """Multiplier for absolute latency limits: strict (1.0) locally, looser on shared CI
+    runners where neighbouring jobs steal CPU. Relative-to-baseline checks use their own bound."""
+    return 3.0 if os.environ.get("CI") else 1.0

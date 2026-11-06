@@ -699,4 +699,11 @@ def pid_alive(pid: int) -> bool:
         wpid, _ = os.waitpid(pid, os.WNOHANG)
         return wpid == 0
     except ChildProcessError:
+        pass
+    # Not our child. On Linux an orphan that exited stays a zombie until its new parent
+    # reaps it (a container's PID 1 often never does): a zombie is not alive.
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            return fh.read().rpartition(b")")[2].split()[0] != b"Z"
+    except OSError:
         return True

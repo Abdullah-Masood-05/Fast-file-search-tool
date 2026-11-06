@@ -161,7 +161,7 @@ def test_system_palette_contrast(qapp):
             assert theme.contrast_ratio(f.foreground().color(), base) >= 3.0
 
 
-def test_2000_line_python_highlights_within_50ms(qapp):
+def test_2000_line_python_highlights_within_50ms(qapp, perf_scale):
     block = (
         'import os\n\n@decorator\ndef function_name(arg, other=42):\n    """Docstring with words."""\n'
         '    value = {"key": [1, 2.5, None], "s": \'text\'}  # trailing comment\n'
@@ -180,4 +180,4 @@ def test_2000_line_python_highlights_within_50ms(qapp):
         h.setDocument(None)
     assert doc.blockCount() == 2000
     print(f"2000-line python rehighlight: {best:.1f} ms")
-    assert best <= 50
+    assert best <= 50 * perf_scale

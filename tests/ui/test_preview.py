@@ -80,7 +80,7 @@ def test_text_preview_and_highlight(pane, qtbot, tmp_path):
     assert pane.kind_label.full_text() == "JavaScript"
 
 
-def test_header_updates_within_2ms(pane, qtbot, tmp_path):
+def test_header_updates_within_2ms(pane, qtbot, tmp_path, perf_scale):
     rows = []
     for i in range(30):
         f = tmp_path / f"file{i}.py"
@@ -95,12 +95,13 @@ def test_header_updates_within_2ms(pane, qtbot, tmp_path):
         assert pane.name_label.full_text() == r.name
     times.sort()
     print(f"show_row header: median {times[len(times) // 2]:.2f} ms, max {times[-1]:.2f} ms")
-    assert times[len(times) // 2] <= 2.0
+    assert times[len(times) // 2] <= 2.0 * perf_scale
 
 
-def test_64kb_text_preview_within_30ms(pane, qtbot, tmp_path, qapp):
+def test_64kb_text_preview_within_30ms(pane, qtbot, tmp_path, qapp, perf_scale):
     f = tmp_path / "big.txt"
-    f.write_text(("The quick brown fox jumps over the lazy dog.\n" * 2000)[:65536], encoding="utf-8")
+    # Over the 64 KB limit on every platform (write_text would add \r on Windows only).
+    f.write_bytes(("The quick brown fox jumps over the lazy dog.\n" * 2000)[:66000].encode("utf-8"))
     row = make_row(f)
     other = tmp_path / "other.txt"
     other.write_text("warm")
@@ -116,7 +117,7 @@ def test_64kb_text_preview_within_30ms(pane, qtbot, tmp_path, qapp):
             qapp.processEvents()
         best = min(best, (time.perf_counter() - t) * 1000)
     print(f"64 KB text preview: {best:.1f} ms")
-    assert best <= 30
+    assert best <= 30 * perf_scale
     assert pane.note.isVisible() or pane.note.text()  # truncation / line-limit note
 
 
@@ -432,7 +433,7 @@ def test_shutdown_stops_worker(qapp, qtbot, tmp_path):
     assert not p._worker.isRunning()
 
 
-def test_highlighted_python_preview_latency(pane, qtbot, tmp_path, qapp):
+def test_highlighted_python_preview_latency(pane, qtbot, tmp_path, qapp, perf_scale):
     block = 'def f(a, b=2):\n    """doc"""\n    return a + b  # sum\n'
     f = tmp_path / "big.py"
     f.write_text((block * 1000)[:65536])
@@ -449,7 +450,7 @@ def test_highlighted_python_preview_latency(pane, qtbot, tmp_path, qapp):
         best = min(best, (time.perf_counter() - t) * 1000)
     print(f"64 KB highlighted python preview: {best:.1f} ms")
     assert pane.code.highlighter.language == "python"
-    assert best <= 30
+    assert best <= 30 * perf_scale
 
 
 def test_palette_change_rebuilds_highlight_formats(qapp, qtbot):

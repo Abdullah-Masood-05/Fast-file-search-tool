@@ -1349,8 +1349,19 @@ class Engine:
         self._relisted = set()                  # each dir is re-listed at most once per batch
         paths = batch.paths
         if batch.moves:
-            for src, dst, is_dir in batch.moves:
+            moves = batch.moves
+            for i, (src, dst, is_dir) in enumerate(moves):
+                # A later move of a directory that contains ``dst`` has already happened on
+                # disk, so ``dst`` is only reachable at its final spelling (the index learns
+                # the new directory path when that later move is applied).
+                for s2, d2, dir2 in moves[i + 1:]:
+                    if dir2 and dst.startswith(s2) and dst[len(s2):len(s2) + 1] in ("\\", "/"):
+                        dst = d2 + dst[len(s2):]
                 self._move(src, dst, is_dir, walking, now, relist, unknown)
+                if is_dir:
+                    # later moves in this batch may name paths below the new directory
+                    # spelling: the store has to know it before they are looked up
+                    self._commit()
             self._commit()
             paths = self._rebase_paths(paths, batch.moves)
         by_parent: Dict[str, set] = {}
@@ -1378,6 +1389,10 @@ class Engine:
             else:
                 perfile[look[0]] = (parent, look[1], names)
         for p in unknown:
+            look = self.store.dir_lookup(p)      # e.g. a directory that moved earlier in this batch
+            if look is not None:
+                relist[look[0]] = (p, look[1])
+                continue
             anc = self._known_ancestor(p)
             if anc is not None:
                 relist[anc[0]] = (anc[1], anc[2])

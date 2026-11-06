@@ -353,7 +353,7 @@ def test_real_observer_reports_changes_in_root_spelling(tmp_path):
         w.stop()
 
 
-def test_feed_cost_per_event():
+def test_feed_cost_per_event(perf_scale):
     """The filter itself is cheap: 20k mixed events well under 0.2 s (p8 measured ~1 us/event)."""
     root = "C:\\Users\\A\\Documents" if os.name == "nt" else "/home/a/Documents"
     sep = os.sep
@@ -370,10 +370,13 @@ def test_feed_cost_per_event():
                 evs.append(f"{cache}{sep}index-v5.db-wal")
             else:
                 evs.append(f"{root}{sep}proj{sep}src{sep}comp{i % 50}{sep}File{i}.tsx")
-        t0 = time.perf_counter()
-        kept = sum(w.feed("modified", p) for p in evs)
-        dt = time.perf_counter() - t0
+        dt = 1e9
+        for _ in range(3):                      # best of 3: one preempted run must not fail CI
+            w.set_roots([root], check_exists=False)
+            t0 = time.perf_counter()
+            kept = sum(w.feed("modified", p) for p in evs)
+            dt = min(dt, time.perf_counter() - t0)
         assert kept == 8000
-        assert dt < 0.2, f"{dt * 1e6 / len(evs):.2f} us/event"
+        assert dt < 0.2 * perf_scale, f"{dt * 1e6 / len(evs):.2f} us/event"
     finally:
         w.stop()

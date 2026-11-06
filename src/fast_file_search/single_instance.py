@@ -107,6 +107,13 @@ class SingleInstance(QObject):
     def _drop(self, sock: QLocalSocket) -> None:
         self._buffers.pop(sock, None)
         try:
+            # Detach the Python lambdas (they capture ``sock``) before the deferred delete:
+            # destroying them inside ~QLocalSocket segfaults on Linux (Qt 6.12 / PySide6 6.12).
+            for signal in (sock.readyRead, sock.disconnected):
+                try:
+                    signal.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
             sock.disconnectFromServer()
             sock.deleteLater()
         except RuntimeError:

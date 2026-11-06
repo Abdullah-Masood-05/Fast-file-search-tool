@@ -277,7 +277,7 @@ def test_state_first_scan_and_ready(make_window, dataset, qtbot):
     client.make_ready(dataset.status(state="scanning", root_state={3: "scanning"}, scanned=12345))
     qtbot.waitUntil(lambda: win.results.empty_state.kind == "first-scan", timeout=1000)
     assert win.results.empty_state.title.text() == "Indexing Documents…"
-    assert "12,345 items so far" in win.results.empty_state.message.text()
+    assert f"{theme.format_count(12345)} items so far" in win.results.empty_state.message.text()
     assert win.status_lbl.text().startswith("Indexing Documents…")
     assert win.progress_bar.isVisible()
     client.push_status(dataset.status())

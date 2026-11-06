@@ -52,7 +52,7 @@ def test_server_name_is_per_user_and_dir(tmp_path):
     assert a != b and a == server_name(tmp_path / "a")
 
 
-def test_second_launch_activates_first_quickly(app, tmp_path):
+def test_second_launch_activates_first_quickly(app, tmp_path, perf_scale):
     first = SingleInstance("", tmp_path)
     assert first.acquire() is True
     got = []
@@ -64,7 +64,7 @@ def test_second_launch_activates_first_quickly(app, tmp_path):
         assert proc.returncode == 0, out
         assert got == ["report 2024"]
         label, flag, ms = out.split()
-        assert flag == "False" and int(ms) <= 500
+        assert flag == "False" and int(ms) <= 500 * perf_scale
     finally:
         first.release()
 
