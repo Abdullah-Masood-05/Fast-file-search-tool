@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from PySide6.QtCore import QEvent, QModelIndex, QObject, QTimer, QUrl, Qt
+from PySide6.QtCore import QEvent, QModelIndex, QTimer, QUrl, Qt
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDesktopServices, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
@@ -28,8 +28,8 @@ from .filter_chips import FilterChipBar
 from .library_sidebar import LibrarySidebar
 from .onboarding import OnboardingDialog, open_privacy_settings
 from .preview import PreviewPane
-from .results import PAGE_SIZE, ResultsPane, icon_cache, summary_text
-from .search_bar import SearchBar, is_regex_query
+from .results import PAGE_SIZE, ResultsPane, summary_text
+from .search_bar import SearchBar
 from .theme import APP_NAME, SPACE_M, SPACE_S, SPACE_XS, display_text, format_count
 from .widgets import (
     AboutDialog, NoticeBar, SettingsDialog, StatusDot, app_icon, app_version, export_results, kinds,
@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
         self._gen = -1
         self._req_key: Optional[tuple] = None        # (text, chip state, sort) of the latest request
         self._req_raw = ""                            # field text of the latest request
-        self._req_empty = True                        # latest request was suggestions-only
+        self._req_empty = True                        # latest request had no query and no filters
         self._displayed_key: Optional[tuple] = None
         self._committed_key: Optional[tuple] = None
         self._pending_send: Optional[bool] = None     # commit flag of a request queued until Ready
@@ -89,7 +89,6 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._shutdown)
-            app.installEventFilter(self)
 
         if self._status is not None:
             self._on_index_status(self._status)
@@ -111,7 +110,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(SPACE_M, SPACE_M, SPACE_M, SPACE_S)
         layout.setSpacing(SPACE_S)
 
-        self.bar = SearchBar(central, icon_for=icon_cache().for_name)
+        self.bar = SearchBar()
         layout.addWidget(self.bar)
         self.chips = FilterChipBar()
         layout.addWidget(self.chips)
@@ -132,7 +131,6 @@ class MainWindow(QMainWindow):
             self.main_splitter.setStretchFactor(i, stretch)
         self.main_splitter.setSizes([220, 700, 360])
         layout.addWidget(self.main_splitter, 1)
-        central.installEventFilter(self)
 
         # status bar
         status = self.statusBar()
@@ -177,7 +175,6 @@ class MainWindow(QMainWindow):
         b.escape_to_hide.connect(self._hide_from_escape)
         b.cleared.connect(self._on_search_cleared)
         b.copy_requested.connect(self.copy_selected_path)
-        b.history_wanted.connect(self._request_history)
         b.keystroke.connect(self._idle_commit.stop)
         self.chips.filters_changed.connect(self._on_filters_changed)
         self.chips.add_root_requested.connect(lambda p: self.add_roots([p]))
@@ -509,27 +506,23 @@ class MainWindow(QMainWindow):
             self._entry_counts()
             self._displayed_key = key
             self.bar.results_text = raw
+        if empty:
+            # Nothing to list: show the ready state and drop any in-flight result.
+            self._gen = -1
+            self._pending_send = None
+            self._refresh_state()
+            return
         if not getattr(self.client, "is_ready", False):
             self._pending_send = commit
             self._refresh_state()
             return
-        if empty and not self.bar.field.hasFocus():
-            # Nothing to list and nobody to show recent searches to.
-            self._gen = -1
-            return
-        commit = commit and not empty
         self.request_count += 1
         self._gen = self.client.search(
             query, self.chips.state(), self.results.sort_spec(),
-            limit=0 if empty else 200, suggestions=not is_regex_query(query),
-            commit_history=commit)
+            limit=200, suggestions=False, commit_history=commit)
         if commit:
             self._committed_key = key
         self._refresh_state()
-
-    def _request_history(self) -> None:
-        if not self.bar.text().strip() and self.chips.chip_state().is_default():
-            self._send_search(commit=False)
 
     def _commit_idle(self) -> None:
         res = self._last_result
@@ -588,13 +581,10 @@ class MainWindow(QMainWindow):
             self.last_apply_ms = (time.perf_counter() - t0) * 1000
             return
         if self._req_empty:
-            if not res.refresh:
-                self.bar.show_suggestions(self._req_raw, res.suggestions)
             self._entry_counts()
             return
         if res.error:
             self.results.set_summary(res.error, error=True)
-            self.bar.hide_popup()
             self.bar.results_text = self._req_raw
             self.last_apply_ms = (time.perf_counter() - t0) * 1000
             return
@@ -619,8 +609,6 @@ class MainWindow(QMainWindow):
             all_total = None
         self.sidebar.set_counts(counts, all_total, "results")
         self.preview.set_terms(list(res.terms or ()))
-        if not res.refresh:
-            self.bar.show_suggestions(self._req_raw, res.suggestions)
         if res.total > 0 and self._committed_key != self._req_key:
             self._idle_commit.start()
         self._refresh_state()
@@ -783,8 +771,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ keyboard
     def _on_nav_key(self, event) -> None:
         ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
-        if self.results.move_selection(event.key(), ctrl):
-            self.bar.note_selection_moved()
+        self.results.move_selection(event.key(), ctrl)
 
     def _open_current_or_first(self) -> None:
         if self.results.current_row() is None and self.results.model.rowCount():
@@ -812,21 +799,8 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
-    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
-        et = event.type()
-        if et == QEvent.Type.MouseButtonPress and self.bar.popup_visible():
-            w = obj if isinstance(obj, QWidget) else None
-            if w is not None and not (w is self.bar.popup or self.bar.popup.isAncestorOf(w)
-                                      or w is self.bar.field or self.bar.field.isAncestorOf(w)):
-                self.bar.hide_popup()
-        elif obj is self.central_widget and et == QEvent.Type.Resize and self.bar.popup_visible():
-            self.bar.popup.place(self.bar.field)
-        return False
-
     def changeEvent(self, event):  # noqa: N802
-        if event.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
-            self.bar.hide_popup()
-        elif event.type() == QEvent.Type.PaletteChange:
+        if event.type() == QEvent.Type.PaletteChange:
             self.results.model.palette_changed()
         super().changeEvent(event)
 

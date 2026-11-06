@@ -3,8 +3,8 @@
 * responsiveness (slow): a separate engine process indexes a ~50k-entry tree while a key is
   typed every 90 ms; a 16 ms heartbeat on the GUI thread must never be late by much
   (p99 <= 30 ms and max <= 50 ms on a dev box; CI runners get p99 <= 40 ms, max 80 ms).
-* filter-aware suggestions: with a Type or Path chip applied, every name suggestion must come
-  from the filtered result space (this was a v1 bug: suggestions ignored the filters).
+* filter-aware live results: with a Type or Path chip applied, every row in the results list
+  while the user types must satisfy the filter.
 """
 import math
 import os
@@ -150,7 +150,7 @@ def test_gui_stays_responsive_while_indexing_and_typing(qapp, tree50k):
         close(win)
 
 
-# ------------------------------------------------------------------ filter-aware suggestions
+# ------------------------------------------------------------------ filter-aware live results
 def _suggestion_tree(base: Path):
     a, b = base / "alpha", base / "beta"
     files = {
@@ -190,17 +190,13 @@ def _type(win, text, timeout=15.0):
     return win._last_result
 
 
-def test_suggestions_respect_type_and_path_filters(qapp, tmp_path):
+def test_live_results_respect_type_and_path_filters(qapp, tmp_path):
     a, b = _suggestion_tree(tmp_path / "t")
     win, _client = make_window([a, b], in_process=True)
     try:
         assert wait_for(lambda: is_idle(win, 2), 30)
         ground = _walk([a, b])
         root_b = [r.id for r in win._status.roots if Path(r.path) == b][0]
-
-        res = _type(win, "gift")
-        plain = [s.text for s in res.suggestions if s.kind == "name"]
-        assert plain, "unfiltered search should offer name suggestions"
 
         cases = {
             "type=image": (ChipState(type_key="image"), lambda g: _kind(g) == "image"),
@@ -211,23 +207,16 @@ def test_suggestions_respect_type_and_path_filters(qapp, tmp_path):
             "type=image + path=beta": (ChipState(type_key="image", root_id=root_b),
                                        lambda g: _kind(g) == "image" and g[2].startswith(str(b) + os.sep)),
         }
-        saw_difference = False
         for label, (state, pred) in cases.items():
             win.chips.set_chip_state(state, emit=True)
-            _type(win, "gif")           # a fresh request that carries the chip state
-            res = _type(win, "gift")
-            allowed = {fold(g[0]) for g in ground if pred(g)}
-            names = [s for s in res.suggestions if s.kind == "name"]
-            assert names, f"{label}: expected suggestions"
-            bad = [s.text for s in names if fold(s.text) not in allowed]
-            assert not bad, f"{label}: suggestions outside the filtered space: {bad}"
-            saw_difference |= any(fold(n) not in allowed for n in plain)
-            want_total = sum(1 for g in ground if "gift" in fold(g[0]) and pred(g))
-            assert res.total == want_total, (label, res.total, want_total)
-            for s in res.suggestions:
-                if s.kind == "history":
-                    assert s.count >= 1
-        assert saw_difference, "the unfiltered suggestions never differed from the filtered ones: weak test"
+            for text in ("g", "gi", "gif", "gift"):      # as the user types
+                res = _type(win, text)
+                rows = list(win.results.model.rows)
+                bad = [r.path for r in rows if not pred((r.name, os.path.isdir(r.path), r.path))]
+                assert not bad, f"{label} / {text!r}: rows outside the filter: {bad}"
+                want_total = sum(1 for g in ground if text in fold(g[0]) and pred(g))
+                assert res.total == want_total, (label, text, res.total, want_total)
+                assert len(rows) == min(res.total, len(rows)) and (rows or want_total == 0)
         win.chips.clear()
     finally:
         close(win)

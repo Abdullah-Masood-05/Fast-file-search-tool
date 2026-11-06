@@ -433,9 +433,6 @@ def child_shots(sandbox: Path, outdir: Path, tag: str) -> int:
             for mode in ("light", "dark"):
                 win.set_appearance(mode)
                 QTest.qWait(500)
-                if hasattr(win.bar, "hide_popup"):
-                    win.bar.hide_popup()
-                    QTest.qWait(100)
                 target = outdir / f"{tag}_{mode}.png"
                 print(f"screenshot {target} saved={win.grab().save(str(target))}", flush=True)
         finally:

@@ -10,7 +10,7 @@ import os
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import (
-    QAbstractItemModel, QAbstractTableModel, QFileInfo, QMimeData, QModelIndex, QPersistentModelIndex,
+    QAbstractItemModel, QAbstractTableModel, QEvent, QFileInfo, QMimeData, QModelIndex, QPersistentModelIndex,
     QRect, QRectF, QSize, Qt, QUrl, Signal,
 )
 from PySide6.QtGui import QAction, QActionGroup, QFont, QFontMetrics, QIcon, QKeyEvent, QPainter, QPalette
@@ -615,9 +615,13 @@ class ResultsPane(QWidget):
         header.customContextMenuRequested.connect(self._header_menu)
         self._apply_default_columns()
         self.default_header_state = header.saveState()
-        state = theme.ui_settings().value("results/header_v2")
-        if state:
-            header.restoreState(state)
+        state = theme.ui_settings().value("results/header_v3")
+        self._fit_folder_pending = True
+        self._fitting = False
+        if state and header.restoreState(state):
+            self._fit_folder_pending = False
+        header.viewport().installEventFilter(self)
+        self.view.viewport().installEventFilter(self)
         spec = theme.ui_settings().value("results/sort", "relevance")
         key, _, order = str(spec or "relevance").partition(":")
         if key not in SORT_LABELS:
@@ -629,8 +633,9 @@ class ResultsPane(QWidget):
         header = self.view.header()
         fm = QFontMetrics(self.view.font())
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(FOLDER_COL, QHeaderView.ResizeMode.Stretch)
-        header.resizeSection(NAME, fm.horizontalAdvance("x" * 30) + 40)
+        # Name takes the spare width; Folder gets ~1/3 of the list once it has a size.
+        header.setSectionResizeMode(NAME, QHeaderView.ResizeMode.Stretch)
+        header.resizeSection(FOLDER_COL, fm.horizontalAdvance("x" * 28) + 40)
         header.resizeSection(SIZE, fm.horizontalAdvance("1,023 MB") + 2 * SPACE_M + 12)
         header.resizeSection(MODIFIED, fm.horizontalAdvance("0000-00-00 00:00") + 2 * SPACE_M + 12)
         header.resizeSection(KIND, fm.horizontalAdvance("JavaScript file") + 2 * SPACE_M)
@@ -640,7 +645,7 @@ class ResultsPane(QWidget):
 
     def save_state(self) -> None:
         s = theme.ui_settings()
-        s.setValue("results/header_v2", self.view.header().saveState())
+        s.setValue("results/header_v3", self.view.header().saveState())
         spec = self.sort_spec()
         s.setValue("results/sort", f"{spec.key}:{'desc' if spec.descending else 'asc'}")
 
@@ -658,8 +663,27 @@ class ResultsPane(QWidget):
         self._last_menu = menu
         menu.popup(header.mapToGlobal(pos))
 
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self.view.viewport() and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self._fit_folder()
+        elif obj is self.view.header().viewport() and event.type() == QEvent.Type.MouseButtonPress:
+            self._fit_folder_pending = False      # the user is dragging a column: hands off
+        return super().eventFilter(obj, event)
+
+    def _fit_folder(self) -> None:
+        """Until the user resizes a column: Folder ~ 1/3 of the width, Name the rest."""
+        width = self.view.viewport().width()
+        if self._fit_folder_pending and width > 300 and self.view.isVisible():
+            self._fitting = True
+            try:
+                self.view.header().resizeSection(FOLDER_COL, int(width * 0.33))
+            finally:
+                self._fitting = False
+
     def reset_columns(self) -> None:
         self.view.header().restoreState(self.default_header_state)
+        self._fit_folder_pending = True
+        self._fit_folder()
         self.set_sort(SortSpec())
 
     # -- sorting

@@ -75,7 +75,6 @@ def test_focus_search_with_query_runs_it(window, client, qtbot):
 
 def test_tab_order(window, qtbot):
     search(qtbot, window, "gifttopicon")
-    window.bar.hide_popup()
     chain = [window.bar.field, window.bar.search_btn, window.chips.type_chip.button]
     w = window.bar.field
     for expected in chain[1:]:
@@ -99,7 +98,6 @@ def _next_tab(w: QWidget) -> QWidget:
 # ---------------------------------------------------------------- keyboard flow
 def test_enter_ctrl_enter_up_and_esc_in_results(window, qtbot, fake_os):
     search(qtbot, window, "gifttopicon")
-    window.bar.hide_popup()
     view = window.results.view
     QTest.keyClick(window.bar.field, Qt.Key.Key_Down)
     first = window.results.current_row().path
@@ -417,7 +415,7 @@ def test_layout_state_is_remembered(make_window, client):
     win._set_preview_visible(False)
     win.close()
     assert theme.ui_settings().value("window/geometry_v2") is not None
-    assert theme.ui_settings().value("results/header_v2") is not None
+    assert theme.ui_settings().value("results/header_v3") is not None
     win2 = make_window(client)
     assert not win2.act_preview.isChecked() and win2.preview.isHidden()
     assert win2.width() <= 1000

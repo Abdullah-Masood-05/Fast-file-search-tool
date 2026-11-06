@@ -106,8 +106,7 @@ def main(out: Path) -> int:
         win.results.select_row(0)
         win.results.view.setFocus()
 
-    def suggestions(win):
-        ds.history = ["gift card receipts", "gifttopicon size:<10kb"]
+    def typing(win):
         f = win.bar.field
         f.setFocus()
         QTest.keyClicks(f, "gift")
@@ -125,7 +124,7 @@ def main(out: Path) -> int:
 
     for mode in ("light", "dark"):
         shoot(mode, "results", results)
-        shoot(mode, "suggestions", suggestions)
+        shoot(mode, "typing", typing)
         shoot(mode, "ready", ready)
         shoot(mode, "nomatch", nomatch)
     theme.apply_appearance("system")
