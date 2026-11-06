@@ -77,7 +77,7 @@ def test_settings_dialog_shows_root_states_and_tools(qapp, cm):
     dlg.logs_btn.click()
     assert rebuilt == [1] and logs == [1]
     mac_only = [dlg.checks["include_home_library"], dlg.checks["descend_packages"]]
-    assert all(c.isVisibleTo(dlg) == theme.IS_MAC for c in mac_only)
+    assert all(c.isHidden() != theme.IS_MAC for c in mac_only)
 
 
 def test_onboarding_dialog_lists_defaults(qapp, tmp_path, monkeypatch):
@@ -205,3 +205,16 @@ def test_fixed_font_is_monospace_offscreen():
         env["QT_QPA_FONTDIR"] = r"C:\Windows\Fonts"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=60)
     assert out.stdout.strip().splitlines()[-1] == "True", out.stderr
+
+
+def test_settings_dialog_platform_only_options_visibility(qapp, cm, monkeypatch):
+    # Regression: options shown only on one OS must be parented before being shown,
+    # otherwise they became stray top-level windows and ended up hidden.
+    for is_mac in (True, False):
+        monkeypatch.setattr(theme, "IS_MAC", is_mac)
+        dlg = SettingsDialog(cm)
+        for key in ("include_home_library", "descend_packages"):
+            box = dlg.checks[key]
+            assert box.parentWidget() is not None and not box.isWindow()
+            assert box.isHidden() != is_mac   # its own flag; the Indexing tab may be hidden
+        dlg.deleteLater()

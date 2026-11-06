@@ -696,9 +696,11 @@ class SettingsDialog(QDialog):
             box = QCheckBox(text)
             box.setAccessibleName(text)
             box.setChecked(bool(getattr(cfg, key, default)))
+            # Parent it before touching visibility: setVisible(True) on a parentless
+            # widget turns it into a stray top-level window, and the later reparent
+            # hides it again (which left the macOS-only options invisible).
+            col.addWidget(box)
             box.setVisible(visible)
-            if visible:
-                col.addWidget(box)
             self.checks[key] = box
             self._check_defaults[key] = default
             return box
