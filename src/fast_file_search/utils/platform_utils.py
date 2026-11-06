@@ -57,6 +57,21 @@ def get_app_data_dir(app_name: Optional[str] = None) -> Path:
     return path
 
 
+def redirect_qt_settings() -> None:
+    """Keep Qt's INI settings (``theme.settings()``, ``ui.ini``) next to config.json.
+
+    On Windows Qt resolves the user-scope INI folder from the RoamingAppData known
+    folder and ignores ``%APPDATA%``, so a redirected profile (tests, self-tests,
+    portable setups) would still write into the real one. macOS and Linux already
+    follow ``HOME`` / ``XDG_CONFIG_HOME``. Call once before any ``QSettings`` is made."""
+    if _system() != "Windows":
+        return
+    from PySide6.QtCore import QSettings
+
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope,
+                      str(get_app_data_dir(APP_DIR_NAME).parent))
+
+
 def _ensure_dir(path: Path, app_name: Optional[str]) -> Path:
     try:
         path.mkdir(parents=True, exist_ok=True)
@@ -104,6 +119,136 @@ def get_data_dir(app_name: Optional[str] = None) -> Path:
     else:
         base = _xdg_dir('XDG_DATA_HOME', home / '.local' / 'share')
     return _ensure_dir(base / (app_name or 'fast_file_search'), app_name)
+
+
+APP_DIR_NAME = "Fast File Search Pro"
+
+
+def get_state_dir(app_name: Optional[str] = None) -> Path:
+    """Per-user directory for runtime state (lock files, crash markers):
+    %LOCALAPPDATA% on Windows, ~/Library/Application Support on macOS,
+    $XDG_STATE_HOME (~/.local/state) elsewhere. ``FAST_FILE_SEARCH_CACHE_DIR``
+    redirects it (tests, portable mode)."""
+    system = _system()
+    home = Path.home()
+    name = app_name or APP_DIR_NAME
+    if os.getenv('FAST_FILE_SEARCH_CACHE_DIR'):
+        return _ensure_dir(Path(os.environ['FAST_FILE_SEARCH_CACHE_DIR']) / name / 'state', name)
+    if system == "Windows":
+        base = Path(os.getenv('LOCALAPPDATA') or home / 'AppData' / 'Local')
+        path = base / name / 'State'
+    elif system == "Darwin":
+        path = home / 'Library' / 'Application Support' / name
+    else:
+        path = _xdg_dir('XDG_STATE_HOME', home / '.local' / 'state') / 'fast-file-search-pro'
+    return _ensure_dir(path, name)
+
+
+def get_log_dir(app_name: Optional[str] = None) -> Path:
+    """Per-user log directory (created): macOS ~/Library/Logs/<app>, Windows
+    %LOCALAPPDATA%/<app>/Logs, Linux $XDG_STATE_HOME/fast-file-search-pro/logs.
+    ``FAST_FILE_SEARCH_CACHE_DIR`` redirects it to ``<override>/<app>/logs``."""
+    system = _system()
+    home = Path.home()
+    name = app_name or APP_DIR_NAME
+    if os.getenv('FAST_FILE_SEARCH_CACHE_DIR'):
+        path = Path(os.environ['FAST_FILE_SEARCH_CACHE_DIR']) / name / 'logs'
+    elif system == "Windows":
+        base = Path(os.getenv('LOCALAPPDATA') or home / 'AppData' / 'Local')
+        path = base / name / 'Logs'
+    elif system == "Darwin":
+        path = home / 'Library' / 'Logs' / name
+    else:
+        path = _xdg_dir('XDG_STATE_HOME', home / '.local' / 'state') / 'fast-file-search-pro' / 'logs'
+    return _ensure_dir(path, name)
+
+
+# (folder name, Windows KNOWNFOLDERID). Order is the order of the default roots.
+_USER_FOLDERS = (
+    ("Desktop", "B4BFCC3A-DB2C-424C-B029-7FE99A87C641", "DESKTOP"),
+    ("Documents", "FDD39AD0-238F-46AF-ADB4-6C85480369C7", "DOCUMENTS"),
+    ("Downloads", "374DE290-123F-4565-9164-39C4925E467B", "DOWNLOAD"),
+    ("Pictures", "33E28130-4E1E-4676-835A-98395C3BC3BB", "PICTURES"),
+    ("Music", "4BD8D571-6D19-48D3-BE97-422220080E43", "MUSIC"),
+    ("Videos", "18989B1D-99B5-455B-841C-AB7C74E4DDFC", "VIDEOS"),
+)
+
+
+def _known_folder_windows(guid: str) -> Optional[str]:
+    """SHGetKnownFolderPath for ``guid`` (follows OneDrive redirection)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+    import uuid
+    u = uuid.UUID(guid)
+    g = GUID(u.time_low, u.time_mid, u.time_hi_version,
+             (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+    func = ctypes.windll.shell32.SHGetKnownFolderPath
+    func.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+                     ctypes.POINTER(ctypes.c_wchar_p)]
+    func.restype = ctypes.c_long
+    out = ctypes.c_wchar_p()
+    try:
+        if func(ctypes.byref(g), 0, None, ctypes.byref(out)) != 0:
+            return None
+        return out.value
+    finally:
+        ctypes.windll.ole32.CoTaskMemFree(out)
+
+
+def _xdg_user_dirs() -> dict:
+    """Parse ``user-dirs.dirs`` ({"DESKTOP": "/home/u/Desktop", ...})."""
+    home = Path.home()
+    cfg = _xdg_dir('XDG_CONFIG_HOME', home / '.config') / 'user-dirs.dirs'
+    result: dict = {}
+    try:
+        text = cfg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return result
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("XDG_") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key[4:].removesuffix("_DIR")
+        value = value.strip().strip('"')
+        value = value.replace("$HOME", str(home))
+        if os.path.isabs(value):
+            result[key] = value
+    return result
+
+
+def default_roots() -> List[str]:
+    """The user's real folders that exist (Desktop, Documents, Downloads,
+    Pictures, Music, Movies/Videos), never the home folder itself. Windows
+    asks the shell (so OneDrive redirection works), Linux reads
+    user-dirs.dirs, macOS uses ``~/<name>``."""
+    system = _system()
+    home = Path.home()
+    candidates: List[str] = []
+    xdg = _xdg_user_dirs() if system == "Linux" else {}
+    for name, guid, xdg_key in _USER_FOLDERS:
+        path: Optional[str] = None
+        if system == "Windows":
+            try:
+                path = _known_folder_windows(guid)
+            except Exception:
+                path = None
+            if not path:
+                path = str(home / name)
+        elif system == "Darwin":
+            path = str(home / ("Movies" if name == "Videos" else name))
+        else:
+            path = xdg.get(xdg_key) or str(home / name)
+        if path and os.path.isdir(path):
+            candidates.append(os.path.normpath(path))
+    # Never the home folder itself; drop duplicates and nested folders.
+    candidates = [c for c in candidates if not paths_equal(c, home)]
+    return dedupe_roots(candidates)
 
 
 def get_default_index_root() -> str:

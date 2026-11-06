@@ -15,16 +15,15 @@
 
 ## What it is
 
-Fast File Search Pro is a local search application that indexes your directories into a SQLite database. It uses SQL queries, trigram matching, and directory monitoring to provide search results as you type.
+Fast File Search Pro is a local search application. It indexes the names of the files and folders you choose, keeps the index current while you work, and shows results as you type. A separate engine process owns the index and the search, so the window stays responsive during large scans.
 
 ### Features
-* **SQL Trigram Search**: Searches are backed by a persistent SQLite trigram index.
-* **Complex Queries**: Supports boolean operators (`AND`, `OR`, `NOT`), file extension filters (`ext:py`), and size ranges (`size:>10mb` or `size:1kb..50kb`).
-* **Real-time Monitoring**: Integrates `watchdog` to detect file creations, deletions, and modifications in indexed directories.
-* **Responsive GUI**: Uses background thread execution for searches and indexing, keeping the user interface active during large scans.
-* **Typing Autocomplete**: Provides fast prefix suggestions in the search bar.
-* **Preview Panel**: Displays contents of text and image files, with metadata and background MD5/SHA256 hash calculation.
-* **Theme Support**: Includes dark and light mode stylesheet options.
+* **Instant search**: results update as you type, with exact result counts, from an in-memory index backed by a SQLite file.
+* **Query syntax**: `AND`, `OR`, `NOT`, quoted phrases, globs, `ext:py`, `size:>10mb`, `case:` and `re:`.
+* **Filters**: type, extension, size, modified date, folder and favorites. Filters apply before ranking, so the counts are exact.
+* **Live updates**: file changes in indexed folders are picked up through `watchdog`, with periodic safety rescans.
+* **Preview panel**: shows text, code and images, with metadata and on-demand hashes.
+* **Light and dark themes**.
 
 ---
 
@@ -32,7 +31,7 @@ Fast File Search Pro is a local search application that indexes your directories
 
 Prebuilt, self-contained builds (Python and Qt bundled) for every release are on the
 [Releases page](https://github.com/Abdullah-Masood-05/Fast-file-search-tool/releases/latest).
-Replace `<version>` below with the release version (for example `1.3.0`).
+Replace `<version>` below with the release version (for example `2.0.0`).
 
 | Platform | File | Install |
 |---|---|---|
@@ -51,6 +50,26 @@ Packages install to `/opt/fast-file-search-pro` with a `fast-file-search-pro` co
 **Unsigned builds.** On Windows, SmartScreen may say "Windows protected your PC": click
 **More info → Run anyway**. On macOS the app is ad-hoc signed but not notarized: the first time,
 **right-click the app → Open → Open** (macOS 15+: *System Settings → Privacy & Security → Open Anyway*).
+
+---
+
+## Privacy
+
+* The app makes no network calls and sends no telemetry or crash reports.
+* The index stores file and folder names, sizes and modification times. It does not store or read file contents. The preview panel reads a file only when you select it.
+* Everything stays on your computer: the index and your favorites, tags and notes in the per-user cache and data folders, and the logs in the per-user log folder (macOS `~/Library/Logs/Fast File Search Pro`, Windows `%LOCALAPPDATA%\Fast File Search Pro\Logs`, Linux `~/.local/state/fast-file-search-pro/logs`).
+* Logs contain file paths only in error messages, or when `FFS_DEBUG=1` is set.
+* Deleting those folders removes everything the app has stored.
+
+## Limitations
+
+* File contents are not searched, only names and paths.
+* Only the folders you add are indexed. On first run these are the folders that exist among Desktop, Documents, Downloads, Pictures, Music and Videos (Movies on macOS), not your whole home folder. Library, AppData and cache folders inside your home folder are skipped unless you turn them on.
+* On macOS, each protected folder (Desktop, Documents, Downloads, removable and network volumes) triggers one system permission prompt. If you deny it, that folder is not indexed until you allow it in System Settings, Privacy & Security. Granting Full Disk Access covers everything with one permission. The app is ad-hoc signed, so macOS may ask again after an update (see `packaging/macos/RELEASE-NOTES-permissions.md`).
+* Network drives and removable volumes may be slow to index and may not report live changes. When live updates are limited, the status bar says so and the app rescans on a timer.
+* On Linux, watching very large folders can exceed the inotify watch limit. The app then falls back to periodic rescans.
+* Very large indexes use memory: about 165 bytes per entry in the engine process, or roughly 50 MB per 300,000 entries.
+* Builds are not code-signed or notarized (see Download).
 
 ---
 
@@ -121,7 +140,7 @@ every package, and publishes a GitHub release when a `v<version>` tag is pushed 
 the version in `pyproject.toml`):
 
 ```bash
-git tag v1.3.0 && git push origin v1.3.0
+git tag v2.0.0 && git push origin v2.0.0
 ```
 
 ---

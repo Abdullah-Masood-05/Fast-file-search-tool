@@ -40,6 +40,17 @@ ICNS = ICONS / "fast-file-search-pro.icns"
 PNG = ICONS / "fast-file-search-pro-256.png"
 
 APP_NAME = "Fast File Search Pro"
+FOLDER_ACCESS_TEXT = (
+    "Fast File Search Pro indexes file names in folders you choose so you can find them "
+    "instantly. File contents are not read."
+)
+USAGE_DESCRIPTION_KEYS = (
+    "NSDesktopFolderUsageDescription",
+    "NSDocumentsFolderUsageDescription",
+    "NSDownloadsFolderUsageDescription",
+    "NSRemovableVolumesUsageDescription",
+    "NSNetworkVolumesUsageDescription",
+)
 COMPANY = "Abdullah Masood"
 BUNDLE_ID = "com.abdullahmasood.fastfilesearchpro"
 DIST_DIR_NAME = "FastFileSearchPro"  # standalone folder name (all platforms)
@@ -116,6 +127,8 @@ def nuitka_args(args: argparse.Namespace, version: str) -> list[str]:
         "--standalone" if args.mode == "standalone" else "--onefile",
         "--enable-plugin=pyside6",
         f"--include-package={PACKAGE}",
+        # The spawned engine process reaches this module only through multiprocessing.
+        f"--include-module={PACKAGE}.engine.service",
         f"--include-package-data={PACKAGE}",
         f"--include-data-files={ICO}=files.ico",
         f"--output-dir={out}",
@@ -171,6 +184,7 @@ def fix_macos_bundle(app: Path, version: str) -> None:
         "NSHighResolutionCapable": True,
         "LSApplicationCategoryType": "public.app-category.utilities",
         "NSHumanReadableCopyright": f"Copyright (c) {COMPANY}. MIT License.",
+        **{key: FOLDER_ACCESS_TEXT for key in USAGE_DESCRIPTION_KEYS},
     })
     with plist_path.open("wb") as fh:
         plistlib.dump(info, fh)
