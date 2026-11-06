@@ -1,14 +1,5 @@
+"""PySide6 user interface (GUI process only; never imports sqlite3)."""
 from .main_window import MainWindow
-from .search_view import SearchView
-from .browser_view import BrowserView
-from .widgets import PreviewPanel, FilterPanel, SettingsDialog, AboutDialog
+from .widgets import AboutDialog, SettingsDialog
 
-__all__ = [
-    "MainWindow",
-    "SearchView",
-    "BrowserView",
-    "PreviewPanel",
-    "FilterPanel",
-    "SettingsDialog",
-    "AboutDialog",
-]
+__all__ = ["MainWindow", "SettingsDialog", "AboutDialog"]

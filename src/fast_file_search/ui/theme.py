@@ -17,7 +17,7 @@ import sys
 from typing import Optional
 
 from PySide6.QtCore import QDateTime, QEvent, QLocale, QObject, QSettings, Qt
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPalette
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontInfo, QGuiApplication, QPalette
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
 # --------------------------------------------------------------------------- spacing
@@ -134,6 +134,31 @@ def is_dark(palette: Optional[QPalette] = None) -> bool:
     return pal.color(QPalette.ColorRole.Window).lightness() < 128
 
 
+def status_dot_color(state: str, palette: Optional[QPalette] = None) -> QColor:
+    """Colour of the status-bar dot. The text next to it always says the same thing,
+    so the colour is never the only signal: accent while the index is live or
+    scanning, the error colour on failure, the secondary text colour otherwise."""
+    pal = palette or QApplication.palette()
+    if state in ("active", "idle", "scanning", "ready"):
+        return QColor(pal.color(QPalette.ColorRole.Highlight))
+    if state in ("error", "failed", "stopped"):
+        return error_text_color(pal)
+    return secondary_text_color(pal, pal.color(QPalette.ColorRole.Window))
+
+
+def chip_text(name: str, value: str, limit: int = 28) -> str:
+    """Filter chip label ``"Name: value"``, elided to ``limit`` characters."""
+    text = f"{name}: {value}"
+    return text if len(text) <= limit else text[: limit - 1].rstrip(" ,") + "…"
+
+
+def section_font() -> QFont:
+    """Small uppercase section headings in the sidebar ("LIBRARY")."""
+    font = ui_font(0.85, QFont.Weight.DemiBold)
+    font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 104)
+    return font
+
+
 class _SecondaryText(QObject):
     """Event filter that keeps a widget's text in the secondary colour across
     light/dark switches (widgets get PaletteChange when the app palette changes)."""
@@ -209,8 +234,18 @@ def ui_font(scale: float = 1.0, weight: Optional[QFont.Weight] = None) -> QFont:
     return font
 
 
+_MONO_FAMILIES = ["Cascadia Mono", "Consolas", "SF Mono", "Menlo", "Monaco", "DejaVu Sans Mono",
+                  "Liberation Mono", "Noto Sans Mono", "Courier New", "monospace"]
+
+
 def fixed_font() -> QFont:
     font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+    if not QFontInfo(font).fixedPitch():
+        # Some platforms (offscreen, minimal Linux setups) resolve the system fixed
+        # font to a proportional face; ask for a real monospace family instead.
+        font.setFamilies(_MONO_FAMILIES)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFixedPitch(True)
     base = QApplication.font().pointSizeF()
     if base > 0:
         font.setPointSizeF(base)
@@ -333,9 +368,11 @@ def current_appearance() -> str:
         return value
     # Migrate the old light/dark toggle: only an explicit "dark" choice is kept.
     try:
-        from ..config import config_manager
+        from .. import config as _config
 
-        if config_manager.config.theme == "dark":
+        getter = getattr(_config, "get_config_manager", None)
+        manager = getter() if getter is not None else getattr(_config, "config_manager", None)
+        if manager is not None and getattr(manager.config, "theme", "") == "dark":
             return "dark"
     except Exception:
         pass

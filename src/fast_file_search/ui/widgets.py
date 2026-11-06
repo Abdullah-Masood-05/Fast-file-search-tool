@@ -1,30 +1,31 @@
-"""Panels and dialogs: filters, preview, settings, about, export, empty states."""
+"""Shared widgets and dialogs: glyph icons, ElidedLabel, EmptyState, NoticeBar,
+SettingsDialog, AboutDialog and export.
+
+Nothing here touches SQLite or the file system on the GUI thread beyond what a
+dialog needs (choosing a folder, writing an export the user asked for).
+"""
 from __future__ import annotations
 
 import csv
 import json
-import mimetypes
+import math
 import os
-import re
 import sys
-import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QDate, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
-    QColor, QFont, QIcon, QImageReader, QPainter, QPalette, QPixmap, QSyntaxHighlighter,
-    QTextCharFormat, QTextDocument,
+    QColor, QFont, QIcon, QIconEngine, QPainter, QPainterPath, QPalette, QPen, QPixmap,
+    QPolygonF,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMessageBox,
-    QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QSystemTrayIcon, QTabWidget,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
+    QPushButton, QSizePolicy, QSystemTrayIcon, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
-from ..config import config_manager
-from ..utils.file_utils import get_file_metadata
+from .. import kinds  # noqa: F401  (re-exported for the other ui modules)
 from ..utils.platform_utils import paths_equal
 from . import theme
 from .theme import SPACE_L, SPACE_M, SPACE_S, SPACE_XL, SPACE_XS, SecondaryLabel
@@ -84,7 +85,236 @@ def app_version() -> str:
     return __version__
 
 
+# --------------------------------------------------------------------------- glyph icons
+def _draw_glyph(p: QPainter, name: str, s: float) -> None:
+    """Draw a 16-unit line glyph scaled to ``s`` px. The pen colour is already set."""
+    k = s / 16.0
+
+    def P(x: float, y: float) -> QPointF:
+        return QPointF(x * k, y * k)
+
+    pen = p.pen()
+    if name == "search":
+        p.drawEllipse(QRectF(2.2 * k, 2.2 * k, 8.4 * k, 8.4 * k))
+        p.drawLine(P(9.4, 9.4), P(13.8, 13.8))
+    elif name == "close":
+        p.drawLine(P(4.5, 4.5), P(11.5, 11.5))
+        p.drawLine(P(11.5, 4.5), P(4.5, 11.5))
+    elif name == "clock":
+        p.drawEllipse(QRectF(2 * k, 2 * k, 12 * k, 12 * k))
+        p.drawLine(P(8, 8), P(8, 4.6))
+        p.drawLine(P(8, 8), P(10.6, 9.6))
+    elif name == "star":
+        pts = []
+        for i in range(10):
+            r = 6.2 if i % 2 == 0 else 2.7
+            a = -math.pi / 2 + i * math.pi / 5
+            pts.append(P(8 + r * math.cos(a), 8.5 + r * math.sin(a)))
+        p.drawPolygon(QPolygonF(pts))
+    elif name == "image":
+        p.drawRoundedRect(QRectF(2 * k, 3 * k, 12 * k, 10 * k), 1.5 * k, 1.5 * k)
+        path = QPainterPath(P(2.5, 12))
+        for x, y in ((6.2, 8), (8.8, 10.6), (10.4, 9), (13.5, 12)):
+            path.lineTo(P(x, y))
+        p.drawPath(path)
+        p.drawEllipse(P(10.6, 6), 1.1 * k, 1.1 * k)
+    elif name in ("document", "file"):
+        path = QPainterPath(P(3.5, 1.5))
+        for x, y in ((9.5, 1.5), (12.5, 4.5), (12.5, 14.5), (3.5, 14.5)):
+            path.lineTo(P(x, y))
+        path.closeSubpath()
+        p.drawPath(path)
+        p.drawPolyline(QPolygonF([P(9.5, 1.5), P(9.5, 4.5), P(12.5, 4.5)]))
+        if name == "document":
+            for y in (7.5, 9.8, 12.1):
+                p.drawLine(P(5.6, y), P(10.4, y))
+    elif name == "code":
+        p.drawPolyline(QPolygonF([P(5.5, 4.5), P(2, 8), P(5.5, 11.5)]))
+        p.drawPolyline(QPolygonF([P(10.5, 4.5), P(14, 8), P(10.5, 11.5)]))
+        p.drawLine(P(9.2, 3.5), P(6.8, 12.5))
+    elif name == "folder":
+        path = QPainterPath(P(1.5, 4))
+        for x, y in ((6, 4), (7.5, 5.5), (14.5, 5.5), (14.5, 13), (1.5, 13)):
+            path.lineTo(P(x, y))
+        path.closeSubpath()
+        p.drawPath(path)
+    elif name == "gear":
+        p.drawEllipse(P(8, 8), 2.0 * k, 2.0 * k)
+        path = QPainterPath()
+        teeth = 8
+        for i in range(teeth * 2):
+            a0 = (i / (teeth * 2)) * 2 * math.pi
+            a1 = ((i + 1) / (teeth * 2)) * 2 * math.pi
+            r = 6.6 if i % 2 == 0 else 4.9
+            if i == 0:
+                path.moveTo(P(8 + r * math.cos(a0), 8 + r * math.sin(a0)))
+            else:
+                path.lineTo(P(8 + r * math.cos(a0), 8 + r * math.sin(a0)))
+            path.lineTo(P(8 + r * math.cos(a1), 8 + r * math.sin(a1)))
+        path.closeSubpath()
+        p.drawPath(path)
+    elif name == "warning":
+        p.drawPolygon(QPolygonF([P(8, 2), P(14.5, 13.5), P(1.5, 13.5)]))
+        p.drawLine(P(8, 6.3), P(8, 9.6))
+        old = QPen(pen)
+        dot = QPen(pen)
+        dot.setWidthF(pen.widthF() * 1.5)
+        p.setPen(dot)
+        p.drawPoint(P(8, 11.7))
+        p.setPen(old)
+    elif name == "check":
+        p.drawPolyline(QPolygonF([P(3.5, 8.5), P(6.8, 11.8), P(12.8, 4.6)]))
+    elif name == "chevron":
+        p.drawPolyline(QPolygonF([P(4.5, 6.5), P(8, 10), P(11.5, 6.5)]))
+    elif name == "info":
+        p.drawEllipse(QRectF(2 * k, 2 * k, 12 * k, 12 * k))
+        p.drawLine(P(8, 7.2), P(8, 11.2))
+        p.drawPoint(P(8, 5))
+
+
+class _GlyphEngine(QIconEngine):
+    """Monochrome line icon painted on demand with the current palette, so it is sharp
+    at any scale and follows light/dark switches without being rebuilt."""
+
+    def __init__(self, name: str, role: str = "secondary"):
+        super().__init__()
+        self.name = name
+        self.role = role
+
+    _colors: Dict[tuple, QColor] = {}
+
+    def _color(self, mode: QIcon.Mode) -> QColor:
+        pal = QApplication.palette()
+        key = (self.role, mode.value, pal.cacheKey())
+        c = self._colors.get(key)
+        if c is None:
+            if len(self._colors) > 64:
+                self._colors.clear()
+            c = self._colors[key] = self._resolve_color(pal, mode)
+        return c
+
+    def _resolve_color(self, pal: QPalette, mode: QIcon.Mode) -> QColor:
+        if mode == QIcon.Mode.Disabled:
+            c = QColor(pal.color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText))
+            return c
+        if mode == QIcon.Mode.Selected:
+            return QColor(pal.color(QPalette.ColorRole.HighlightedText))
+        if self.role == "accent":
+            return QColor(pal.color(QPalette.ColorRole.Highlight))
+        if self.role == "text":
+            return QColor(pal.color(QPalette.ColorRole.WindowText))
+        if self.role == "error":
+            return theme.error_text_color(pal)
+        return theme.secondary_text_color(pal, pal.color(QPalette.ColorRole.Window))
+
+    _pixmaps: Dict[tuple, QPixmap] = {}
+
+    def paint(self, painter: QPainter, rect: QRect, mode: QIcon.Mode, state: QIcon.State) -> None:
+        # Painted through a small pixmap cache: views call this for every visible row.
+        dev = painter.device()
+        scale = dev.devicePixelRatioF() if dev is not None else 1.0
+        side = min(rect.width(), rect.height())
+        pm = self.scaledPixmap(QSize(side, side), mode, state, scale)
+        painter.drawPixmap(rect.x() + (rect.width() - side) // 2, rect.y() + (rect.height() - side) // 2, pm)
+
+    def _render(self, painter: QPainter, rect: QRect, mode: QIcon.Mode) -> None:
+        side = min(rect.width(), rect.height())
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.translate(rect.x() + (rect.width() - side) / 2, rect.y() + (rect.height() - side) / 2)
+        pen = QPen(self._color(mode))
+        pen.setWidthF(max(1.0, side / 12.0))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        _draw_glyph(painter, self.name, float(side))
+        painter.restore()
+
+    def pixmap(self, size: QSize, mode: QIcon.Mode, state: QIcon.State) -> QPixmap:
+        return self.scaledPixmap(size, mode, state, 1.0)
+
+    def scaledPixmap(self, size: QSize, mode: QIcon.Mode, state: QIcon.State,  # noqa: N802
+                     scale: float) -> QPixmap:
+        w = max(1, round(size.width() * scale))
+        h = max(1, round(size.height() * scale))
+        key = (self.name, self.role, w, h, scale, mode.value, self._color(mode).rgba())
+        pm = self._pixmaps.get(key)
+        if pm is None:
+            if len(self._pixmaps) > 512:
+                self._pixmaps.clear()
+            pm = QPixmap(w, h)
+            pm.fill(Qt.GlobalColor.transparent)
+            p = QPainter(pm)
+            self._render(p, QRect(0, 0, w, h), mode)
+            p.end()
+            pm.setDevicePixelRatio(scale)
+            self._pixmaps[key] = pm
+        return pm
+
+    def clone(self) -> QIconEngine:
+        return _GlyphEngine(self.name, self.role)
+
+
+_glyph_cache: Dict[Tuple[str, str], QIcon] = {}
+
+
+def glyph_icon(name: str, role: str = "secondary") -> QIcon:
+    """A palette-coloured line icon (search, close, clock, star, image, document,
+    code, folder, file, gear, warning, info)."""
+    key = (name, role)
+    icon = _glyph_cache.get(key)
+    if icon is None:
+        icon = QIcon(_GlyphEngine(name, role))
+        _glyph_cache[key] = icon
+    return icon
+
+
 # --------------------------------------------------------------------------- small widgets
+class DropDownButton(QToolButton):
+    """Tool button with an instant popup menu whose text never runs under the menu
+    indicator: the native bevel and label are drawn by the style, the label in a
+    rect that leaves room for a small chevron at the right."""
+
+    ARROW = 12
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        base = super().sizeHint()
+        fm = self.fontMetrics()
+        w = fm.horizontalAdvance(self.text().replace("&&", "&")) + 2 * SPACE_S + self.ARROW + SPACE_XS
+        return QSize(w, base.height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return self.sizeHint()
+
+    def paintEvent(self, event):  # noqa: N802
+        from PySide6.QtWidgets import QStyle, QStyleOptionToolButton, QStylePainter
+
+        p = QStylePainter(self)
+        opt = QStyleOptionToolButton()
+        self.initStyleOption(opt)
+        opt.features = opt.features & ~QStyleOptionToolButton.ToolButtonFeature.HasMenu
+        opt.features = opt.features & ~QStyleOptionToolButton.ToolButtonFeature.MenuButtonPopup
+        label = QStyleOptionToolButton(opt)
+        opt.text = ""
+        p.drawComplexControl(QStyle.ComplexControl.CC_ToolButton, opt)
+        r = self.rect()
+        label.rect = QRect(r.left() + SPACE_S, r.top(), r.width() - 2 * SPACE_S - self.ARROW - SPACE_XS, r.height())
+        if opt.state & QStyle.StateFlag.State_Sunken:
+            shift = self.style().pixelMetric(QStyle.PixelMetric.PM_ButtonShiftHorizontal, opt, self)
+            label.rect.translate(shift, self.style().pixelMetric(QStyle.PixelMetric.PM_ButtonShiftVertical, opt, self))
+        p.drawControl(QStyle.ControlElement.CE_ToolButtonLabel, label)
+        size = 10
+        ar = QRect(r.right() - SPACE_S - size + 2, r.center().y() - size // 2 + 1, size, size)
+        mode = QIcon.Mode.Normal if self.isEnabled() else QIcon.Mode.Disabled
+        glyph_icon("chevron", "text").paint(p, ar, Qt.AlignmentFlag.AlignCenter, mode)
+
+
 class ElidedLabel(QLabel):
     """Single-line label that elides instead of forcing its parent wider."""
 
@@ -132,6 +362,7 @@ class EmptyState(QFrame):
         super().__init__(parent)
         self.kind = ""
         self.buttons: List[QPushButton] = []
+        self.setObjectName("EmptyState")
         # Same frame and background as the results list it stands in for.
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setAutoFillBackground(True)
@@ -154,12 +385,19 @@ class EmptyState(QFrame):
         self.title.setFont(theme.ui_font(1.25, QFont.Weight.DemiBold))
         self.title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.title.setWordWrap(True)
+        self.title.setTextFormat(Qt.TextFormat.PlainText)
         self.message = SecondaryLabel()
         self.message.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.message.setWordWrap(True)
+        self.message.setTextFormat(Qt.TextFormat.PlainText)
         self.message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         for lbl in (self.title, self.message):
             outer.addWidget(lbl)
+        self.link = QLabel()
+        self.link.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.link.setTextFormat(Qt.TextFormat.RichText)
+        self.link.setVisible(False)
+        outer.addWidget(self.link)
         outer.addSpacing(SPACE_L)
 
         self.button_row = QHBoxLayout()
@@ -170,11 +408,14 @@ class EmptyState(QFrame):
         outer.addStretch(3)
 
     def set_content(self, kind: str, title: str, message: str = "",
-                    actions: Sequence[Tuple[str, Callable[[], None]]] = ()) -> None:
+                    actions: Sequence[Tuple[str, Callable[[], None]]] = (),
+                    link: str = "") -> None:
         self.kind = kind
         self.title.setText(title)
         self.message.setText(message)
         self.message.setVisible(bool(message))
+        self.link.setText(link)
+        self.link.setVisible(bool(link))
         for b in self.buttons:
             # Hide first: until the deferred delete runs, a removed button would
             # otherwise be painted over the content at its default size.
@@ -184,590 +425,141 @@ class EmptyState(QFrame):
         self.buttons = []
         for i, (text, callback) in enumerate(actions):
             btn = QPushButton(text)
+            btn.setAccessibleName(text.rstrip("…"))
             btn.clicked.connect(lambda _=False, cb=callback: cb())
             self.button_row.insertWidget(1 + i, btn)
             self.buttons.append(btn)
 
 
-# --------------------------------------------------------------------------- filters
-_SIZE_PRESETS: List[Tuple[str, Optional[Tuple[Optional[int], Optional[int]]]]] = [
-    ("Any size", None),
-    ("Under 10 KB", (0, 10 * 1024)),
-    ("10 KB to 1 MB", (10 * 1024, 1024 ** 2)),
-    ("1 MB to 10 MB", (1024 ** 2, 10 * 1024 ** 2)),
-    ("10 MB to 100 MB", (10 * 1024 ** 2, 100 * 1024 ** 2)),
-    ("100 MB to 1 GB", (100 * 1024 ** 2, 1024 ** 3)),
-    ("Over 1 GB", (1024 ** 3, None)),
-]
+class NoticeBar(QFrame):
+    """A one-line message above the results that needs the user's attention
+    (permission denied, indexer restarting...). Hidden while there is nothing to say.
 
-_DATE_PRESETS = [
-    ("Any time", "any"), ("Today", "today"), ("Yesterday", "yesterday"),
-    ("Past 7 days", "week"), ("Past 30 days", "month"), ("Past year", "year"),
-    ("Custom range", "custom"),
-]
-
-
-class FilterPanel(QFrame):
-    """Type, size, date, path and exclude filters for the current search."""
-    filters_changed = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("FilterPanel")
-        self.setFrameShape(QFrame.Shape.NoFrame)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, SPACE_S, 0, 0)
-        layout.setSpacing(SPACE_S)
-
-        # Typing in the regex/exclude boxes must not fire a full search per keystroke.
-        self._filter_timer = QTimer(self)
-        self._filter_timer.setSingleShot(True)
-        self._filter_timer.setInterval(300)
-        self._filter_timer.timeout.connect(self.filters_changed.emit)
-
-        header = QHBoxLayout()
-        header.setSpacing(SPACE_S)
-        self.title_lbl = QLabel("Filters")
-        self.title_lbl.setFont(theme.ui_font(1.0, QFont.Weight.DemiBold))
-        header.addWidget(self.title_lbl)
-        header.addStretch()
-        self.clear_filters_btn = QPushButton("Reset")
-        self.clear_filters_btn.setToolTip("Clear all filters")
-        self.clear_filters_btn.clicked.connect(self.reset_filters)
-        header.addWidget(self.clear_filters_btn)
-        layout.addLayout(header)
-
-        form = QFormLayout()
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setHorizontalSpacing(SPACE_M)
-        form.setVerticalSpacing(SPACE_S)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        self.form_layout = form
-
-        self.ext_combo = QComboBox()
-        self.ext_combo.addItem("All types", None)
-        self.ext_combo.currentIndexChanged.connect(self._on_filter_changed)
-        form.addRow("Type", self.ext_combo)
-
-        self.size_combo = QComboBox()
-        for text, rng in _SIZE_PRESETS:
-            self.size_combo.addItem(text, rng)
-        self.size_combo.currentIndexChanged.connect(self._on_filter_changed)
-        form.addRow("Size", self.size_combo)
-
-        self.date_combo = QComboBox()
-        for text, key in _DATE_PRESETS:
-            self.date_combo.addItem(text, key)
-        self.date_combo.currentIndexChanged.connect(self._on_date_preset_changed)
-        form.addRow("Modified", self.date_combo)
-
-        self.custom_date_widget = QWidget()
-        dates = QHBoxLayout(self.custom_date_widget)
-        dates.setContentsMargins(0, 0, 0, 0)
-        dates.setSpacing(SPACE_S)
-        self.start_date_edit = QDateEdit(QDate.currentDate().addYears(-1))
-        self.end_date_edit = QDateEdit(QDate.currentDate())
-        for edit, name in ((self.start_date_edit, "From date"), (self.end_date_edit, "To date")):
-            edit.setCalendarPopup(True)
-            edit.setAccessibleName(name)
-            edit.dateChanged.connect(self._on_filter_changed)
-        dates.addWidget(self.start_date_edit, 1)
-        dates.addWidget(QLabel("to"))
-        dates.addWidget(self.end_date_edit, 1)
-        self.custom_date_widget.setVisible(False)
-        form.addRow("", self.custom_date_widget)
-
-        self.regex_input = QLineEdit()
-        self.regex_input.setPlaceholderText("Regular expression")
-        self.regex_input.setClearButtonEnabled(True)
-        self.regex_input.textChanged.connect(self._on_filter_changed)
-        form.addRow("Path", self.regex_input)
-        self.regex_error = QLabel()
-        self.regex_error.setWordWrap(True)
-        self.regex_error.setVisible(False)
-        form.addRow("", self.regex_error)
-
-        self.exclude_input = QLineEdit()
-        self.exclude_input.setPlaceholderText("node_modules, *.tmp")
-        self.exclude_input.setClearButtonEnabled(True)
-        self.exclude_input.textChanged.connect(self._on_filter_changed)
-        form.addRow("Exclude", self.exclude_input)
-
-        for row in range(form.rowCount()):
-            label = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
-            field = form.itemAt(row, QFormLayout.ItemRole.FieldRole)
-            if label and field and isinstance(label.widget(), QLabel) and label.widget().text():
-                label.widget().setBuddy(field.widget())
-                field.widget().setAccessibleName(label.widget().text())
-
-        layout.addLayout(form)
-        layout.addStretch()
-        self._sync_reset()
-
-    # -- state
-    def active_filter_count(self) -> int:
-        return sum((
-            self.ext_combo.currentIndex() > 0,
-            self.size_combo.currentIndex() > 0,
-            self.date_combo.currentIndex() > 0,
-            bool(self.regex_input.text().strip()),
-            bool(self.exclude_input.text().strip()),
-        ))
-
-    def _sync_reset(self) -> None:
-        self.clear_filters_btn.setEnabled(self.active_filter_count() > 0)
-
-    def update_extensions(self, extensions: List[str]):
-        """Fill the type list with the most common extensions, keeping the selection."""
-        current = self.ext_combo.currentData()
-        self.ext_combo.blockSignals(True)
-        self.ext_combo.clear()
-        self.ext_combo.addItem("All types", None)
-        for ext in extensions:
-            if ext:
-                self.ext_combo.addItem(ext, ext)
-        if current:
-            idx = self.ext_combo.findData(current)
-            if idx < 0:
-                self.ext_combo.addItem(current, current)
-                idx = self.ext_combo.count() - 1
-            self.ext_combo.setCurrentIndex(idx)
-        self.ext_combo.blockSignals(False)
-
-    def _on_filter_changed(self, *_args):
-        self._sync_reset()
-        self._filter_timer.start()
-
-    def _on_date_preset_changed(self, *_args):
-        self.custom_date_widget.setVisible(self.date_combo.currentData() == "custom")
-        self._on_filter_changed()
-
-    def reset_filters(self):
-        # blockSignals() on the panel does not silence its children, so block each
-        # control; otherwise every child fires filters_changed and triggers a search.
-        self._filter_timer.stop()
-        controls = (self.ext_combo, self.size_combo, self.date_combo,
-                    self.regex_input, self.exclude_input)
-        for c in controls:
-            c.blockSignals(True)
-        self.ext_combo.setCurrentIndex(0)
-        self.size_combo.setCurrentIndex(0)
-        self.date_combo.setCurrentIndex(0)
-        self.custom_date_widget.setVisible(False)
-        self.regex_input.clear()
-        self._set_regex_error(None)
-        self.exclude_input.clear()
-        for c in controls:
-            c.blockSignals(False)
-        self._sync_reset()
-        self.filters_changed.emit()
-
-    def _set_regex_error(self, message: Optional[str]) -> None:
-        if message:
-            theme.set_error_text(self.regex_error, True)
-        self.regex_error.setText(message or "")
-        self.regex_error.setVisible(bool(message))
-        self.regex_input.setToolTip(message or "")
-        self.regex_input.setAccessibleDescription(message or "")
-
-    def get_filter_values(self) -> dict:
-        """Active filters for the search engine."""
-        regex_pattern = self.regex_input.text().strip()
-        if regex_pattern:
-            try:
-                re.compile(regex_pattern)
-                self._set_regex_error(None)
-            except re.error as exc:
-                # An invalid pattern must not abort the search; say so and ignore it.
-                self._set_regex_error(f"Not a valid regular expression ({exc}). Ignored.")
-                regex_pattern = ""
-        else:
-            self._set_regex_error(None)
-        excludes = [p.strip() for p in self.exclude_input.text().split(",") if p.strip()]
-
-        date_range: Optional[Tuple[Optional[float], Optional[float]]] = None
-        today = QDate.currentDate()
-        now = time.time()
-        day = 24 * 3600
-        midnight = float(today.startOfDay().toSecsSinceEpoch())
-        preset = self.date_combo.currentData()
-        if preset == "today":
-            date_range = (midnight, now)
-        elif preset == "yesterday":
-            date_range = (float(today.addDays(-1).startOfDay().toSecsSinceEpoch()), midnight - 1)
-        elif preset == "week":
-            date_range = (now - 7 * day, now)
-        elif preset == "month":
-            date_range = (now - 30 * day, now)
-        elif preset == "year":
-            date_range = (now - 365 * day, now)
-        elif preset == "custom":
-            d1, d2 = self.start_date_edit.date(), self.end_date_edit.date()
-            if d1 > d2:
-                d1, d2 = d2, d1
-            date_range = (float(d1.startOfDay().toSecsSinceEpoch()),
-                          float(d2.endOfDay().toSecsSinceEpoch()))
-
-        return {
-            "extension": self.ext_combo.currentData() or None,
-            "size_range": self.size_combo.currentData(),
-            "date_range": date_range,
-            "regex": regex_pattern or None,
-            "exclude_patterns": excludes,
-        }
-
-
-# --------------------------------------------------------------------------- preview
-class MatchHighlighter(QSyntaxHighlighter):
-    """Marks the search terms in the text preview, like find-in-page."""
-
-    def __init__(self, parent: QTextDocument, terms: List[str]):
-        super().__init__(parent)
-        self.rules: List[Tuple[re.Pattern, QTextCharFormat]] = []
-        self._fmt = QTextCharFormat()
-        self._fmt.setBackground(QColor("#ffe082"))
-        self._fmt.setForeground(QColor("#000000"))
-        self._build_rules(terms)
-
-    def _build_rules(self, terms: List[str]) -> None:
-        self.rules = []
-        for term in terms:
-            if len(term) >= 2:
-                self.rules.append((re.compile(re.escape(term), re.IGNORECASE), self._fmt))
-
-    def set_terms(self, terms: List[str]) -> None:
-        self._build_rules(terms)
-        self.rehighlight()
-
-    def highlightBlock(self, text: Optional[str]) -> None:  # noqa: N802
-        if not text:
-            return
-        for pat, fmt in self.rules:
-            for match in pat.finditer(text):
-                start, end = match.span()
-                self.setFormat(start, end - start, fmt)
-
-
-class PreviewLoaderThread(QThread):
-    """Reads a file's start and metadata off the GUI thread, then hashes it.
-
-    Cancelled cooperatively (never ``terminate()``d): killing a thread that holds the
-    GIL or an open file handle can deadlock or crash the whole process.
+    Notices are keyed; the most recent one is shown. Dismissing a key hides it until
+    it is posted again with ``force=True``.
     """
-    loaded = Signal(str, str, object)  # path, content_preview, meta
-    hashes_ready = Signal(str, str, str)  # path, md5, sha256
-    error = Signal(str)
+    dismissed = Signal(str)
 
-    MAX_HASH_SIZE = 512 * 1024 * 1024
-
-    def __init__(self, path: str):
-        super().__init__()
-        self.path = path
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        self._cancelled = True
-        self.requestInterruption()
-
-    def _is_cancelled(self) -> bool:
-        return self._cancelled or self.isInterruptionRequested()
-
-    @staticmethod
-    def _decode_preview(raw: bytes) -> Optional[str]:
-        """Decode the start of a file as text, or None when it looks binary."""
-        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-            return raw.decode("utf-16", errors="replace")
-        if raw.startswith(b"\xef\xbb\xbf"):
-            raw = raw[3:]
-        if b"\x00" in raw:
-            return None
-        return raw.decode("utf-8", errors="replace")
-
-    def run(self):
-        try:
-            p = Path(self.path)
-            if not p.exists():
-                self.error.emit("The file no longer exists.")
-                return
-
-            meta = dict(get_file_metadata(self.path))
-            meta.setdefault("extension", p.suffix.lower())
-            pending = "Calculating…" if p.is_file() else "Not available for folders"
-            meta["md5"] = meta["sha256"] = pending
-
-            mime, _ = mimetypes.guess_type(self.path)
-            if p.is_dir():
-                try:
-                    n = 0
-                    for _ in p.iterdir():
-                        n += 1
-                        if n >= 100000:
-                            break
-                    count = f"{n:,}+" if n >= 100000 else f"{n:,}"
-                except OSError:
-                    count = "an unknown number of"
-                content = f"Folder with {count} items."
-            elif mime and mime.startswith("image/"):
-                content = "IMAGE_FILE"
-            elif mime and mime.startswith("video/"):
-                content = "No preview for video files."
-            elif mime == "application/pdf":
-                content = "No preview for PDF files. Open the file to read it."
-            else:
-                try:
-                    with open(self.path, "rb") as f:
-                        raw = f.read(8192)
-                    text = self._decode_preview(raw)
-                    content = text[:4000] if text is not None else "No preview for this type of file."
-                except OSError as exc:
-                    content = f"The file could not be read: {exc.strerror or exc}"
-
-            if self._is_cancelled():
-                return
-            self.loaded.emit(self.path, content, meta)
-
-            # Hashing can take a while on big files, so it is reported separately and
-            # never delays the preview itself.
-            if not p.is_file():
-                return
-            try:
-                size = p.stat().st_size
-            except OSError:
-                return
-            if size > self.MAX_HASH_SIZE:
-                note = "Not calculated for files over 512 MB"
-                self.hashes_ready.emit(self.path, note, note)
-                return
-            try:
-                import hashlib
-                h_md5 = hashlib.md5(usedforsecurity=False)
-                h_sha256 = hashlib.sha256()
-                with open(self.path, "rb") as f:
-                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                        if self._is_cancelled():
-                            return
-                        h_md5.update(chunk)
-                        h_sha256.update(chunk)
-                self.hashes_ready.emit(self.path, h_md5.hexdigest(), h_sha256.hexdigest())
-            except OSError as e:
-                msg = f"Could not read the file: {e.strerror or e}"
-                self.hashes_ready.emit(self.path, msg, msg)
-        except Exception as e:
-            if not self._is_cancelled():
-                self.error.emit(str(e))
-
-
-class PreviewPanel(QFrame):
-    """Name, location, a text/image preview and file details for the selection."""
-
-    DETAIL_FIELDS = ("Location", "Size", "Created", "Modified", "MD5", "SHA-256")
-
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setObjectName("PreviewPanel")
-        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setObjectName("NoticeBar")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setAutoFillBackground(True)
+        self.setBackgroundRole(QPalette.ColorRole.AlternateBase)
+        self.setAccessibleName("Notice")
+        self._notices: Dict[str, Tuple[str, str, Sequence[Tuple[str, Callable[[], None]]], bool]] = {}
+        self._order: List[str] = []
+        self._dismissed: set = set()
+        self.key = ""
 
-        self.current_path = ""
-        self.loader_thread: Optional[PreviewLoaderThread] = None
-        self._retired_threads: List[PreviewLoaderThread] = []
-        self.highlighter: Optional[MatchHighlighter] = None
-        self.search_terms: List[str] = []
+        row = QHBoxLayout(self)
+        row.setContentsMargins(SPACE_M, SPACE_S, SPACE_S, SPACE_S)
+        row.setSpacing(SPACE_S)
+        self.icon = QLabel()
+        self.icon.setFixedSize(16, 16)
+        row.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.text = QLabel()
+        self.text.setWordWrap(True)
+        self.text.setTextFormat(Qt.TextFormat.PlainText)
+        self.text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(self.text, 1)
+        self.buttons_row = QHBoxLayout()
+        self.buttons_row.setSpacing(SPACE_S)
+        row.addLayout(self.buttons_row)
+        self.buttons: List[QPushButton] = []
+        self.dismiss_btn = QPushButton("Dismiss")
+        self.dismiss_btn.setAccessibleName("Dismiss notice")
+        self.dismiss_btn.clicked.connect(self.dismiss_current)
+        row.addWidget(self.dismiss_btn)
+        self.setVisible(False)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(SPACE_XS)
-
-        self.file_title = ElidedLabel()
-        self.file_title.setFont(theme.ui_font(1.1, QFont.Weight.DemiBold))
-        self.file_title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.file_title)
-        self.file_location = ElidedLabel(mode=Qt.TextElideMode.ElideMiddle)
-        theme.make_secondary(self.file_location)
-        layout.addWidget(self.file_location)
-        layout.addSpacing(SPACE_S)
-
-        self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(True)
-
-        self.preview_tab = QWidget()
-        preview_layout = QVBoxLayout(self.preview_tab)
-        preview_layout.setContentsMargins(0, SPACE_S, 0, 0)
-        self.text_preview = QPlainTextEdit()
-        self.text_preview.setReadOnly(True)
-        self.text_preview.setFont(theme.fixed_font())
-        self.text_preview.setAccessibleName("File preview")
-        self.image_preview = QLabel()
-        self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_preview.setVisible(False)
-        self.image_preview.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        self.image_preview.setAccessibleName("Image preview")
-        preview_layout.addWidget(self.text_preview)
-        preview_layout.addWidget(self.image_preview)
-        self.tabs.addTab(self.preview_tab, "Preview")
-
-        self.details_tab = QWidget()
-        form = QFormLayout(self.details_tab)
-        form.setContentsMargins(0, SPACE_M, 0, 0)
-        form.setHorizontalSpacing(SPACE_M)
-        form.setVerticalSpacing(SPACE_S)
-        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        self.meta_labels: Dict[str, QLabel] = {}
-        for field in self.DETAIL_FIELDS:
-            title = SecondaryLabel(field)
-            value = QLabel("")
-            value.setWordWrap(True)
-            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            value.setAccessibleName(field)
-            if field in ("MD5", "SHA-256"):
-                value.setFont(theme.fixed_font())
-            form.addRow(title, value)
-            self.meta_labels[field] = value
-        self.tabs.addTab(self.details_tab, "Details")
-        layout.addWidget(self.tabs, 1)
-
-        self._show_nothing()
-
-        # Never let Qt destroy a QThread that is still running at shutdown.
-        app = QApplication.instance()
-        if app is not None:
-            app.aboutToQuit.connect(self.shutdown)
-
-    def _show_nothing(self) -> None:
-        self.file_title.setText("No file selected")
-        self.file_location.setText("Select a result to preview it.")
-        self.text_preview.clear()
-        self.text_preview.setPlaceholderText("")
-        for lbl in self.meta_labels.values():
-            lbl.setText("")
-
-    def clear(self) -> None:
-        self._retire_loader()
-        self.current_path = ""
-        self.image_preview.clear()
-        self.image_preview.setVisible(False)
-        self.text_preview.setVisible(True)
-        self._show_nothing()
-
-    def set_search_terms(self, terms: List[str]):
-        self.search_terms = terms
-        if self.highlighter is not None:
-            self.highlighter.set_terms(terms)
-
-    def _retire_loader(self) -> None:
-        """Cancel the running loader without blocking the GUI or killing the thread."""
-        t = self.loader_thread
-        self.loader_thread = None
-        if t is None:
+    def post(self, key: str, text: str, actions: Sequence[Tuple[str, Callable[[], None]]] = (),
+             level: str = "warning", dismissible: bool = True, force: bool = False) -> None:
+        if key in self._dismissed and not force:
             return
-        for sig in (t.loaded, t.hashes_ready, t.error):
-            try:
-                sig.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-        t.cancel()
-        if t.isRunning():
-            self._retired_threads.append(t)
-            t.finished.connect(lambda t=t: self._drop_retired(t))
+        self._dismissed.discard(key)
+        self._notices[key] = (text, level, tuple(actions), dismissible)
+        if key in self._order:
+            self._order.remove(key)
+        self._order.append(key)
+        self._render()
 
-    def _drop_retired(self, t: PreviewLoaderThread) -> None:
-        if t in self._retired_threads:
-            self._retired_threads.remove(t)
-        t.deleteLater()
+    def remove(self, key: str) -> None:
+        if self._notices.pop(key, None) is not None:
+            self._order.remove(key)
+            self._render()
 
-    def shutdown(self) -> None:
-        """Stop all background loaders and wait for them (call before the app exits)."""
-        self._retire_loader()
-        for t in list(self._retired_threads):
-            t.wait(3000)
+    def has(self, key: str) -> bool:
+        return key in self._notices
 
-    def load_file(self, path: str):
-        if not path or path == self.current_path:
+    def dismiss_current(self) -> None:
+        key = self.key
+        if not key:
             return
-        self.current_path = path
-        p = Path(path)
-        self.file_title.setText(theme.display_text(p.name or path))
-        self.file_location.setText(theme.display_text(str(p.parent)))
+        self._dismissed.add(key)
+        self.remove(key)
+        self.dismissed.emit(key)
 
-        self.text_preview.clear()
-        self.text_preview.setPlaceholderText("Loading preview…")
-        self.image_preview.clear()
-        self.image_preview.setVisible(False)
-        self.text_preview.setVisible(True)
-        for lbl in self.meta_labels.values():
-            lbl.setText("")
-
-        self._retire_loader()
-        self.loader_thread = PreviewLoaderThread(path)
-        self.loader_thread.loaded.connect(self._on_preview_loaded)
-        self.loader_thread.hashes_ready.connect(self._on_hashes_ready)
-        self.loader_thread.error.connect(self._on_preview_error)
-        self.loader_thread.start()
-
-    @staticmethod
-    def _format_ts(meta: dict, *keys: str) -> str:
-        for key in keys:
-            value = meta.get(key)
-            if value:
-                return theme.format_timestamp_iso(value)
-        return "Unknown"
-
-    def _load_image(self, path: str) -> None:
-        reader = QImageReader(path)
-        reader.setAutoTransform(True)
-        area = self.preview_tab.size()
-        target = QSize(max(area.width() - SPACE_S, 200), max(area.height() - SPACE_S, 200))
-        src = reader.size()
-        if src.isValid() and (src.width() > target.width() or src.height() > target.height()):
-            # Decode straight to the display size: avoids holding a huge bitmap in memory.
-            reader.setScaledSize(src.scaled(target, Qt.AspectRatioMode.KeepAspectRatio))
-        image = reader.read()
-        if image.isNull():
-            self.image_preview.setVisible(False)
-            self.text_preview.setVisible(True)
-            self.text_preview.setPlainText("This image could not be loaded.")
-        else:
-            self.image_preview.setPixmap(QPixmap.fromImage(image))
-
-    @Slot(str, str, object)
-    def _on_preview_loaded(self, path, content, meta):
-        if path != self.current_path:
+    def _render(self) -> None:
+        if not self._order:
+            self.key = ""
+            self.setVisible(False)
             return
-        self.text_preview.setPlaceholderText("No preview available.")
-        size = int(meta.get("size", 0) or 0)
-        self.meta_labels["Location"].setText(theme.display_text(str(Path(str(meta.get("path", path))).parent)))
-        self.meta_labels["Size"].setText("" if meta.get("is_dir") else theme.format_size_exact(size))
-        self.meta_labels["Created"].setText(self._format_ts(meta, "created", "ctime"))
-        self.meta_labels["Modified"].setText(self._format_ts(meta, "modified", "mtime"))
-        self.meta_labels["MD5"].setText(str(meta.get("md5", "")))
-        self.meta_labels["SHA-256"].setText(str(meta.get("sha256", "")))
+        key = self._order[-1]
+        text, level, actions, dismissible = self._notices[key]
+        self.key = key
+        self.text.setText(text)
+        self.setAccessibleDescription(text)
+        icon = glyph_icon("warning" if level != "info" else "info",
+                          "error" if level == "error" else "text")
+        self.icon.setPixmap(icon.pixmap(16, 16))
+        for b in self.buttons:
+            b.hide()
+            self.buttons_row.removeWidget(b)
+            b.deleteLater()
+        self.buttons = []
+        for label, cb in actions:
+            b = QPushButton(label)
+            b.setAccessibleName(label.rstrip("…"))
+            b.clicked.connect(lambda _=False, cb=cb: cb())
+            self.buttons_row.addWidget(b)
+            self.buttons.append(b)
+        self.dismiss_btn.setVisible(dismissible)
+        self.setVisible(True)
 
-        if content == "IMAGE_FILE":
-            self.text_preview.setVisible(False)
-            self.image_preview.setVisible(True)
-            self._load_image(path)
-        else:
-            # Plain text on purpose: rich text would render .html/.md sources.
-            self.text_preview.setPlainText(content)
-            if self.search_terms:
-                if self.highlighter is None:
-                    self.highlighter = MatchHighlighter(self.text_preview.document(), self.search_terms)
-                else:
-                    self.highlighter.set_terms(self.search_terms)
 
-    @Slot(str, str, str)
-    def _on_hashes_ready(self, path, md5_hex, sha256_hex):
-        if path != self.current_path:
-            return
-        self.meta_labels["MD5"].setText(md5_hex)
-        self.meta_labels["SHA-256"].setText(sha256_hex)
+class StatusDot(QWidget):
+    """8 px circle in the status bar; its meaning is always repeated in the label."""
 
-    @Slot(str)
-    def _on_preview_error(self, err_msg):
-        self.text_preview.setPlaceholderText("")
-        self.text_preview.setPlainText(f"No preview: {err_msg}")
-        # Allow re-selecting the same file to retry.
-        self.current_path = ""
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.state = "loading"
+        self.setFixedSize(SPACE_M, SPACE_M)
+        self.setAccessibleName("Index status")
+
+    def set_state(self, state: str) -> None:
+        if state != self.state:
+            self.state = state
+            self.update()
+
+    def paintEvent(self, event):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(theme.status_dot_color(self.state, self.palette()))
+        d = 8.0
+        p.drawEllipse(QRectF((self.width() - d) / 2, (self.height() - d) / 2, d, d))
+
+
+class SectionLabel(QLabel):
+    """Uppercase sidebar section heading ("LIBRARY")."""
+
+    def __init__(self, text: str, parent: Optional[QWidget] = None):
+        super().__init__(text.upper(), parent)
+        self.setFont(theme.section_font())
+        self.setAccessibleName(text.title())
+        theme.make_secondary(self)
+        self.setContentsMargins(SPACE_S, SPACE_S, 0, SPACE_XS)
 
 
 # --------------------------------------------------------------------------- settings
@@ -779,21 +571,50 @@ def tray_wording() -> str:
     return "Keep running in the system tray when the window is closed"
 
 
-class SettingsDialog(QDialog):
-    """Settings (Preferences on macOS): appearance, results, folders, exclusions."""
+_ROOT_STATE_TEXT = {
+    "new": "Waiting to be indexed",
+    "scanning": "Indexing…",
+    "ok": "",
+    "denied": "Access denied",
+    "missing": "Folder not found",
+    "error": "Could not be read",
+}
 
-    def __init__(self, parent=None):
+
+def log_dir() -> Optional[Path]:
+    """The GUI log folder from the platform module (P5), if it is available."""
+    try:
+        from ..utils import platform_utils
+
+        getter = getattr(platform_utils, "get_log_dir", None)
+        return Path(getter()) if getter is not None else None
+    except Exception:
+        return None
+
+
+class SettingsDialog(QDialog):
+    """Settings (Preferences on macOS): appearance, tray, indexed folders, excludes and
+    the indexer switches of config v2. ``save_settings`` writes config.json through the
+    config manager; the caller sends the new ``EngineConfig`` to the engine."""
+
+    def __init__(self, config_manager, parent: Optional[QWidget] = None, *,
+                 root_states: Optional[Mapping[str, Tuple[str, int]]] = None,
+                 on_rebuild: Optional[Callable[[], None]] = None,
+                 on_show_logs: Optional[Callable[[], None]] = None):
         super().__init__(parent)
+        self.config_manager = config_manager
         self.setWindowTitle(theme.settings_label())
         self.setModal(True)
-        self.resize(560, 460)
+        self.resize(600, 520)
         self.indexing_changed = False
+        self._root_states = dict(root_states or {})
         cfg = config_manager.config
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SPACE_L, SPACE_L, SPACE_L, SPACE_L)
         layout.setSpacing(SPACE_L)
         self.tabs = QTabWidget()
+        self.tabs.setAccessibleName("Settings sections")
         layout.addWidget(self.tabs, 1)
 
         # -- General
@@ -808,15 +629,9 @@ class SettingsDialog(QDialog):
         self.appearance_combo.setCurrentIndex(max(0, self.appearance_combo.findData(theme.current_appearance())))
         form.addRow("Appearance", self.appearance_combo)
 
-        self.max_results_spin = QSpinBox()
-        self.max_results_spin.setRange(10, 100000)
-        self.max_results_spin.setSingleStep(100)
-        self.max_results_spin.setGroupSeparatorShown(True)
-        self.max_results_spin.setValue(cfg.max_results)
-        form.addRow("Maximum results", self.max_results_spin)
-
         self.tray_check = QCheckBox(tray_wording())
         self.tray_check.setChecked(theme.setting_bool("close_to_tray", False))
+        self.tray_check.setAccessibleName(tray_wording())
         if QSystemTrayIcon.isSystemTrayAvailable():
             form.addRow("", self.tray_check)
         else:
@@ -824,7 +639,7 @@ class SettingsDialog(QDialog):
         for row in range(form.rowCount()):
             label = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
             field = form.itemAt(row, QFormLayout.ItemRole.FieldRole)
-            if label and field and isinstance(label.widget(), QLabel):
+            if label and field and isinstance(label.widget(), QLabel) and label.widget().text():
                 label.widget().setBuddy(field.widget())
                 field.widget().setAccessibleName(label.widget().text())
         self.tabs.addTab(general, "General")
@@ -834,20 +649,23 @@ class SettingsDialog(QDialog):
         col = QVBoxLayout(indexing)
         col.setContentsMargins(SPACE_L, SPACE_L, SPACE_L, SPACE_L)
         col.setSpacing(SPACE_S)
-        folders_lbl = QLabel("Folders to index")
+        folders_lbl = QLabel("Indexed folders")
         folders_lbl.setFont(theme.ui_font(1.0, QFont.Weight.DemiBold))
         col.addWidget(folders_lbl)
         self.paths_list = QListWidget()
-        self.paths_list.setAccessibleName("Folders to index")
+        self.paths_list.setAccessibleName("Indexed folders")
         self.paths_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.paths_list.addItems(cfg.index_paths)
+        for p in list(getattr(cfg, "index_paths", []) or []):
+            self._add_path_item(p)
         folders_lbl.setBuddy(self.paths_list)
         col.addWidget(self.paths_list, 1)
         buttons = QHBoxLayout()
         buttons.setSpacing(SPACE_S)
         self.add_path_btn = QPushButton("Add folder…")
+        self.add_path_btn.setAccessibleName("Add folder")
         self.add_path_btn.clicked.connect(self.add_indexed_path)
         self.remove_path_btn = QPushButton("Remove")
+        self.remove_path_btn.setAccessibleName("Remove folder")
         self.remove_path_btn.clicked.connect(self.remove_indexed_path)
         self.remove_path_btn.setEnabled(False)
         self.paths_list.itemSelectionChanged.connect(
@@ -863,19 +681,55 @@ class SettingsDialog(QDialog):
         col.addWidget(exclude_lbl)
         self.exclude_edit = QPlainTextEdit()
         self.exclude_edit.setAccessibleName("Skip these names")
-        self.exclude_edit.setPlainText("\n".join(cfg.exclude_patterns))
+        self.exclude_edit.setPlainText("\n".join(getattr(cfg, "exclude_patterns", []) or []))
         self.exclude_edit.setTabChangesFocus(True)
         exclude_lbl.setBuddy(self.exclude_edit)
         col.addWidget(self.exclude_edit, 1)
-        col.addWidget(SecondaryLabel("One folder name or pattern per line, for example node_modules or *.tmp."))
+        col.addWidget(SecondaryLabel("One name, pattern or folder/sub sequence per line, "
+                                     "for example node_modules, *.tmp or build/output."))
 
         col.addSpacing(SPACE_M)
-        self.content_check = QCheckBox("Index text inside files")
-        self.content_check.setChecked(bool(getattr(cfg, "index_content", False)))
-        col.addWidget(self.content_check)
-        col.addWidget(SecondaryLabel("Lets you search file contents. Indexing is slower and the index gets larger."))
+        self.checks: Dict[str, QCheckBox] = {}
+        self._check_defaults: Dict[str, bool] = {}
+
+        def check(key: str, text: str, default: bool, visible: bool = True) -> QCheckBox:
+            box = QCheckBox(text)
+            box.setAccessibleName(text)
+            box.setChecked(bool(getattr(cfg, key, default)))
+            box.setVisible(visible)
+            if visible:
+                col.addWidget(box)
+            self.checks[key] = box
+            self._check_defaults[key] = default
+            return box
+
+        check("include_home_library", "Include ~/Library", False, visible=theme.IS_MAC)
+        check("index_hidden", "Index hidden files (they are ranked lower)", True)
+        check("descend_packages", "Search inside apps and packages", False, visible=theme.IS_MAC)
+        check("live_monitoring", "Live monitoring (update the index as files change)", True)
+        check("pause_on_battery", "Pause background rescans when on battery", True)
+
+        col.addSpacing(SPACE_S)
+        tools = QHBoxLayout()
+        tools.setSpacing(SPACE_S)
+        self.logs_btn = QPushButton("Show log folder")
+        self.logs_btn.setAccessibleName("Show log folder")
+        self.logs_btn.clicked.connect(on_show_logs or (lambda: None))
+        self.logs_btn.setVisible(on_show_logs is not None)
+        self.rebuild_btn = QPushButton("Rebuild index…")
+        self.rebuild_btn.setAccessibleName("Rebuild index")
+        self.rebuild_btn.clicked.connect(on_rebuild or (lambda: None))
+        self.rebuild_btn.setVisible(on_rebuild is not None)
+        tools.addWidget(self.logs_btn)
+        tools.addWidget(self.rebuild_btn)
+        tools.addStretch()
+        col.addLayout(tools)
         self.tabs.addTab(indexing, "Indexing")
 
+        self.error_lbl = QLabel()
+        self.error_lbl.setWordWrap(True)
+        self.error_lbl.setVisible(False)
+        layout.addWidget(self.error_lbl)
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.button_box.accepted.connect(self.save_settings)
@@ -886,41 +740,71 @@ class SettingsDialog(QDialog):
     def appearance(self) -> str:
         return self.appearance_combo.currentData() or "system"
 
-    def add_indexed_path(self):
+    def _add_path_item(self, path: str) -> None:
+        item = QListWidgetItem(path)
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        state, entries = self._root_states.get(path, ("", -1))
+        note = _ROOT_STATE_TEXT.get(state, "")
+        if not note and entries >= 0:
+            note = f"{theme.format_count(entries)} items"
+        if note:
+            item.setText(f"{path}  ({note})")
+        item.setToolTip(path)
+        self.paths_list.addItem(item)
+
+    def paths(self) -> List[str]:
+        return [self.paths_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.paths_list.count())]
+
+    def add_indexed_path(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Add folder to index")
         if folder:
             # Qt returns forward slashes on Windows; store native paths and compare
             # case/separator-insensitively so the same folder is never listed twice.
             folder = os.path.normpath(folder)
-            for i in range(self.paths_list.count()):
-                if paths_equal(self.paths_list.item(i).text(), folder):
-                    return
-            self.paths_list.addItem(folder)
+            if any(paths_equal(p, folder) for p in self.paths()):
+                return
+            self._add_path_item(folder)
 
-    def remove_indexed_path(self):
+    def remove_indexed_path(self) -> None:
         for s in self.paths_list.selectedItems():
             self.paths_list.takeItem(self.paths_list.row(s))
 
-    def save_settings(self):
-        cfg = config_manager.config
-        paths = [self.paths_list.item(i).text() for i in range(self.paths_list.count())]
-        excludes = [pat.strip() for pat in self.exclude_edit.toPlainText().split("\n") if pat.strip()]
-        index_content = self.content_check.isChecked()
-        self.indexing_changed = (paths != list(cfg.index_paths)
-                                 or excludes != list(cfg.exclude_patterns)
-                                 or index_content != bool(getattr(cfg, "index_content", False)))
-        old = (list(cfg.index_paths), list(cfg.exclude_patterns), cfg.max_results,
-               getattr(cfg, "index_content", False))
-        cfg.index_paths = paths
-        cfg.exclude_patterns = excludes
-        cfg.max_results = self.max_results_spin.value()
-        cfg.index_content = index_content
+    def _show_error(self, text: str) -> None:
+        theme.set_error_text(self.error_lbl, True)
+        self.error_lbl.setText(text)
+        self.error_lbl.setVisible(bool(text))
+
+    def save_settings(self) -> None:
+        cfg = self.config_manager.config
+        paths = self.paths()
+        excludes: List[str] = []
+        for pat in self.exclude_edit.toPlainText().split("\n"):
+            pat = pat.strip()
+            if pat and pat not in excludes:
+                excludes.append(pat)
+        bad = [p for p in paths if not os.path.isabs(p)]
+        if bad:
+            self._show_error(f'"{bad[0]}" is not a full folder path.')
+            return
+        values = {"index_paths": paths, "exclude_patterns": excludes}
+        for key, box in self.checks.items():
+            values[key] = box.isChecked()
+        old = {k: getattr(cfg, k, None) for k in values}
+
+        def norm(key, value):
+            if isinstance(values[key], list):
+                return list(value or [])
+            return bool(self._check_defaults[key] if value is None else value)
+
+        self.indexing_changed = any(norm(k, old[k]) != values[k] for k in values)
+        for k, v in values.items():
+            setattr(cfg, k, v)
         try:
-            config_manager.save()
+            self.config_manager.save()
         except Exception as e:
-            cfg.index_paths, cfg.exclude_patterns, cfg.max_results, cfg.index_content = old
-            QMessageBox.warning(self, "Settings not saved",
-                                f"The settings could not be saved.\n\n{e}")
+            for k, v in old.items():
+                setattr(cfg, k, v)
+            QMessageBox.warning(self, "Settings not saved", f"The settings could not be saved.\n\n{e}")
             return
         settings = theme.ui_settings()
         settings.setValue("appearance", self.appearance)
@@ -977,7 +861,7 @@ class AboutDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- export
-def export_results(parent: QWidget, results: List[dict]) -> Optional[str]:
+def export_results(parent: Optional[QWidget], results: List[dict]) -> Optional[str]:
     """Ask for a file and write the results as CSV or JSON.
 
     Returns a status message for the status bar, or None when cancelled.  Errors are
@@ -999,11 +883,11 @@ def export_results(parent: QWidget, results: List[dict]) -> Optional[str]:
         else:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Name", "Extension", "Size", "Modified", "Path", "Score"])
+                writer.writerow(["Name", "Folder", "Size", "Modified", "Path", "Kind"])
                 for item in results:
-                    writer.writerow([item.get("name", ""), item.get("extension", ""),
+                    writer.writerow([item.get("name", ""), item.get("folder", ""),
                                      item.get("size", 0), item.get("modified", 0),
-                                     item.get("path", ""), item.get("score", 0.0)])
+                                     item.get("path", ""), item.get("kind", "")])
     except OSError as e:
         QMessageBox.warning(parent, "Export failed",
                             f'Could not write "{Path(path).name}": {e.strerror or e}')
