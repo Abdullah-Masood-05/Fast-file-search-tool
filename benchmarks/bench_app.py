@@ -6,6 +6,7 @@
     uv run python benchmarks/bench_app.py --tree D:\\some\\tree    # use an existing tree (not modified)
     uv run python benchmarks/bench_app.py --compare A.json B.json   # side by side, flags regressions (>10% and >5 ms/MB)
     uv run python benchmarks/bench_app.py --screenshots dist\\bench --tag v2  # light/dark PNGs of the real window
+    uv run python benchmarks/bench_app.py --profile-gui dist\\prof  # GUI-thread profile while typing (gui_profile.py)
 
 Measured (see ``metrics`` in the JSON; ``headline`` repeats the numbers CI checks):
   startup (fresh process, warm index):  to first paint, to engine Ready, to first results
@@ -134,26 +135,30 @@ class _Heartbeat:
         self.t.timeout.connect(self._tick)
         self.clock = QElapsedTimer()
         self.last = 0
+        self.last_pc = 0.0           # time.perf_counter() of the last tick (read by the stall sampler)
         self.late = []
 
     def start(self):
         self.late = []
         self.clock.start()
         self.last = self.clock.nsecsElapsed()
+        self.last_pc = time.perf_counter()
         self.t.start()
 
     def _tick(self):
         now = self.clock.nsecsElapsed()
         self.late.append(max(0.0, (now - self.last) / 1e6 - self.interval))
         self.last = now
+        self.last_pc = time.perf_counter()
 
     def take(self):
         late, self.late = self.late, []
         return late
 
 
-def _run_app(driver_factory, out_path: Path, out: dict) -> int:
-    """main.main([]) with MainWindow replaced by a subclass that starts the driver."""
+def _run_app(driver_factory, out_path: Path, out: dict, probe=None) -> int:
+    """main.main([]) with MainWindow replaced by a subclass that starts the driver.
+    ``probe`` (profile runs only) gets a mark for every request sent and every result applied."""
     import fast_file_search.main as app_main
     import fast_file_search.ui.main_window as mw_mod
     from PySide6.QtCore import QTimer
@@ -168,9 +173,18 @@ def _run_app(driver_factory, out_path: Path, out: dict) -> int:
             QTimer.singleShot(0, lambda: driver_factory(self))
 
         def _on_search_result(self, res):
+            t = time.perf_counter()
             super()._on_search_result(res)
             if res.offset == 0 and self._displayed_key == self._req_key:
                 self._t_applied = time.perf_counter()
+            if probe is not None:
+                probe.apply(res.gen, res.offset, res.refresh, (time.perf_counter() - t) * 1000)
+
+        def _send_search(self, commit=False, text=None):
+            t = time.perf_counter()
+            super()._send_search(commit, text)
+            if probe is not None:
+                probe.send(self._req_raw, self._gen, (time.perf_counter() - t) * 1000)
 
     mw_mod.MainWindow = Window
     try:
@@ -238,6 +252,14 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
     from PySide6.QtWidgets import QApplication
 
     out: dict = {"tree": str(tree)}
+    prof_dir = os.environ.get("BENCH_PROFILE_DIR")
+    probe = gp = None
+    if prof_dir:
+        sys.path.insert(0, str(HERE))
+        import gui_profile as gp
+        from fast_file_search.engine import protocol as P
+        probe = gp.Probe()
+        probe.install(P)
 
     def key(f, ch):
         if ch.isascii():
@@ -260,6 +282,12 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
         client = win.client
         hb = _Heartbeat((QTimer, QElapsedTimer, Qt))
         hb.start()
+        sampler = None
+        if probe is not None:
+            import threading
+            probe.phase = "indexing_typing"
+            sampler = gp.StallSampler(threading.get_ident(), hb, probe)
+            sampler.start()
         win.activateWindow()
         f = win.bar.field
         # ---- fresh index while typing
@@ -316,7 +344,9 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
         lat = {name: [] for name in QUERIES}
         engine_ms = {name: [] for name in QUERIES}
         totals = {}
-        reps = int(os.environ.get("BENCH_SEARCH_REPS", "15"))
+        if probe is not None:
+            probe.phase = "search"
+        reps = int(os.environ.get("BENCH_SEARCH_REPS", "5" if probe is not None else "15"))
         for rep in range(reps + 2):
             for name, text in QUERIES.items():
                 t = time.perf_counter()
@@ -341,31 +371,59 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
         print("search through the client:", out["search_client_all"], flush=True)
 
         # ---- keystroke -> results on screen, heartbeat running
-        hb.take()
-        kr = {}
-        for rep in range(4):
-            for word in TYPING_WORDS:
-                f.setFocus()
-                f.clear()
-                QTest.qWait(150)
-                win._t_applied = None
-                t_last = 0.0
-                for ch in word:
-                    key(f, ch)
-                    t_last = time.perf_counter()
-                    QTest.qWait(90)
-                e = time.monotonic() + 10
-                while (win._req_raw != word or win._t_applied is None
-                       or win._displayed_key != win._req_key) and time.monotonic() < e:
-                    QTest.qWait(5)
-                if win._t_applied is not None and rep:      # drop the first round
-                    kr.setdefault(word, []).append((win._t_applied - t_last) * 1000)
-                QTest.qWait(100)
-        allk = [x for v in kr.values() for x in v]
-        out["keystroke_to_results_ms"] = {"p50": round(pct(allk, 50), 1), "p95": round(pct(allk, 95), 1),
-                                          "max": round(max(allk), 1), "debounce_ms": 120, "n": len(allk)}
-        out["heartbeat_typing_idle"] = summary(hb.take())
+        def ev_wait(ms):
+            """Wait in a real event loop (what the app runs), not QTest.qWait's processEvents + 10 ms sleeps."""
+            loop = QEventLoop()
+            QTimer.singleShot(ms, loop.quit)
+            loop.exec()
+
+        def typing_pass(reps, drop_first, wait=QTest.qWait):
+            kr, words, over = {}, [], []
+
+            def pause(ms):
+                t = time.perf_counter()
+                wait(ms)
+                if ms >= 90:
+                    over.append((time.perf_counter() - t) * 1000 - ms)
+            hb.take()
+            for rep in range(reps):
+                for word in TYPING_WORDS:
+                    f.setFocus()
+                    f.clear()
+                    pause(150)
+                    win._t_applied = None
+                    t_first = time.perf_counter()
+                    t_last = 0.0
+                    for ch in word:
+                        key(f, ch)
+                        t_last = time.perf_counter()
+                        pause(90)
+                    e = time.monotonic() + 10
+                    while (win._req_raw != word or win._t_applied is None
+                           or win._displayed_key != win._req_key) and time.monotonic() < e:
+                        pause(5)
+                    if win._t_applied is not None and (rep or not drop_first):   # drop the first round
+                        kr.setdefault(word, []).append((win._t_applied - t_last) * 1000)
+                        words.append((word, t_first, t_last, time.perf_counter()))
+                    pause(100)
+            allk = [x for v in kr.values() for x in v]
+            res = {"keystroke_to_results_ms": {"p50": round(pct(allk, 50), 1), "p95": round(pct(allk, 95), 1),
+                                               "max": round(max(allk), 1), "debounce_ms": 120, "n": len(allk)},
+                   "heartbeat": summary(hb.take())}
+            return res, words, over
+
+        if probe is None:
+            res, _w, _o = typing_pass(4, True)
+            out["keystroke_to_results_ms"] = res["keystroke_to_results_ms"]
+            out["heartbeat_typing_idle"] = res["heartbeat"]
+        else:
+            out["profile"] = profile_typing(typing_pass, ev_wait, probe, sampler, gp, Path(prof_dir))
+            first = out["profile"]["passes"]["qwait"]
+            out["keystroke_to_results_ms"] = first["keystroke_to_results_ms"]
+            out["heartbeat_typing_idle"] = first["heartbeat"]
         print("keystroke -> results:", out["keystroke_to_results_ms"], flush=True)
+        if probe is not None:
+            return                      # profile runs stop here (no watcher burst)
 
         # ---- watcher burst under the live root
         burst_dir = tree / "zz_bench_burst"
@@ -403,7 +461,63 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
         out["rss_final_engine_mb"] = rss_mb(client.engine_pid)
         out["engine_pid"] = client.engine_pid
 
-    return _run_app(driver, out_path, out)
+    return _run_app(driver, out_path, out, probe)
+
+
+def profile_typing(typing_pass, ev_wait, probe, sampler, gp, prof_dir: Path) -> dict:
+    """The typing-on-an-idle-index scenario four times: QTest.qWait waits (the normal benchmark),
+    real event-loop waits, under cProfile, and (macOS) under /usr/bin/sample."""
+    import cProfile
+    from PySide6 import __version__ as pyside
+    from PySide6.QtCore import qVersion
+    from PySide6.QtGui import QGuiApplication
+
+    prof = {"platform": platform.platform(), "machine": platform.machine(), "python": platform.python_version(),
+            "qt": qVersion(), "pyside": pyside, "qpa": QGuiApplication.platformName(), "passes": {}}
+
+    def run_pass(name, reps, drop_first, wait=None):
+        probe.phase = name
+        i0 = len(probe.events)
+        t0 = time.perf_counter()
+        res, words, over = typing_pass(reps, drop_first, wait) if wait else typing_pass(reps, drop_first)
+        res["seconds"] = round(time.perf_counter() - t0, 1)
+        res["wait_overshoot_ms"] = gp.stats(over)
+        res["phases"] = gp.keystroke_phases(probe.events[i0:], words)
+        prof["passes"][name] = res
+        print(f"profile pass {name}: {res['keystroke_to_results_ms']} heartbeat {res['heartbeat']}", flush=True)
+        return res
+
+    first = run_pass("qwait", 3, True)
+    run_pass("evloop", 2, False, ev_wait)
+    sampler.paused = True
+    pr = cProfile.Profile()
+    pr.enable()
+    try:
+        run_pass("cprofile", 2, False)
+    finally:
+        pr.disable()
+    sampler.paused = False
+    prof["cprofile"] = gp.cprofile_top(pr)
+    prof_dir.mkdir(parents=True, exist_ok=True)
+    pr.dump_stats(str(prof_dir / "gui-cprofile.pstats"))
+    if sys.platform == "darwin":
+        secs = first["seconds"] * 2 / 3 + 4
+        path = str(prof_dir / "native-sample.txt")
+        proc = gp.start_native_sample(secs, path)
+        if proc is None:
+            prof["native"] = "(could not start /usr/bin/sample)"
+        else:
+            run_pass("native", 2, False)
+            try:
+                proc.wait(timeout=secs + 60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            prof["native"] = gp.native_main_thread_summary(path)
+    sampler.stop()
+    prof["stalls"] = sampler.report()
+    (prof_dir / "gui-profile.json").write_text(json.dumps(prof, indent=1, ensure_ascii=False), encoding="utf-8")
+    (prof_dir / "gui-profile.txt").write_text(gp.text_report(prof), encoding="utf-8")
+    return {"passes": prof["passes"]}
 
 
 def child_shots(sandbox: Path, outdir: Path, tag: str) -> int:
@@ -580,6 +694,36 @@ def benchmark(args) -> int:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def profile_gui(args) -> int:
+    """Fresh index + the typing scenarios with the GUI-thread probes (see gui_profile.py). Writes
+    gui-profile.json/.txt, gui-cprofile.pstats, run.json and (macOS) native-sample.txt into the folder."""
+    prof_dir = Path(args.profile_gui).resolve()
+    prof_dir.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="ffs_prof_"))
+    sandbox = tmp / "sandbox"
+    sandbox.mkdir()
+    try:
+        if args.tree:
+            tree = Path(args.tree).resolve()
+        else:
+            tree = tmp / "tree"
+            make_tree(tree, args.files)
+        os.environ["BENCH_PROFILE_DIR"] = str(prof_dir)
+        try:
+            run_child(["--child-run", str(sandbox), str(tree), str(prof_dir / "run.json"), "0"], sandbox,
+                      timeout=3600)
+        finally:
+            os.environ.pop("BENCH_PROFILE_DIR", None)
+        run = json.loads((prof_dir / "run.json").read_text(encoding="utf-8"))
+        if "error" in run:
+            raise RuntimeError("benchmark driver failed:\n" + run["error"])
+        txt = prof_dir / "gui-profile.txt"
+        print(txt.read_text(encoding="utf-8") if txt.exists() else "(no gui-profile.txt)", flush=True)
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def print_table(rec, meta):
     print(f"\n=== Fast File Search Pro 2.0 app benchmark ({meta['platform']}, Python {meta['python']}, "
           f"{meta['binding']} / Qt {meta['qt_version']}, {meta['entries']:,} entries) ===")
@@ -637,6 +781,9 @@ def main() -> int:
     ap.add_argument("--burst-files", type=int, default=2000)
     ap.add_argument("--screenshots", metavar="DIR", help="save light/dark PNGs of the real window and exit")
     ap.add_argument("--tag", default="v2", help="file prefix for --screenshots")
+    ap.add_argument("--profile-gui", metavar="DIR",
+                    help="profile the GUI thread while typing (cProfile, stall stacks, per-keystroke phases, "
+                         "macOS native samples) and write the reports into DIR; no startup runs or burst")
     # internal: the app runs in child processes
     ap.add_argument("--child-run", nargs=4, metavar=("SANDBOX", "TREE", "OUT", "BURST"), help=argparse.SUPPRESS)
     ap.add_argument("--child-startup", nargs=2, metavar=("SANDBOX", "OUT"), help=argparse.SUPPRESS)
@@ -652,6 +799,8 @@ def main() -> int:
         return child_startup(Path(args.child_startup[0]), Path(args.child_startup[1]))
     if args.child_shots:
         return child_shots(Path(args.child_shots[0]), Path(args.child_shots[1]), args.child_shots[2])
+    if args.profile_gui:
+        return profile_gui(args)
     if args.screenshots:
         tmp = Path(tempfile.mkdtemp(prefix="ffs_shot_"))
         try:

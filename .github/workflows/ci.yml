@@ -13,6 +13,11 @@ on:
         required: false
         default: ''
         type: string
+      macos_profile:
+        description: 'Only run the macOS GUI-thread profile (bench_app.py --profile-gui); skips tests, builds and benchmarks.'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -32,6 +37,7 @@ env:
 jobs:
   test:
     name: Test (${{ matrix.os }})
+    if: ${{ !inputs.macos_profile }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -284,6 +290,7 @@ jobs:
   bench:
     name: Bench (${{ matrix.os }})
     needs: test
+    if: ${{ !inputs.macos_profile }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -360,6 +367,69 @@ jobs:
           name: bench-${{ matrix.os }}
           path: bench-out/*.json
           if-no-files-found: error
+
+  # workflow_dispatch with macos_profile=true: only this job runs. Profiles the GUI thread while
+  # typing (offscreen and the real cocoa platform) and puts the report into the job summary.
+  profile:
+    name: Profile (${{ matrix.os }}, ${{ matrix.qpa }})
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.macos_profile }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+        qpa: [offscreen, cocoa]
+    env:
+      QT_QPA_PLATFORM: ${{ matrix.qpa }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Use a throwaway app cache dir
+        run: echo "FAST_FILE_SEARCH_CACHE_DIR=$RUNNER_TEMP/ffs-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+
+      - name: Disable App Nap
+        run: defaults write NSGlobalDomain NSAppSleepDisabled -bool YES
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Generate the 300k tree
+        run: uv run python benchmarks/gen_tree.py "$RUNNER_TEMP/tree300k" --files 300000
+
+      - name: Profile the GUI thread while typing
+        run: |
+          sysctl -n hw.ncpu machdep.cpu.brand_string || true
+          uv run python benchmarks/bench_app.py --tree "$RUNNER_TEMP/tree300k"             --profile-gui "prof-out/${{ matrix.os }}-${{ matrix.qpa }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          f="prof-out/${{ matrix.os }}-${{ matrix.qpa }}/gui-profile.txt"
+          {
+            echo "### GUI profile (${{ matrix.os }}, ${{ matrix.qpa }})"
+            echo '```'
+            if [ -f "$f" ]; then head -c 400000 "$f"; else echo "no report"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: profile-${{ matrix.os }}-${{ matrix.qpa }}
+          path: prof-out/
+          if-no-files-found: warn
 
   release:
     name: Publish release
