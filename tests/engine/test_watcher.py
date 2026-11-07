@@ -142,7 +142,9 @@ def test_history_and_index_db_writes_queue_nothing(tmp_path):
                     fh.write(b"x" * 100)
         time.sleep(1.0)
         assert w.events_seen > 0                 # events did arrive ...
-        assert w.events_kept == 0 and w.coalescer.pending == 0 and not sink.batches   # ... and were all dropped
+        kept = list(w.recent_kept)
+        assert w.events_kept == 0 and w.coalescer.pending == 0 and not sink.batches, (
+            f"kept {w.events_kept} of {w.events_seen} events: {kept}")   # ... and were all dropped
         (root / "real.txt").write_text("x")
         assert sink.ev.wait(3)
         assert any(p.endswith("real.txt") for b in sink.batches for p in b.paths)

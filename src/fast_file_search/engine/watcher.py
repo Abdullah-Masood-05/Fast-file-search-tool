@@ -18,6 +18,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from .exclusions import PACKAGE_SUFFIXES, Exclusions, dedupe_roots, path_key, sep_of
@@ -219,6 +220,8 @@ class Watcher:
         self._limit_logged = False
         self.events_seen = 0
         self.events_kept = 0
+        # (kind, path, is_dir) of the latest kept events, for diagnostics and tests
+        self.recent_kept: deque = deque(maxlen=32)
 
     # -------------------------------------------------------------- roots
     def set_roots(self, roots: Iterable[str], check_exists: bool = True) -> List[str]:
@@ -344,6 +347,7 @@ class Watcher:
             else:
                 return False
             self.events_kept += 1
+            self.recent_kept.append((kind, d or s, is_dir))
             return True
         if kind == "modified" and is_dir:
             if not self._keep_dir_modified:
@@ -353,12 +357,14 @@ class Watcher:
                 return False
             self.coalescer.add(p, DIR)
             self.events_kept += 1
+            self.recent_kept.append((kind, p, True))
             return True
         p = self.accept(src)
         if p is None:
             return False
         self.coalescer.add(p, FILE)
         self.events_kept += 1
+        self.recent_kept.append((kind, p, is_dir))
         return True
 
     def collapse(self, dirs: Iterable[str]) -> List[str]:
