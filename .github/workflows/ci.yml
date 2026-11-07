@@ -318,6 +318,13 @@ jobs:
             libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-image0 \
             libxcb-randr0 libxcb-render-util0 libxcb-xkb1
 
+      # The benchmark window is headless and in the background, so macOS App Nap would
+      # throttle its timers; a user's foreground window isn't napped. Turn it off so the
+      # numbers measure the app, not the throttling.
+      - name: Disable App Nap (macOS)
+        if: runner.os == 'macOS'
+        run: defaults write NSGlobalDomain NSAppSleepDisabled -bool YES
+
       - name: Install dependencies
         run: uv sync --locked
 
