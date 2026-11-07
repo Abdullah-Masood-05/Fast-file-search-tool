@@ -362,6 +362,10 @@ class Watcher:
         p = self.accept(src)
         if p is None:
             return False
+        if kind == "created" and is_dir and self.map_path(src)[1].spelling is p:
+            # FSEvents replays the creation of a root that was made just before the
+            # stream started; the root exists by definition, so there is nothing to do.
+            return False
         self.coalescer.add(p, FILE)
         self.events_kept += 1
         self.recent_kept.append((kind, p, is_dir))

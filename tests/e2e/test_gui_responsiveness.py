@@ -29,7 +29,14 @@ from fast_file_search.utils.platform_utils import redirect_qt_settings  # noqa: 
 from gen_tree import generate  # noqa: E402
 
 ON_CI = bool(os.environ.get("CI"))
-P99_LIMIT, MAX_LIMIT = (40.0, 80.0) if ON_CI else (30.0, 50.0)
+# macOS CI runners throttle timers of the (background, headless) test app, which shows
+# up as a steady ~45 ms lateness rather than stalls; the max limit still catches freezes.
+if ON_CI and sys.platform == "darwin":
+    P99_LIMIT, MAX_LIMIT = 60.0, 80.0
+elif ON_CI:
+    P99_LIMIT, MAX_LIMIT = 40.0, 80.0
+else:
+    P99_LIMIT, MAX_LIMIT = 30.0, 50.0
 WORDS = ["gifttop", "index", "readme", "lodash", "userprofile", "zzzqq", "button", "invoice"]
 
 

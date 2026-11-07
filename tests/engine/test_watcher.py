@@ -134,14 +134,25 @@ def test_history_and_index_db_writes_queue_nothing(tmp_path):
     w.set_roots([str(root)])
     assert w.start() == {str(root): "on"}
     try:
-        time.sleep(0.2)
+        # FSEvents can deliver events from just before the stream started (the mkdirs
+        # above, reported as the root itself). Let them flush, then measure only the
+        # database writes.
+        time.sleep(1.0)
+        deadline = time.monotonic() + 3
+        while w.coalescer.pending and time.monotonic() < deadline:
+            time.sleep(0.05)
+        w.events_kept = 0
+        w.recent_kept.clear()
+        sink.batches.clear()
+        sink.ev.clear()
+        seen_before = w.events_seen
         for i in range(30):
             for p in (cache / "index-v5.db", cache / "index-v5.db-wal", data / "search_history.db",
                       data / "search_history.db-journal"):
                 with open(p, "ab") as fh:
                     fh.write(b"x" * 100)
         time.sleep(1.0)
-        assert w.events_seen > 0                 # events did arrive ...
+        assert w.events_seen > seen_before       # events did arrive ...
         kept = list(w.recent_kept)
         assert w.events_kept == 0 and w.coalescer.pending == 0 and not sink.batches, (
             f"kept {w.events_kept} of {w.events_seen} events: {kept}")   # ... and were all dropped
@@ -382,3 +393,15 @@ def test_feed_cost_per_event(perf_scale):
         assert dt < 0.2 * perf_scale, f"{dt * 1e6 / len(evs):.2f} us/event"
     finally:
         w.stop()
+
+
+def test_created_event_for_the_root_itself_is_ignored(tmp_path):
+    """FSEvents can replay the creation of a root made just before the stream started."""
+    root = tmp_path / "root"
+    root.mkdir()
+    w = Watcher(Exclusions(), Sink(), quiet=0.2, max_wait=1.0)
+    w.set_roots([str(root)])
+    assert not w.feed("created", str(root), True)
+    assert w.feed("modified", str(root), True) == (w._keep_dir_modified is True)
+    assert w.feed("created", str(root / "new.txt"))
+    assert w.coalescer.pending == (2 if w._keep_dir_modified else 1)
