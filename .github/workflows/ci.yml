@@ -382,6 +382,7 @@ jobs:
         qpa: [offscreen, cocoa]
     env:
       QT_QPA_PLATFORM: ${{ matrix.qpa }}
+      PYTHONFAULTHANDLER: '1'
     defaults:
       run:
         shell: bash

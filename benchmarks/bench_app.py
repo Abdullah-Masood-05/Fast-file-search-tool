@@ -487,7 +487,7 @@ def profile_typing(typing_pass, ev_wait, probe, sampler, gp, prof_dir: Path) -> 
         print(f"profile pass {name}: {res['keystroke_to_results_ms']} heartbeat {res['heartbeat']}", flush=True)
         return res
 
-    first = run_pass("qwait", 3, True)
+    run_pass("qwait", 3, True)
     run_pass("evloop", 2, False, ev_wait)
     sampler.paused = True
     pr = cProfile.Profile()
@@ -501,13 +501,14 @@ def profile_typing(typing_pass, ev_wait, probe, sampler, gp, prof_dir: Path) -> 
     prof_dir.mkdir(parents=True, exist_ok=True)
     pr.dump_stats(str(prof_dir / "gui-cprofile.pstats"))
     if sys.platform == "darwin":
-        secs = first["seconds"] * 2 / 3 + 4
+        # Sampled with real event-loop waits (what the app runs); ends just before the pass does.
+        secs = max(5, prof["passes"]["evloop"]["seconds"] * 0.9)
         path = str(prof_dir / "native-sample.txt")
         proc = gp.start_native_sample(secs, path)
         if proc is None:
             prof["native"] = "(could not start /usr/bin/sample)"
         else:
-            run_pass("native", 2, False)
+            run_pass("native", 2, False, ev_wait)
             try:
                 proc.wait(timeout=secs + 60)
             except subprocess.TimeoutExpired:
