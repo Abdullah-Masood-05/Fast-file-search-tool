@@ -60,7 +60,9 @@ _R_HTEXT = QPalette.ColorRole.HighlightedText
 _ALIGN_RIGHT = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 _ALIGN_LEFT = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 _NO_FLAGS = Qt.ItemFlag.NoItemFlags
-_ITEM_FLAGS = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
+# ItemNeverHasChildren: a flat list, so the tree view never asks hasChildren() per row while laying out.
+_ITEM_FLAGS = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
+               | Qt.ItemFlag.ItemNeverHasChildren)
 _LAYOUT_ARGS = ('QList<QPersistentModelIndex>', 'QAbstractItemModel::LayoutChangeHint')
 _NATIVE_SEP = os.sep
 
@@ -133,6 +135,7 @@ class ResultsModel(QAbstractTableModel):
         self.gen = -1
         self._disp: List[Optional[tuple]] = []
         self._in_flight = False
+        self._fetch_held = 0           # > 0 while the view lays out its items (see ResultsView.doItemsLayout)
         self.root_names: Dict[int, str] = {}
         self.root_paths: Dict[int, str] = {}
         self.prefix_root = False
@@ -236,7 +239,16 @@ class ResultsModel(QAbstractTableModel):
 
     # -- paging
     def canFetchMore(self, parent=QModelIndex()) -> bool:  # noqa: N802
-        return not parent.isValid() and not self._in_flight and len(self.rows) < self.total and self.gen >= 0
+        return (not self._fetch_held and not parent.isValid() and not self._in_flight
+                and len(self.rows) < self.total and self.gen >= 0)
+
+    def hold_fetch(self, on: bool) -> None:
+        """While held, ``canFetchMore`` is False. QTreeView's item layout calls ``fetchMore``
+        whenever the model can fetch, whatever is on screen, so without this every reset and
+        every appended page pulled the next page: the list loaded every result, 500 at a time,
+        with a full relayout of all rows per page. Pages now load only when the user scrolls
+        to the end (or the list does not fill the view)."""
+        self._fetch_held += 1 if on else -1
 
     def fetchMore(self, parent=QModelIndex()) -> None:  # noqa: N802
         if not self.canFetchMore(parent):
@@ -458,6 +470,17 @@ class ResultsView(QTreeView):
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.setSortingEnabled(False)
+
+    def doItemsLayout(self):  # noqa: N802
+        hold = getattr(self.model(), "hold_fetch", None)
+        if hold is None:
+            super().doItemsLayout()
+            return
+        hold(True)
+        try:
+            super().doItemsLayout()
+        finally:
+            hold(False)
 
     def keyPressEvent(self, event: QKeyEvent):  # noqa: N802
         key = event.key()

@@ -88,6 +88,70 @@ def test_fetch_more_pages_until_total_one_in_flight(window, qtbot):
     assert len({r.id for r in m.rows}) == 1350
 
 
+def _paged_pane(qtbot, height):
+    """A shown ResultsPane whose model answers fetch requests with 500-row pages of a 5,000 total."""
+    pane = ResultsPane()
+    qtbot.addWidget(pane)
+    pane.resize(700, height)
+    pane.show()
+    pane.show_results()
+    m = pane.model
+    asked = []
+
+    def deliver(gen, offset):
+        asked.append(offset)
+        m.append_page(_res(gen, _rows(500, offset), total=5000, offset=offset))
+    m.fetch_requested.connect(deliver)
+    qtbot.waitExposed(pane)
+    return pane, m, asked
+
+
+def test_new_result_does_not_pull_more_pages_while_the_list_is_at_the_top(qtbot):
+    # QTreeView's item layout calls fetchMore whenever it can; that used to load every page
+    # (and relayout every row) after each keystroke.
+    pane, m, asked = _paged_pane(qtbot, 500)
+    for gen in (1, 2, 3):
+        m.set_result(_res(gen, _rows(200), total=5000))
+        qtbot.wait(150)
+        assert m.rowCount() == 200 and asked == []
+    m.apply_refresh(_res(3, _rows(200), total=5000, refresh=True))
+    qtbot.wait(100)
+    assert m.rowCount() == 200 and asked == []
+
+
+def test_scrolling_to_the_end_loads_one_page_at_a_time(qtbot):
+    pane, m, asked = _paged_pane(qtbot, 500)
+    m.set_result(_res(1, _rows(200), total=5000))
+    qtbot.wait(100)
+    sb = pane.view.verticalScrollBar()
+    sb.setValue(sb.maximum())
+    qtbot.waitUntil(lambda: m.rowCount() == 700, timeout=2000)
+    qtbot.wait(150)
+    assert asked == [200] and m.rowCount() == 700          # the appended page does not chain into the next
+    sb.setValue(sb.maximum())
+    qtbot.waitUntil(lambda: m.rowCount() == 1200, timeout=2000)
+    assert asked == [200, 700]
+    assert not m._fetch_held
+
+
+def test_a_list_shorter_than_the_view_still_fills_it(qtbot):
+    pane, m, asked = _paged_pane(qtbot, 900)
+    m.set_result(_res(1, _rows(5), total=5000))
+    qtbot.waitUntil(lambda: asked == [5], timeout=2000)
+    qtbot.wait(150)
+    assert m.rowCount() == 505 and asked == [5]
+
+
+def test_item_flags_mark_a_flat_draggable_list(qapp):
+    m = ResultsModel()
+    m.set_result(_res(1, _rows(3)))
+    f = m.flags(m.index(0, NAME))
+    for flag in (Qt.ItemFlag.ItemIsEnabled, Qt.ItemFlag.ItemIsSelectable, Qt.ItemFlag.ItemIsDragEnabled,
+                 Qt.ItemFlag.ItemNeverHasChildren):
+        assert f & flag
+    assert not m.flags(QModelIndex()) & Qt.ItemFlag.ItemIsEnabled
+
+
 def test_stale_page_is_ignored(qapp):
     m = ResultsModel()
     m.set_result(_res(5, _rows(200), total=900))
