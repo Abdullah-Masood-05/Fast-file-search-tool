@@ -898,6 +898,7 @@ class Engine:
     def _commit(self) -> None:
         if not self._ops:
             self._t_first_op = None
+            self._dirty_dirs.clear()             # the diffs since the last commit changed nothing
             return
         ops, self._ops = self._ops, []
         self._t_first_op = None
