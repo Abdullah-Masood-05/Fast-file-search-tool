@@ -195,6 +195,19 @@ def _run_app(driver_factory, out_path: Path, out: dict, probe=None) -> int:
     return 0
 
 
+def wait_ms(ms: int) -> None:
+    """Run the Qt event loop for ``ms`` (what the app does between events).
+
+    Not ``QTest.qWait``: PySide's qWait holds the GIL for the whole wait (processEvents plus
+    10 ms sleeps), so the engine client's sender and reader threads cannot run until it
+    returns. That delayed every request and result by up to the wait (on the macOS runners a
+    17 ms search took 220 ms to reach the GUI) and made the heartbeat late by the sleeps."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    loop = QEventLoop()
+    QTimer.singleShot(int(ms), loop.quit)
+    loop.exec()
+
+
 def _is_idle(win):
     st = win._status
     return (st is not None and st.state == "idle" and bool(st.roots)
@@ -206,7 +219,6 @@ def child_startup(sandbox: Path, out_path: Path) -> int:
     t0 = float(os.environ["BENCH_T0"])
     _child_common(sandbox, None)
     from PySide6.QtCore import QEvent, QObject
-    from PySide6.QtTest import QTest
 
     out: dict = {}
     marks: dict = {}
@@ -228,8 +240,8 @@ def child_startup(sandbox: Path, out_path: Path) -> int:
         client.ready.connect(lambda r: client.search("gif", suggestions=False))
         end = time.monotonic() + 60
         while time.monotonic() < end and "results" not in marks:
-            QTest.qWait(5)
-        QTest.qWait(500)
+            wait_ms(5)
+        wait_ms(500)
         out["first_paint_ms"] = (marks.get("paint", float("nan")) - t0) * 1000
         out["ready_ms"] = (marks.get("ready", float("nan")) - t0) * 1000
         out["first_results_ms"] = (marks.get("results", float("nan")) - t0) * 1000
@@ -293,7 +305,7 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
         # ---- fresh index while typing
         end = time.monotonic() + 120
         while not client.is_ready and time.monotonic() < end:
-            QTest.qWait(5)
+            wait_ms(5)
         t_ready = time.perf_counter()
         out["spawn_to_ready_ms"] = getattr(client, "spawn_to_ready_ms", None)
         keys, w, key_ms = 0, 0, []
@@ -308,8 +320,8 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
                 key(f, ch)
                 key_ms.append((time.perf_counter() - t) * 1000)
                 keys += 1
-                QTest.qWait(90)
-            QTest.qWait(150)
+                wait_ms(90)
+            wait_ms(150)
         t_idle = time.perf_counter()
         st = win._status
         out["index"] = {"entries": st.total_entries, "folders": st.total_folders,
@@ -321,7 +333,7 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
         out["rss_after_index_gui_mb"] = rss_mb()
         out["rss_after_index_engine_mb"] = rss_mb(client.engine_pid)
         print("index:", out["index"], flush=True)
-        QTest.qWait(1000)
+        wait_ms(1000)
 
         # ---- search latency through the client (no UI debounce)
         got = {}
@@ -359,7 +371,7 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
                 if rep >= 2:                      # two warm-up rounds
                     lat[name].append((t2 - t) * 1000)
                     engine_ms[name].append(res.elapsed_ms)
-                QTest.qWait(5)
+                wait_ms(5)
         client.search_result.disconnect(on_res)
         allv = [x for v in lat.values() for x in v]
         out["search_client_ms"] = {
@@ -371,13 +383,7 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
         print("search through the client:", out["search_client_all"], flush=True)
 
         # ---- keystroke -> results on screen, heartbeat running
-        def ev_wait(ms):
-            """Wait in a real event loop (what the app runs), not QTest.qWait's processEvents + 10 ms sleeps."""
-            loop = QEventLoop()
-            QTimer.singleShot(ms, loop.quit)
-            loop.exec()
-
-        def typing_pass(reps, drop_first, wait=QTest.qWait):
+        def typing_pass(reps, drop_first, wait=wait_ms):
             kr, words, over = {}, [], []
 
             def pause(ms):
@@ -417,8 +423,8 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
             out["keystroke_to_results_ms"] = res["keystroke_to_results_ms"]
             out["heartbeat_typing_idle"] = res["heartbeat"]
         else:
-            out["profile"] = profile_typing(typing_pass, ev_wait, probe, sampler, gp, Path(prof_dir))
-            first = out["profile"]["passes"]["qwait"]
+            out["profile"] = profile_typing(typing_pass, QTest.qWait, probe, sampler, gp, Path(prof_dir))
+            first = out["profile"]["passes"]["evloop"]
             out["keystroke_to_results_ms"] = first["keystroke_to_results_ms"]
             out["heartbeat_typing_idle"] = first["heartbeat"]
         print("keystroke -> results:", out["keystroke_to_results_ms"], flush=True)
@@ -445,11 +451,11 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
             g = client.search(token, suggestions=False, limit=1)
             e2 = time.monotonic() + 5
             while g not in gen_box and time.monotonic() < e2:
-                QTest.qWait(5)
+                wait_ms(5)
             if gen_box.get(g) == burst_files:
                 seen_at = time.perf_counter()
                 break
-            QTest.qWait(50)
+            wait_ms(50)
         client.search_result.disconnect(on_burst)
         out["watcher_burst"] = {"files": burst_files, "write_s": round(t_written - t_burst, 2),
                                 "searchable_after_write_s": round(seen_at - t_written, 2) if seen_at else None,
@@ -464,9 +470,10 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
     return _run_app(driver, out_path, out, probe)
 
 
-def profile_typing(typing_pass, ev_wait, probe, sampler, gp, prof_dir: Path) -> dict:
-    """The typing-on-an-idle-index scenario four times: QTest.qWait waits (the normal benchmark),
-    real event-loop waits, under cProfile, and (macOS) under /usr/bin/sample."""
+def profile_typing(typing_pass, qwait, probe, sampler, gp, prof_dir: Path) -> dict:
+    """The typing-on-an-idle-index scenario four times: event-loop waits (the normal benchmark),
+    QTest.qWait waits (for comparison: qWait holds the GIL), under cProfile, and (macOS) under
+    /usr/bin/sample."""
     import cProfile
     from PySide6 import __version__ as pyside
     from PySide6.QtCore import qVersion
@@ -487,8 +494,8 @@ def profile_typing(typing_pass, ev_wait, probe, sampler, gp, prof_dir: Path) -> 
         print(f"profile pass {name}: {res['keystroke_to_results_ms']} heartbeat {res['heartbeat']}", flush=True)
         return res
 
-    run_pass("qwait", 3, True)
-    run_pass("evloop", 2, False, ev_wait)
+    run_pass("evloop", 3, True)
+    run_pass("qwait", 2, False, qwait)
     sampler.paused = True
     pr = cProfile.Profile()
     pr.enable()
@@ -502,13 +509,13 @@ def profile_typing(typing_pass, ev_wait, probe, sampler, gp, prof_dir: Path) -> 
     pr.dump_stats(str(prof_dir / "gui-cprofile.pstats"))
     if sys.platform == "darwin":
         # Sampled with real event-loop waits (what the app runs); ends just before the pass does.
-        secs = max(5, prof["passes"]["evloop"]["seconds"] * 0.9)
+        secs = max(5, prof["passes"]["evloop"]["seconds"] * 2 / 3 * 0.9)
         path = str(prof_dir / "native-sample.txt")
         proc = gp.start_native_sample(secs, path)
         if proc is None:
             prof["native"] = "(could not start /usr/bin/sample)"
         else:
-            run_pass("native", 2, False, ev_wait)
+            run_pass("native", 2, False)
             try:
                 proc.wait(timeout=secs + 60)
             except subprocess.TimeoutExpired:
@@ -715,6 +722,9 @@ def profile_gui(args) -> int:
                       timeout=3600)
         finally:
             os.environ.pop("BENCH_PROFILE_DIR", None)
+            for log in sandbox.rglob("*.log"):          # app logs and faulthandler crash logs
+                (prof_dir / "logs").mkdir(exist_ok=True)
+                shutil.copy2(log, prof_dir / "logs" / log.name)
         run = json.loads((prof_dir / "run.json").read_text(encoding="utf-8"))
         if "error" in run:
             raise RuntimeError("benchmark driver failed:\n" + run["error"])
