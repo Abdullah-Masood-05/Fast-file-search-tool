@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,6 +65,24 @@ IDLE_FOR_PERIODIC = 60.0     # no search for this long before a periodic rescan
 LIMITED_RESCAN_MIN = 15
 
 _CORRUPT_WORDS = ("malformed", "not a database", "disk image", "corrupt", "encrypted")
+MAX_RECOVERIES = 3           # writer errors resynced per RECOVERY_WINDOW before the engine gives up
+RECOVERY_WINDOW = 60.0
+
+
+def _is_conflict(exc: BaseException) -> bool:
+    """A UNIQUE constraint violation (two rows for one name in a folder)."""
+    return "UNIQUE constraint failed" in str(exc)
+
+
+def name_key(name: str, platform: str = sys.platform) -> str:
+    """Comparison key for one file name under the platform's rules: case-insensitive on
+    Windows and macOS, and Unicode-normalization-insensitive on macOS (APFS/HFS+ accept a
+    name in NFC or NFD for the same file). Exact elsewhere."""
+    if platform == "darwin":
+        return name.lower() if name.isascii() else unicodedata.normalize("NFC", name).casefold()
+    if platform == "win32":
+        return name.lower() if name.isascii() else name.casefold()
+    return name
 
 
 def _load_core():
@@ -143,8 +162,9 @@ class _Scan:
     long-lived per-root watcher scan ('flush': one-level re-lists, new folders walked)."""
 
     def __init__(self, root_id: int, path: str, mode: str, background: bool, ctx: WalkContext,
-                 first: bool = False):
+                 first: bool = False, epoch: int = 0):
         self.root_id = root_id
+        self.epoch = epoch           # Engine._epoch at creation: listings of older walks are dropped
         self.path = path
         self.mode = mode
         self.background = background
@@ -489,6 +509,18 @@ class Engine:
         self._t_first_op: Optional[float] = None
         self._touched: Dict[int, float] = {}
         self._relisted: set = set()
+        # Every listing is diffed against the *committed* children of its dir, so two diffs
+        # of one dir must never share a commit window, and a walk task that was queued as
+        # "new" (every entry an INS) must not run as such once anything else filled its dir:
+        self._new_dirs: set = set()              # dir ids with a queued "new" walk task
+        self._dirty_dirs: set = set()            # dir ids diffed since the last commit
+        self._ren_dst: set = set()               # (dir key, name key) of uncommitted REN targets
+        self._fold_cache: Dict[int, Dict[str, list]] = {}   # dir id -> name key -> children
+        self._alias: Dict[int, int] = {}         # dir id resolved into another at a commit
+        self._epoch = 0                          # bumped by a writer resync: older walks are void
+        self._recoveries: List[float] = []
+        self._mem_behind = False                 # a commit reached the Store but not the MemIndex
+        self._folds = sys.platform in ("darwin", "win32")
         # path_key(dir) -> monotonic time a watcher event at or directly below it was applied
         self._recent_dirs: Dict[str, float] = {}
         self._gen = 0
@@ -521,7 +553,8 @@ class Engine:
         self._status = threading.Thread(target=self._status_main, name="ffs-status", daemon=True)
         self.t_created = time.perf_counter()
         self.t_ready: Optional[float] = None
-        self.stats = SimpleNamespace(listings=0, commits=0, ops=0, batches=0, batch_ops=0, flush_s=0.0)
+        self.stats = SimpleNamespace(listings=0, commits=0, ops=0, batches=0, batch_ops=0, flush_s=0.0,
+                                     conflicts=0, recoveries=0)
 
     # ------------------------------------------------------------------ public API
     def start(self) -> None:
@@ -741,51 +774,91 @@ class Engine:
                 self._start_scan(rid, "full", background=True)
 
     def _writer_loop(self) -> None:
-        wq = self._wq
         while not self._stop.is_set():
-            if self._ops:
-                timeout = max(0.0, (self._t_first_op or time.monotonic()) + BATCH_SECS - time.monotonic())
-            elif self._warm_pending or self._snapshot_due:
-                timeout = 0.02
-            else:
-                timeout = 0.5
             try:
-                item = wq.get(timeout=timeout)
-            except queue.Empty:
-                item = None
-                if not self._ops:
-                    if self._snapshot_due and not self.activity.recently_active(2.0) and not self._scans_active():
-                        self._snapshot_due = False
-                        self._save_snapshot()
-                    elif self._warm_pending:
-                        self._warm_step()
-            if item is not None:
-                if item[0] == "stop":
+                if self._writer_step():
                     break
-                if item[0] == "L":
-                    self.activity.wait(self._stop)
-                try:
-                    self._dispatch(item)
-                except Exception as exc:
-                    if self._is_corrupt(exc):
-                        self._recover_store(exc)
-                    else:
-                        raise
-                if self._ops and self._t_first_op is None:
-                    self._t_first_op = time.monotonic()
-            if self._ops:
-                now = time.monotonic()
-                # smaller batches while the user types: MemIndex.apply holds the index lock
-                limit = (BATCH_ROWS_ACTIVE if self.activity.recently_active()
-                         else BATCH_ROWS_FIRST if self._fast_writes else BATCH_ROWS)
-                if (len(self._ops) >= limit or now - self._t_first_op >= BATCH_SECS
-                        or (wq.empty() and self.pool.idle())):
-                    self.activity.wait(self._stop)
-                    self._commit_safe()
+            except Exception as exc:
+                if self._is_corrupt(exc):
+                    self._recover_store(exc)
+                else:
+                    self._recover_writer(exc)
+
+    def _writer_step(self) -> bool:
+        """One wait / dispatch / commit round of the writer loop. True on "stop"."""
+        wq = self._wq
+        if self._ops:
+            timeout = max(0.0, (self._t_first_op or time.monotonic()) + BATCH_SECS - time.monotonic())
+        elif self._warm_pending or self._snapshot_due:
+            timeout = 0.02
+        else:
+            timeout = 0.5
+        try:
+            item = wq.get(timeout=timeout)
+        except queue.Empty:
+            item = None
+            if not self._ops:
+                if self._snapshot_due and not self.activity.recently_active(2.0) and not self._scans_active():
+                    self._snapshot_due = False
+                    self._save_snapshot()
+                elif self._warm_pending:
+                    self._warm_step()
+        if item is not None:
+            if item[0] == "stop":
+                return True
+            if item[0] == "L":
+                self.activity.wait(self._stop)
+            self._dispatch(item)
+            if self._ops and self._t_first_op is None:
+                self._t_first_op = time.monotonic()
+        if self._ops:
             now = time.monotonic()
-            if now - self._last_housekeeping >= 0.5:
-                self._last_housekeeping = now
-                self._housekeeping(now)
+            # smaller batches while the user types: MemIndex.apply holds the index lock
+            limit = (BATCH_ROWS_ACTIVE if self.activity.recently_active()
+                     else BATCH_ROWS_FIRST if self._fast_writes else BATCH_ROWS)
+            if (len(self._ops) >= limit or now - self._t_first_op >= BATCH_SECS
+                    or (wq.empty() and self.pool.idle())):
+                self.activity.wait(self._stop)
+                self._commit()
+        now = time.monotonic()
+        if now - self._last_housekeeping >= 0.5:
+            self._last_housekeeping = now
+            self._housekeeping(now)
+        return False
+
+    def _recover_writer(self, exc: BaseException) -> None:
+        """An unexpected error while applying a listing, a watcher batch or a commit. The
+        uncommitted ops are dropped (a failed commit is rolled back as a whole), every walk
+        in flight is voided, the MemIndex is rebuilt if it may differ from the Store, and
+        every root is rescanned incrementally: the index converges on the disk again
+        instead of the engine dying with a half-applied batch. Repeated failures (more than
+        MAX_RECOVERIES within RECOVERY_WINDOW) are fatal."""
+        now = time.monotonic()
+        self._recoveries = [t for t in self._recoveries if now - t < RECOVERY_WINDOW] + [now]
+        if len(self._recoveries) > MAX_RECOVERIES or self.store is None:
+            raise exc
+        _log.error("index writer error, resyncing with a rescan: %s", exc,
+                   exc_info=(type(exc), exc, exc.__traceback__))
+        self.stats.recoveries += 1
+        self._ops = []
+        self._t_first_op = None
+        self._cancel_scans()
+        if self._mem_behind or getattr(self.mem, "generation", None) != self.store.generation:
+            self.mem = self.core.MemIndex.build(self.store)
+            self._mem_behind = False
+            self._snap_gen = -1
+        self._gen = self.store.generation
+        for rid in list(self._root_order):
+            self._start_scan(rid, "full", background=True)
+        self._status_dirty = True
+
+    def _reset_pending(self) -> None:
+        self._new_dirs.clear()
+        self._dirty_dirs.clear()
+        self._ren_dst.clear()
+        self._fold_cache.clear()
+        self._alias.clear()
+        self._touched.clear()
 
     def _warm_step(self) -> None:
         """MemIndex.warm(): precompute lazy columns in small slices while idle, so the
@@ -822,28 +895,104 @@ class Engine:
         self._wq.put(("L", lst))
 
     # ------------------------------------------------------------------ commits
-    def _commit_safe(self) -> None:
-        try:
-            self._commit()
-        except Exception as exc:
-            if self._is_corrupt(exc):
-                self._recover_store(exc)
-            else:
-                raise
-
     def _commit(self) -> None:
         if not self._ops:
             self._t_first_op = None
             return
         ops, self._ops = self._ops, []
         self._t_first_op = None
-        gen = self.store.apply(ops)
+        try:
+            gen = self.store.apply(ops)
+        except Exception as exc:
+            if not _is_conflict(exc):
+                raise
+            # rolled back as a whole: resolve the duplicate names, then apply the same
+            # rewritten ops to the Store and the MemIndex
+            _log.warning("commit conflict (%s): resolving duplicate names", exc)
+            self.stats.conflicts += 1
+            ops = self._resolve_conflicts(ops)
+            gen = self.store.apply(ops)
+        self._dirty_dirs.clear()
+        self._ren_dst.clear()
+        self._fold_cache.clear()
+        self._mem_behind = True
         self.mem.apply(ops, gen)
+        self._mem_behind = False
+        if (self._new_dirs or self._alias) and (self.pool is None or self.pool.idle()):
+            self._new_dirs.clear()               # no walk task is left that could name them
+            self._alias.clear()
         self._gen = gen
         self._warm_pending = True
         self.stats.commits += 1
         self.stats.ops += len(ops)
         self._status_dirty = True
+
+    def _resolve_conflicts(self, ops: list) -> list:
+        """Rewrite ``ops`` so that no (dir, name) is claimed twice. An INS of a name that
+        exists (in the Store or earlier in ``ops``) becomes an UPD of the existing entry
+        (DEL + INS when one is a folder and the other is not); later ops naming the dropped
+        id follow the surviving one (``_alias`` redirects queued walk tasks too). A REN onto
+        a taken name deletes the entry it replaces first, as the rename did on disk."""
+        O = self.core.ops
+        INS, UPD, REN, DEL, DIR = O.INS, O.UPD, O.REN, O.DEL, O.DIR
+        store = self.store
+        alias = self._alias
+        names: Dict[tuple, tuple] = {}           # (dir, name) -> (id, flags) as of the ops so far
+        gone: set = set()                        # ids deleted or renamed away by the ops so far
+        out: list = []
+
+        def holder(did: int, name: str):
+            h = names.get((did, name))
+            if h is not None:
+                return h
+            row = store.entry_lookup(did, name)
+            return None if row is None or row[0] in gone else (row[0], row[4])
+
+        def release(i: int) -> None:
+            gone.add(i)
+            for k in [k for k, v in names.items() if v[0] == i]:
+                del names[k]
+
+        for o in ops:
+            code = o[0]
+            if code == INS:
+                _, i, did, name, size, mtime, ctime, flags = o
+                did = alias.get(did, did)
+                h = holder(did, name)
+                if h is not None:
+                    e, efl = h
+                    if efl is not None and not (efl ^ flags) & FOLDER:
+                        alias[i] = e
+                        out.append((UPD, e, size, mtime, ctime, flags | (efl & UNREADABLE)))
+                        continue
+                    out.append((DEL, e))
+                    release(e)
+                names[(did, name)] = (i, flags)
+                out.append((INS, i, did, name, size, mtime, ctime, flags))
+            elif code == DIR:
+                if o[1] in alias:
+                    continue                     # the surviving folder has its dirs row
+                out.append((DIR, o[1], alias.get(o[2], o[2])) + tuple(o[3:]))
+            elif code == REN:
+                _, i, did, name = o
+                i, did = alias.get(i, i), alias.get(did, did)
+                h = holder(did, name)
+                if h is not None and h[0] != i:
+                    out.append((DEL, h[0]))
+                    release(h[0])
+                release(i)
+                gone.discard(i)
+                names[(did, name)] = (i, None)   # kind unknown here: a later INS replaces it
+                out.append((REN, i, did, name))
+            elif code == DEL:
+                i = alias.get(o[1], o[1])
+                release(i)
+                out.append((DEL, i))
+            elif code == O.ROOTDEL:
+                out.append(o)
+            else:                                # UPD, DIRPATH, DIRMTIME: (code, id, ...)
+                out.append((code, alias.get(o[1], o[1])) + tuple(o[2:]))
+        return out
 
     def _commit_root_state(self, rid: int, **fields) -> None:
         self._commit()
@@ -868,6 +1017,7 @@ class Engine:
     def _recover_store(self, exc: BaseException) -> None:
         _log.error("index DB corrupt (%s): quarantining and rebuilding", exc)
         self._ops = []
+        self._t_first_op = None
         self._cancel_scans()
         try:
             self.store.close(clean=False)
@@ -1051,9 +1201,10 @@ class Engine:
                     s.cancelled = True
             ri.scan = None
             ri.flush_scan = None
+        self._epoch += 1                         # voids subtree walks and listings in flight too
         if self.pool is not None:
             self.pool.remove(lambda t: True)
-        self._touched.clear()
+        self._reset_pending()
 
     # ------------------------------------------------------------------ scans
     def _ctx(self, ri: _RootInfo) -> WalkContext:
@@ -1072,7 +1223,7 @@ class Engine:
             old.cancelled = True
             self.pool.remove(lambda t, o=old: t.scan is o)
         first = ri.state == "new" or not ri.complete
-        scan = _Scan(rid, ri.path, mode, background, self._ctx(ri), first=first)
+        scan = _Scan(rid, ri.path, mode, background, self._ctx(ri), first=first, epoch=self._epoch)
         ri.scan = scan
         if mode == "full":
             ri.needs_full = False
@@ -1095,7 +1246,7 @@ class Engine:
         ri = self._roots.get(rid)
         if ri is None or self.pool is None:
             return
-        scan = _Scan(rid, ri.path, "sub", False, self._ctx(ri))
+        scan = _Scan(rid, ri.path, "sub", False, self._ctx(ri), epoch=self._epoch)
         scan.outstanding = 1
         self.pool.push([DirTask(dir_id, path, 1, False, (), scan)])
 
@@ -1103,8 +1254,9 @@ class Engine:
         ri = self._roots.get(rid)
         if ri is None:
             return None
-        if ri.flush_scan is None or ri.flush_scan.cancelled or ri.flush_scan.ctx.ex is not self.ex:
-            ri.flush_scan = _Scan(rid, ri.path, "flush", False, self._ctx(ri))
+        fs = ri.flush_scan
+        if fs is None or fs.cancelled or fs.ctx.ex is not self.ex or fs.epoch != self._epoch:
+            ri.flush_scan = _Scan(rid, ri.path, "flush", False, self._ctx(ri), epoch=self._epoch)
         return ri.flush_scan
 
     def _update_partial(self) -> None:
@@ -1127,9 +1279,13 @@ class Engine:
         task = lst.task
         scan = task.scan
         self.stats.listings += 1
-        if scan.cancelled:
+        if scan.cancelled or scan.epoch != self._epoch:
+            self._new_dirs.discard(task.dir_id)
             self._task_done(scan, 0)
             return
+        if self._alias and task.dir_id in self._alias:
+            # the dir's INS was resolved into an existing folder at a commit
+            task = task._replace(dir_id=self._alias[task.dir_id], is_new=False)
         is_new = task.is_new
         if self._touched:
             t_touch = self._touched.get(task.dir_id)
@@ -1139,6 +1295,7 @@ class Engine:
                     self.pool.push([task._replace(is_new=False)])
                     return
                 is_new = False
+        is_new = self._claim(task.dir_id, is_new)
         if lst.error is not None:
             self._on_list_error(task, lst.error)
             n = 0
@@ -1148,6 +1305,25 @@ class Engine:
                 self.pool.push(children)
             n = len(children)
         self._task_done(scan, n)
+
+    def _claim(self, did: int, is_new: bool = False) -> bool:
+        """Call before diffing dir ``did``; returns the effective ``is_new``. Every diff
+        reads the *committed* children, so (1) a dir already diffed in this commit window
+        is committed first, else both diffs would insert the same new names, and (2) a
+        "new" walk task (every entry an INS, no query) stays new only while nothing else
+        diffed its dir since it was queued: an overlapping walk (a subtree rescan, a moved
+        folder's re-walk) or a watcher update may have filled it in the meantime."""
+        nd = self._new_dirs
+        if is_new:
+            if did in nd:
+                nd.discard(did)
+            else:
+                is_new = False
+        elif nd:
+            nd.discard(did)
+        if did in self._dirty_dirs:
+            self._commit()
+        return is_new
 
     def _task_done(self, scan: _Scan, nchildren: int) -> None:
         scan.outstanding += nchildren - 1
@@ -1171,6 +1347,7 @@ class Engine:
             one_level = mode == "flush"
         structure = mode == "structure"
         children: List[DirTask] = []
+        self._dirty_dirs.add(did)
         scan.dirs += 1
         scan.entries += len(entries)
         if task.entry and task.entry[3] & UNREADABLE and old is None:
@@ -1214,6 +1391,7 @@ class Engine:
             for o in old.values():
                 append((DEL, o[0]))
         if new:
+            new_dirs = self._new_dirs
             ids = store.allocate_ids(len(new))
             for i, ent in zip(ids, new):
                 name, size, mtime, ctime, fl, path = ent
@@ -1224,6 +1402,7 @@ class Engine:
                 if path is not None:
                     append((DIR, i, did, rid, path, mtime))
                     if fl & DESCEND:
+                        new_dirs.add(i)
                         children.append(DirTask(i, path, depth, True, (size, mtime, ctime, f), scan))
         return children
 
@@ -1409,17 +1588,22 @@ class Engine:
                 by_parent.setdefault(parent, set()).add(name)
         perfile: Dict[int, tuple] = {}
         for parent, names in by_parent.items():
-            look = self.store.dir_lookup(parent)
+            look = self._dir_lookup(parent)
             if look is None:
                 unknown.append(parent)
-            elif len(names) > PER_FILE_LIMIT:
-                relist[look[0]] = (parent, look[1])
+                continue
+            did, rid, parent = look
+            if did in perfile:                   # the same folder spelled two ways
+                names = perfile[did][2] | names
+            if len(names) > PER_FILE_LIMIT:
+                relist[did] = (parent, rid)
+                perfile.pop(did, None)
             else:
-                perfile[look[0]] = (parent, look[1], names)
+                perfile[did] = (parent, rid, names)
         for p in unknown:
-            look = self.store.dir_lookup(p)      # e.g. a directory that moved earlier in this batch
+            look = self._dir_lookup(p)           # e.g. a directory that moved earlier in this batch
             if look is not None:
-                relist[look[0]] = (p, look[1])
+                relist[look[0]] = (look[2], look[1])
                 continue
             anc = self._known_ancestor(p)
             if anc is not None:
@@ -1434,9 +1618,9 @@ class Engine:
         self._commit()
         if moved_dsts and not walking:          # while walking, _move re-walks every moved dir
             for d in _outermost(moved_dsts):
-                look = self.store.dir_lookup(d)
+                look = self._dir_lookup(d)
                 if look is not None:
-                    self._sub_scan(look[1], look[0], d)
+                    self._sub_scan(look[1], look[0], look[2])
         self._note_recent(noted, now)
         self.stats.batches += 1
         self.stats.batch_ops += self.stats.ops - n_before
@@ -1483,11 +1667,57 @@ class Engine:
         return hit
 
     def _plan_relist(self, path: str, relist: Dict[int, tuple], unknown: List[str]) -> None:
-        look = self.store.dir_lookup(path)
+        look = self._dir_lookup(path)
         if look is None:
             unknown.append(path)
         else:
-            relist[look[0]] = (path, look[1])
+            relist[look[0]] = (look[2], look[1])
+
+    def _nkey(self, name: str) -> str:
+        return name_key(name, self.platform)
+
+    def _folded_children(self, did: int) -> Dict[str, list]:
+        """name key -> [(id, name, flags)] of the committed children of ``did``, cached
+        until the next commit. Only used on case/normalization-insensitive platforms."""
+        m = self._fold_cache.get(did)
+        if m is None:
+            m = {}
+            nkey = self._nkey
+            for c in self.store.children(did):
+                m.setdefault(nkey(c[1]), []).append((c[0], c[1], c[5]))
+            self._fold_cache[did] = m
+        return m
+
+    def _folded_entry(self, did: int, name: str, skip: int = -1):
+        """The stored child of ``did`` that is ``name`` under the platform's name rules
+        but spelled differently (case, NFC vs NFD), else None."""
+        for c in self._folded_children(did).get(self._nkey(name), ()):
+            if c[1] != name and c[0] != skip:
+                return c
+        return None
+
+    def _dir_lookup(self, path: str):
+        """(dir_id, root_id, stored path) of an indexed folder. A watcher path may spell a
+        folder differently from the walk that stored it (case, or NFC vs NFD on macOS): on
+        Windows and macOS an exact miss falls back to a name-key match below the parent."""
+        look = self.store.dir_lookup(path)
+        if look is not None:
+            return look[0], look[1], path
+        if not self._folds:
+            return None
+        parent, name = os.path.split(path)
+        if not name or parent == path or self._root_for_path(parent) is None:
+            return None
+        pl = self._dir_lookup(parent)
+        if pl is None:
+            return None
+        for c in self._folded_children(pl[0]).get(self._nkey(name), ()):
+            if c[2] & FOLDER:
+                cp = os.path.join(pl[2], c[1])
+                look = self.store.dir_lookup(cp)
+                if look is not None:
+                    return look[0], look[1], cp
+        return None
 
     def _known_ancestor(self, path: str):
         """(dir_id, path, root_id) of the nearest indexed ancestor of ``path``."""
@@ -1497,9 +1727,9 @@ class Engine:
             if parent == p or self._root_for_path(parent) is None:
                 ri = self._root_for_path(path)
                 return (ri.id, ri.path, ri.id) if ri is not None else None
-            look = self.store.dir_lookup(parent)
+            look = self._dir_lookup(parent)
             if look is not None:
-                return look[0], parent, look[1]
+                return look[0], look[2], look[1]
             p = parent
 
     def _update_names(self, did: int, parent: str, rid: int, names, walking: bool, now: float) -> None:
@@ -1507,6 +1737,7 @@ class Engine:
         scan = self._flush_scan(rid)
         if scan is None:
             return
+        self._claim(did)
         ctx = scan.ctx
         olds = {}
         ents = []
@@ -1521,6 +1752,11 @@ class Engine:
                     if o2 is not None:
                         olds[ent[0]] = (o2[0], ent[0], o2[1], o2[2], o2[3], o2[4])
                 ents.append(ent)
+        if self._folds and any(e[0] not in olds and self._folded_entry(did, e[0]) is not None for e in ents):
+            # the index has one of these names spelled differently (a case-only rename, NFC
+            # vs NFD): the event's spelling may not be the one on disk, so list the folder
+            self._relist(did, parent, rid, walking, now)
+            return
         task = DirTask(did, parent, 1, False, (), scan)
         if walking:
             self._touched[did] = now
@@ -1564,6 +1800,7 @@ class Engine:
                     self._commit()
                     self._relist(anc[0], anc[1], anc[2], walking, now)
             return
+        self._claim(did)
         kids = self._diff(task, lst.entries, False, one_level=True)
         if kids:
             scan.outstanding += len(kids)
@@ -1578,9 +1815,9 @@ class Engine:
             return
         p = path
         while True:
-            look = self.store.dir_lookup(p)
+            look = self._dir_lookup(p)
             if look is not None:
-                self._sub_scan(look[1], look[0], p)
+                self._sub_scan(look[1], look[0], look[2])
                 return
             parent = os.path.dirname(p)
             if parent == p or self._root_for_path(parent) is None:
@@ -1596,9 +1833,19 @@ class Engine:
         store = self.store
         sp, sn = self._split(src)
         dp, dn = self._split(dst)
-        sl = store.dir_lookup(sp)
-        dl = store.dir_lookup(dp)
+        if self._ren_dst and ((path_key(sp), self._nkey(sn)) in self._ren_dst
+                              or (path_key(dp), self._nkey(dn)) in self._ren_dst):
+            self._commit()                       # an earlier move in this batch renamed onto an end
+        sl = self._dir_lookup(sp)
+        dl = self._dir_lookup(dp)
         old = store.entry_lookup(sl[0], sn) if sl is not None else None
+        if old is None and sl is not None and self._folds:
+            c = self._folded_entry(sl[0], sn)    # the source is stored under another spelling
+            if c is not None:
+                old = store.entry_lookup(sl[0], c[1])
+        if dl is not None and dl[2] != dp:
+            dp = dl[2]
+            dst = os.path.join(dp, dn)
         if old is None:
             # unknown source: the destination simply appeared
             if dl is not None:
@@ -1631,7 +1878,12 @@ class Engine:
         existing = store.entry_lookup(dl[0], name)
         if existing is not None and existing[0] != oid:
             self._ops.append((O.DEL, existing[0]))
+        elif existing is None and self._folds:
+            c = self._folded_entry(dl[0], name, skip=oid)
+            if c is not None:                    # one name per file here: the move replaced it
+                self._ops.append((O.DEL, c[0]))
         self._ops.append((O.REN, oid, dl[0], name))
+        self._ren_dst.add((path_key(dp), self._nkey(name)))
         f = ent[4] & FLAG_MASK
         if ofl & FOLDER:
             self._ops.append((O.DIRPATH, oid, dst))

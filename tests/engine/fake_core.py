@@ -226,7 +226,12 @@ class Store:
         return (i, e[2], e[3], e[4], e[5])
 
     def apply(self, ops) -> int:
-        _apply(self.d, ops)
+        before = pickle.dumps(self.d)        # one transaction, like SQLite: all or nothing
+        try:
+            _apply(self.d, ops)
+        except BaseException:
+            self.d = pickle.loads(before)
+            raise
         for rid, f in self._pending_root.items():
             if rid in self.d.roots:
                 self.d.roots[rid].update(f)
