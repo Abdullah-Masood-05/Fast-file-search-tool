@@ -54,6 +54,12 @@ STATUS_IDLE_INTERVAL = 5.0
 CHANGED_MIN_INTERVAL = 0.5
 REFRESH_MIN_INTERVAL = 1.0
 PER_FILE_LIMIT = 64          # more touched names in one dir -> re-list the dir instead
+# Watcher events reach the writer later than the disk changes they describe, so a
+# batch can be applied after a folder it names has already been moved on disk (the
+# move's own event follows in a later batch). Folders that had events applied this
+# recently are re-walked after they move; see Engine._note_recent.
+RECENT_EVENT_SECS = 15.0
+RECENT_EVENT_MAX = 4096
 IDLE_FOR_PERIODIC = 60.0     # no search for this long before a periodic rescan
 LIMITED_RESCAN_MIN = 15
 
@@ -223,6 +229,18 @@ def _root_counts(counters, rid: int):
     if hasattr(rc, "entries"):
         return rc.entries, getattr(rc, "folders", 0), getattr(rc, "bytes", 0)
     return rc[0], rc[1], rc[2]
+
+
+def _outermost(paths: List[str]) -> List[str]:
+    """``paths`` without duplicates and without paths below another one."""
+    out: List[str] = []
+    kept: List[str] = []
+    for k, p in sorted((path_key(p), p) for p in paths):     # parents sort before children
+        if any(k == a or k.startswith(a if a.endswith(os.sep) else a + os.sep) for a in kept):
+            continue
+        out.append(p)
+        kept.append(k)
+    return out
 
 
 def _total(counters, *names, default=0):
@@ -471,6 +489,8 @@ class Engine:
         self._t_first_op: Optional[float] = None
         self._touched: Dict[int, float] = {}
         self._relisted: set = set()
+        # path_key(dir) -> monotonic time a watcher event at or directly below it was applied
+        self._recent_dirs: Dict[str, float] = {}
         self._gen = 0
         self._snap_gen = -1
         self._first_complete_pending = False
@@ -1348,6 +1368,8 @@ class Engine:
         unknown: List[str] = []                 # paths whose dir is not indexed (yet)
         self._relisted = set()                  # each dir is re-listed at most once per batch
         paths = batch.paths
+        moved_dsts: List[str] = []              # moved dirs to re-walk (stale events before the move)
+        noted: List[str] = []                   # parent dirs of this batch's paths (final spelling)
         if batch.moves:
             moves = batch.moves
             for i, (src, dst, is_dir) in enumerate(moves):
@@ -1357,6 +1379,10 @@ class Engine:
                 for s2, d2, dir2 in moves[i + 1:]:
                     if dir2 and dst.startswith(s2) and dst[len(s2):len(s2) + 1] in ("\\", "/"):
                         dst = d2 + dst[len(s2):]
+                if is_dir and self._moved_recent(src, dst):
+                    moved_dsts.append(dst)
+                noted.append(os.path.dirname(src))
+                noted.append(os.path.dirname(dst))
                 self._move(src, dst, is_dir, walking, now, relist, unknown)
                 if is_dir:
                     # later moves in this batch may name paths below the new directory
@@ -1370,7 +1396,9 @@ class Engine:
             if bits & B_REC:
                 rescans.append(p)
                 continue
+            noted.append(os.path.dirname(p))
             if bits & B_DIR:
+                noted.append(p)
                 self._plan_relist(p, relist, unknown)
             if bits & B_FILE:
                 ri = self._root_for_path(p)
@@ -1404,9 +1432,55 @@ class Engine:
         for p in rescans:
             self._rescan_path(p)
         self._commit()
+        if moved_dsts and not walking:          # while walking, _move re-walks every moved dir
+            for d in _outermost(moved_dsts):
+                look = self.store.dir_lookup(d)
+                if look is not None:
+                    self._sub_scan(look[1], look[0], d)
+        self._note_recent(noted, now)
         self.stats.batches += 1
         self.stats.batch_ops += self.stats.ops - n_before
         self.stats.flush_s += time.perf_counter() - t0
+
+    def _note_recent(self, dirs: List[str], now: float) -> None:
+        """Remember the folders this batch touched (see RECENT_EVENT_SECS)."""
+        rd = self._recent_dirs
+        for d in dirs:
+            k = path_key(d)
+            rd.pop(k, None)
+            rd[k] = now                          # insertion order == age order
+        cutoff = now - RECENT_EVENT_SECS
+        while rd:
+            k, t = next(iter(rd.items()))
+            if t >= cutoff and len(rd) <= RECENT_EVENT_MAX:
+                break
+            del rd[k]
+
+    def _moved_recent(self, src: str, dst: str) -> bool:
+        """Folder ``src`` moved to ``dst``. True when an earlier batch applied events at or
+        below ``src``: they may have been applied after the move had already happened on
+        disk (the move's event comes later), so they found nothing at the old path (a new
+        file not added, a modified one deleted, one moved in dropped) and the moved
+        subtree has to be re-walked. The marks follow the folder to ``dst`` in case it
+        moves again before its walk."""
+        rd = self._recent_dirs
+        if not rd:
+            return False
+        now = time.monotonic()
+        sk = path_key(src)
+        pre = sk if sk.endswith(os.sep) else sk + os.sep
+        dk = path_key(dst)
+        hit = False
+        for k, t in list(rd.items()):
+            if now - t > RECENT_EVENT_SECS:
+                continue
+            if k == sk:
+                hit = True
+                rd[dk] = t
+            elif k.startswith(pre):
+                hit = True
+                rd[dk + os.sep + k[len(pre):]] = t
+        return hit
 
     def _plan_relist(self, path: str, relist: Dict[int, tuple], unknown: List[str]) -> None:
         look = self.store.dir_lookup(path)

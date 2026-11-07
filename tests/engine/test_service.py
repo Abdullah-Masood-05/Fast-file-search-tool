@@ -575,3 +575,90 @@ def test_macos_bridge_is_inert_elsewhere():
         a = macos.ActivityAssertion()
         a.set_active(True)
         a.set_active(False)
+
+
+def _stale_tree(root):
+    (root / "a" / "lib4" / "sub").mkdir(parents=True)
+    (root / "a" / "lib4" / "keep.txt").write_text("k")
+    (root / "a" / "lib4" / "sub" / "deep.txt").write_text("d")
+    (root / "other").mkdir()
+    (root / "other" / "x.txt").write_text("x")
+
+
+def test_events_under_old_dir_path_in_an_earlier_batch_than_the_dir_move(core, tmp_path):
+    """Regression (Linux CI churn): events under a folder's old path were applied in a
+    batch *before* the batch with that folder's move, but after the move had happened on
+    disk. They found nothing at the old path (a create inserted nothing, a modify deleted
+    the file, a move into the folder deleted the source) and the later REN+DIRPATH moved
+    the stale subtree. The engine must reconcile the moved folder."""
+    from fast_file_search.engine.watcher import FILE, Batch
+    root = tmp_path / "tree"
+    _stale_tree(root)
+    h, _ = start(tmp_path, [root], live_monitoring=False)
+    try:
+        h.settle()
+        old, new = root / "a" / "lib4", root / "moved_dir_lib4"
+        (old / "created.txt").write_text("c")                       # create under the old path
+        (old / "sub" / "created2.txt").write_text("c")
+        with open(old / "sub" / "deep.txt", "ab") as fh:             # modify under the old path
+            fh.write(b"more")
+        os.rename(root / "other" / "x.txt", old / "moved_x.txt")     # move into the folder
+        os.rename(old, new)                                         # ... and only then the folder moves
+        b1 = Batch({str(old / "created.txt"): FILE, str(old / "sub" / "created2.txt"): FILE,
+                    str(old / "sub" / "deep.txt"): FILE},
+                   [(str(root / "other" / "x.txt"), str(old / "moved_x.txt"), False)], False)
+        b2 = Batch({}, [(str(old), str(new), True)], False)
+        h.call(lambda: h.engine._apply_batch(b1))
+        h.call(lambda: h.engine._apply_batch(b2))
+        h.settle()
+        assert h.index_paths() == walk_truth(root)
+        ents = h.entries()
+        p = str(new / "sub" / "deep.txt")
+        assert ents[p][1] == os.lstat(p).st_size
+    finally:
+        h.stop()
+
+
+def test_dir_move_after_recent_events_rewalks_without_churn(core, tmp_path):
+    """A folder that had events applied shortly before it moved is re-walked after
+    its REN+DIRPATH (see the test above); when nothing was stale the walk adds no ops
+    and the move stays a rename, not delete + re-add. A folder without recent events is
+    not re-walked."""
+    from fast_file_search.engine.watcher import FILE, Batch
+    root = tmp_path / "tree"
+    _stale_tree(root)
+    (root / "quiet" / "inner").mkdir(parents=True)
+    (root / "quiet" / "inner" / "q.txt").write_text("q")
+    h, _ = start(tmp_path, [root], live_monitoring=False)
+    try:
+        h.settle()
+        old, new = root / "a" / "lib4", root / "a" / "lib5"
+        (old / "fresh.txt").write_text("f")
+        h.call(lambda: h.engine._apply_batch(Batch({str(old / "fresh.txt"): FILE}, [], False)))
+        h.settle()
+        log = h.record_ops()
+        listings = h.engine.stats.listings
+        os.rename(old, new)
+        h.call(lambda: h.engine._apply_batch(Batch({}, [(str(old), str(new), True)], False)))
+        h.settle()
+        kinds = [op[0] for batch in log for op in batch]
+        assert REN in kinds and DIRPATH in kinds
+        assert INS not in kinds and DEL not in kinds
+        assert h.engine.stats.listings >= listings + 2            # lib5 and lib5/sub were re-walked
+        assert h.index_paths() == walk_truth(root)
+        listings = h.engine.stats.listings
+        os.rename(root / "quiet", root / "quiet2")
+        h.call(lambda: h.engine._apply_batch(
+            Batch({}, [(str(root / "quiet"), str(root / "quiet2"), True)], False)))
+        h.settle()
+        assert h.engine.stats.listings == listings                # no recent events there: no walk
+        assert h.index_paths() == walk_truth(root)
+    finally:
+        h.stop()
+
+
+def test_outermost_drops_nested_paths():
+    j = os.path.join
+    a = j(os.sep + "r", "a")
+    got = S._outermost([j(a, "c"), a + " b", a, j(a, "c", "d"), a])
+    assert sorted(got) == sorted([a, a + " b"])

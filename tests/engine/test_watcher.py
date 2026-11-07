@@ -405,3 +405,35 @@ def test_created_event_for_the_root_itself_is_ignored(tmp_path):
     assert w.feed("modified", str(root), True) == (w._keep_dir_modified is True)
     assert w.feed("created", str(root / "new.txt"))
     assert w.coalescer.pending == (2 if w._keep_dir_modified else 1)
+
+
+def test_changes_inside_a_folder_moved_in_from_outside_are_reported(tmp_path):
+    """Regression (Linux): watchdog adds inotify watches for a new folder only on
+    IN_CREATE, so a folder moved in from outside the root (an unpaired IN_MOVED_TO) was
+    never watched and nothing created in it later was reported."""
+    root, outside = tmp_path / "root", tmp_path / "outside"
+    root.mkdir()
+    (outside / "d" / "sub").mkdir(parents=True)
+    (outside / "d" / "node_modules").mkdir()
+    sink = Sink()
+    w = Watcher(Exclusions(), sink, quiet=0.2, max_wait=1.0)
+    w.set_roots([str(root)])
+    assert w.start()[str(root)] == "on"
+    try:
+        time.sleep(0.3)
+        os.rename(outside / "d", root / "d")
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and not any(str(root / "d") in b.paths for b in sink.batches):
+            time.sleep(0.05)
+        assert any(str(root / "d") in b.paths for b in sink.batches)
+        time.sleep(0.3)
+        want = {str(root / "d" / "after.txt"), str(root / "d" / "sub" / "after2.txt")}
+        for p in want:
+            with open(p, "w") as fh:
+                fh.write("x")
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and not want <= {p for b in sink.batches for p in b.paths}:
+            time.sleep(0.05)
+        assert want <= {p for b in sink.batches for p in b.paths}
+    finally:
+        w.stop()

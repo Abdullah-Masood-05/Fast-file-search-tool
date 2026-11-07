@@ -416,10 +416,12 @@ class Watcher:
                 """Feeds the filter directly instead of the observer queue."""
 
                 def queue_event(self, event):  # noqa: N802 (watchdog API)
+                    synthetic = getattr(event, "is_synthetic", False)
+                    if event.is_directory and event.event_type == "created" and not synthetic:
+                        _watch_moved_in_dir(watcher, self, event.src_path)
                     try:
                         watcher.feed(event.event_type, event.src_path, event.is_directory,
-                                     getattr(event, "dest_path", None) or None,
-                                     getattr(event, "is_synthetic", False))
+                                     getattr(event, "dest_path", None) or None, synthetic)
                     except Exception:
                         _log.debug("watch event dropped", exc_info=True)
 
@@ -505,6 +507,34 @@ class Watcher:
     @property
     def is_running(self) -> bool:
         return self._observer is not None
+
+
+def _watch_moved_in_dir(w: "Watcher", emitter, path) -> None:
+    """inotify (Linux): watchdog adds watches for a new folder only on IN_CREATE. A folder
+    moved in from outside the watched tree (another root, ~/Downloads) arrives as an
+    unpaired IN_MOVED_TO, reported as "created" without a watch, so nothing below it
+    would ever be reported. Add the missing watches (recursively). Anything created in
+    it before this is covered by the engine's walk of the new folder, which runs later."""
+    ino = getattr(getattr(emitter, "_inotify", None), "_inotify", None)
+    wd_for_path = getattr(ino, "_wd_for_path", None)
+    add = getattr(ino, "_add_dir_watch", None)
+    lock = getattr(ino, "_lock", None)
+    if not isinstance(wd_for_path, dict) or add is None or lock is None or not emitter.watch.is_recursive:
+        return
+    if w.accept(os.fsdecode(path)) is None:
+        return                       # excluded (node_modules, own files): no watches needed
+    pb = os.fsencode(path)
+    if pb in wd_for_path:
+        return                       # a real IN_CREATE: watchdog added the watch already
+    try:
+        with lock:
+            if pb not in wd_for_path and not getattr(ino, "_closed", False):
+                add(pb, ino.event_mask, recursive=True)
+    except OSError as exc:
+        if exc.errno in LIMIT_ERRNOS:
+            w._report_limit(os.fsdecode(path), exc)
+        elif exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+            _log.debug("cannot watch %s: %s", path, exc)
 
 
 def _windows_emitter(w: "Watcher", base):
