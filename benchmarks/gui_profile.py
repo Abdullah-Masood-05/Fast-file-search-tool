@@ -292,16 +292,17 @@ def cprofile_top(pr, n=60):
 
 
 # --------------------------------------------------------------------------- macOS native sampling
-def start_native_sample(seconds, path):
+def start_native_sample(seconds, path, wait):
+    """Start ``/usr/bin/sample`` on this process (``wait(ms)`` keeps the event loop running meanwhile)."""
     if sys.platform != "darwin":
         return None
     for cmd in (["sample", str(os.getpid()), str(int(seconds)), "1", "-mayDie", "-file", path],
                 ["sudo", "-n", "sample", str(os.getpid()), str(int(seconds)), "1", "-mayDie", "-file", path]):
         try:
-            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             continue
-        time.sleep(1.0)
+        wait(300)
         if p.poll() is None or p.returncode == 0:
             return p
     return None
@@ -314,7 +315,7 @@ def native_main_thread_summary(path, min_frac=0.02, max_lines=160):
     except OSError:
         return "(no sample report)"
     lines = text.splitlines()
-    start = next((i for i, l in enumerate(lines) if "com.apple.main-thread" in l or re.match(r"\s*\d+ Thread_\d+\s+DispatchQueue_1", l)), None)
+    start = next((i for i, l in enumerate(lines) if "com.apple.main-thread" in l or "Main Thread" in l), None)
     if start is None:
         return "(main thread not found in the sample report)"
     m = re.match(r"\s*(\d+)", lines[start])
@@ -343,6 +344,10 @@ def text_report(prof):
     L = []
     w = L.append
     w(f"GUI profile: {prof.get('platform')} qpa={prof.get('qpa')} python={prof.get('python')} qt={prof.get('qt')}")
+    b = prof.get("baseline")
+    if b:
+        w(f"Baseline, bare Qt window on qpa={b.get('qpa')} (no app code): heartbeat {fmt(b.get('heartbeat'))}"
+          f"   wait-overshoot {fmt(b.get('wait_overshoot_ms'))}")
     w("")
     w("== Passes (keystroke -> results incl. 120 ms debounce; heartbeat lateness while typing on the idle index)")
     for name, p in prof.get("passes", {}).items():

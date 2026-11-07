@@ -383,7 +383,7 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
         print("search through the client:", out["search_client_all"], flush=True)
 
         # ---- keystroke -> results on screen, heartbeat running
-        def typing_pass(reps, drop_first, wait=wait_ms):
+        def typing_pass(reps, drop_first, wait=wait_ms, until=None):
             kr, words, over = {}, [], []
 
             def pause(ms):
@@ -393,6 +393,8 @@ def child_run(sandbox: Path, tree: Path, out_path: Path, burst_files: int) -> in
                     over.append((time.perf_counter() - t) * 1000 - ms)
             hb.take()
             for rep in range(reps):
+                if until is not None and until():
+                    break
                 for word in TYPING_WORDS:
                     f.setFocus()
                     f.clear()
@@ -482,11 +484,14 @@ def profile_typing(typing_pass, qwait, probe, sampler, gp, prof_dir: Path) -> di
     prof = {"platform": platform.platform(), "machine": platform.machine(), "python": platform.python_version(),
             "qt": qVersion(), "pyside": pyside, "qpa": QGuiApplication.platformName(), "passes": {}}
 
-    def run_pass(name, reps, drop_first, wait=None):
+    def run_pass(name, reps, drop_first, wait=None, until=None):
         probe.phase = name
         i0 = len(probe.events)
         t0 = time.perf_counter()
-        res, words, over = typing_pass(reps, drop_first, wait) if wait else typing_pass(reps, drop_first)
+        kw = {"until": until}
+        if wait is not None:
+            kw["wait"] = wait
+        res, words, over = typing_pass(reps, drop_first, **kw)
         res["seconds"] = round(time.perf_counter() - t0, 1)
         res["wait_overshoot_ms"] = gp.stats(over)
         res["phases"] = gp.keystroke_phases(probe.events[i0:], words)
@@ -508,24 +513,60 @@ def profile_typing(typing_pass, qwait, probe, sampler, gp, prof_dir: Path) -> di
     prof_dir.mkdir(parents=True, exist_ok=True)
     pr.dump_stats(str(prof_dir / "gui-cprofile.pstats"))
     if sys.platform == "darwin":
-        # Sampled with real event-loop waits (what the app runs); ends just before the pass does.
-        secs = max(5, prof["passes"]["evloop"]["seconds"] * 2 / 3 * 0.9)
+        # Keeps typing (event-loop waits, as in the app) until `sample` has finished, so every
+        # sample falls inside the typing (sample takes a few seconds to attach).
         path = str(prof_dir / "native-sample.txt")
-        proc = gp.start_native_sample(secs, path)
+        proc = gp.start_native_sample(15, path, wait_ms)
         if proc is None:
             prof["native"] = "(could not start /usr/bin/sample)"
         else:
-            run_pass("native", 2, False)
+            run_pass("native", 40, False, until=lambda: proc.poll() is not None)
             try:
-                proc.wait(timeout=secs + 60)
+                proc.wait(timeout=60)
             except subprocess.TimeoutExpired:
                 proc.kill()
             prof["native"] = gp.native_main_thread_summary(path)
     sampler.stop()
     prof["stalls"] = sampler.report()
+    try:
+        prof["baseline"] = json.loads((prof_dir / "baseline.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
     (prof_dir / "gui-profile.json").write_text(json.dumps(prof, indent=1, ensure_ascii=False), encoding="utf-8")
     (prof_dir / "gui-profile.txt").write_text(gp.text_report(prof), encoding="utf-8")
     return {"passes": prof["passes"]}
+
+
+def child_baseline(out_path: Path, seconds: float) -> int:
+    """A bare QApplication with an empty, shown QMainWindow of the app's size on the same Qt
+    platform: 16 ms heartbeat lateness and event-loop wait overshoot with no app code at all
+    (the floor the runner's platform sets)."""
+    from PySide6.QtCore import QElapsedTimer, Qt, QTimer
+    from PySide6.QtWidgets import QApplication, QLabel, QMainWindow
+
+    app = QApplication([])
+    win = QMainWindow()
+    win.setCentralWidget(QLabel("baseline"))
+    win.resize(1280, 800)
+    win.show()
+    win.raise_()
+    win.activateWindow()
+    wait_ms(500)
+    hb = _Heartbeat((QTimer, QElapsedTimer, Qt))
+    hb.start()
+    over = []
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        t = time.perf_counter()
+        wait_ms(90)
+        over.append((time.perf_counter() - t) * 1000 - 90)
+    out = {"qpa": app.platformName(), "heartbeat": summary(hb.take()),
+           "wait_overshoot_ms": {"p50": round(pct(over, 50), 2), "p95": round(pct(over, 95), 2),
+                                 "max": round(max(over), 2), "n": len(over)}}
+    win.close()
+    out_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
+    print("baseline (bare Qt window):", out, flush=True)
+    return 0
 
 
 def child_shots(sandbox: Path, outdir: Path, tag: str) -> int:
@@ -716,6 +757,7 @@ def profile_gui(args) -> int:
         else:
             tree = tmp / "tree"
             make_tree(tree, args.files)
+        run_child(["--child-baseline", str(prof_dir / "baseline.json"), "15"], sandbox, timeout=300)
         os.environ["BENCH_PROFILE_DIR"] = str(prof_dir)
         try:
             run_child(["--child-run", str(sandbox), str(tree), str(prof_dir / "run.json"), "0"], sandbox,
@@ -799,6 +841,7 @@ def main() -> int:
     ap.add_argument("--child-run", nargs=4, metavar=("SANDBOX", "TREE", "OUT", "BURST"), help=argparse.SUPPRESS)
     ap.add_argument("--child-startup", nargs=2, metavar=("SANDBOX", "OUT"), help=argparse.SUPPRESS)
     ap.add_argument("--child-shots", nargs=3, metavar=("SANDBOX", "DIR", "TAG"), help=argparse.SUPPRESS)
+    ap.add_argument("--child-baseline", nargs=2, metavar=("OUT", "SECONDS"), help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if args.compare:
@@ -808,6 +851,8 @@ def main() -> int:
         return child_run(Path(s), Path(t), Path(o), int(b))
     if args.child_startup:
         return child_startup(Path(args.child_startup[0]), Path(args.child_startup[1]))
+    if args.child_baseline:
+        return child_baseline(Path(args.child_baseline[0]), float(args.child_baseline[1]))
     if args.child_shots:
         return child_shots(Path(args.child_shots[0]), Path(args.child_shots[1]), args.child_shots[2])
     if args.profile_gui:
