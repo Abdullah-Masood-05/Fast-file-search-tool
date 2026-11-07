@@ -318,11 +318,24 @@ def run_selftest_gui(*, in_process: bool = False) -> int:
         window = MainWindow(client, cm, first_run=False)
         window.show()
         app.processEvents()
-        state: Dict[str, Any] = {"ready": False, "result": None}
+        state: Dict[str, Any] = {"ready": False, "result": None, "gen": None}
         loop = QEventLoop()
-        client.ready.connect(lambda r: state.update(ready=True))
-        client.search_result.connect(lambda r: (state.update(result=r), loop.quit()))
-        client.ready.connect(lambda r: client.search("", FilterState(kinds=frozenset({"file", "folder"})), SortSpec()))
+
+        def on_status(st) -> None:
+            # Search only once the first scan of the fixture is done: "Ready" means the
+            # engine is up, not that the fixture is indexed yet.
+            if state["gen"] is None and st.state == "idle" and st.total_entries > 0:
+                state["gen"] = client.search("", FilterState(kinds=frozenset({"file", "folder"})), SortSpec())
+
+        def on_result(r) -> None:
+            # Ignore results for requests the window sent itself.
+            if state["gen"] is not None and r.gen == state["gen"]:
+                state["result"] = r
+                loop.quit()
+
+        client.ready.connect(lambda r: (state.update(ready=True), on_status(r.status) if r.status else None))
+        client.index_status.connect(on_status)
+        client.search_result.connect(on_result)
         QTimer.singleShot(int(READY_TIMEOUT * 1000), loop.quit)
         client.start()
         loop.exec()
