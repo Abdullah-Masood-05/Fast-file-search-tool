@@ -522,11 +522,6 @@ class Engine:
         self.t_created = time.perf_counter()
         self.t_ready: Optional[float] = None
         self.stats = SimpleNamespace(listings=0, commits=0, ops=0, batches=0, batch_ops=0, flush_s=0.0)
-        self._diag = deque(maxlen=4000) if os.environ.get("FFS_DIAG") else None
-
-    def _d(self, *a) -> None:
-        if self._diag is not None:
-            self._diag.append((round(time.monotonic(), 3), self.stats.commits) + a)
 
     # ------------------------------------------------------------------ public API
     def start(self) -> None:
@@ -842,40 +837,13 @@ class Engine:
             return
         ops, self._ops = self._ops, []
         self._t_first_op = None
-        try:
-            gen = self.store.apply(ops)
-        except Exception as exc:
-            if self._diag is not None:
-                self._dump_diag(ops, exc)
-            raise
+        gen = self.store.apply(ops)
         self.mem.apply(ops, gen)
         self._gen = gen
         self._warm_pending = True
         self.stats.commits += 1
         self.stats.ops += len(ops)
         self._status_dirty = True
-
-    def _dump_diag(self, ops, exc) -> None:
-        O = self.core.ops
-        seen = {}
-        dups = []
-        for o in ops:
-            if o[0] == O.INS:
-                k = (o[2], o[3])
-                if k in seen:
-                    dups.append((seen[k], o))
-                seen[k] = o
-                ex = self.store.entry_lookup(o[2], o[3])
-                if ex is not None:
-                    dups.append(("STORE", ex, o))
-        lines = [f"DIAG commit failed: {exc}; {len(ops)} ops; dups={dups[:20]}"]
-        ids = {o[2] for d in dups for o in d if isinstance(o, tuple) and len(o) > 3}
-        for i in ids:
-            lines.append(f"DIAG dir {i}: {self.store.dir_row(i)}")
-        for t in self._diag:
-            lines.append("DIAG " + repr(t))
-        _log.critical(chr(10).join(lines))
-        print(chr(10).join(lines), file=sys.stderr, flush=True)
 
     def _commit_root_state(self, rid: int, **fields) -> None:
         self._commit()
@@ -1128,7 +1096,6 @@ class Engine:
         if ri is None or self.pool is None:
             return
         scan = _Scan(rid, ri.path, "sub", False, self._ctx(ri))
-        self._d("sub_scan", id(scan), dir_id, path)
         scan.outstanding = 1
         self.pool.push([DirTask(dir_id, path, 1, False, (), scan)])
 
@@ -1164,8 +1131,6 @@ class Engine:
             self._task_done(scan, 0)
             return
         is_new = task.is_new
-        self._d("L", scan.mode, id(scan), task.dir_id, task.path, is_new, lst.t_listed,
-                self._touched.get(task.dir_id), None if lst.entries is None else len(lst.entries))
         if self._touched:
             t_touch = self._touched.get(task.dir_id)
             if t_touch is not None:
@@ -1206,7 +1171,6 @@ class Engine:
             one_level = mode == "flush"
         structure = mode == "structure"
         children: List[DirTask] = []
-        self._d("diff", mode, did, is_new, old is not None, len(entries))
         scan.dirs += 1
         scan.entries += len(entries)
         if task.entry and task.entry[3] & UNREADABLE and old is None:
@@ -1391,7 +1355,6 @@ class Engine:
         self._commit()
         n_before = self.stats.ops
         walking = self._scans_active()
-        self._d("batch", walking, batch.collapsed, dict(batch.paths), list(batch.moves))
         now = time.monotonic()
         for ri in self._roots.values():
             if ri.flush_scan is not None:
@@ -1542,7 +1505,6 @@ class Engine:
     def _update_names(self, did: int, parent: str, rid: int, names, walking: bool, now: float) -> None:
         """Per-file update of a few names in one indexed dir (same rules as a walk)."""
         scan = self._flush_scan(rid)
-        self._d("update_names", did, parent, sorted(names), walking)
         if scan is None:
             return
         ctx = scan.ctx
@@ -1587,7 +1549,6 @@ class Engine:
         if did in done:
             return
         done.add(did)
-        self._d("relist", did, path, walking)
         scan = self._flush_scan(rid)
         if scan is None:
             return
