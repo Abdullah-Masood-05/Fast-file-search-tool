@@ -662,3 +662,254 @@ def test_outermost_drops_nested_paths():
     a = j(os.sep + "r", "a")
     got = S._outermost([j(a, "c"), a + " b", a, j(a, "c", "d"), a])
     assert sorted(got) == sorted([a, a + " b"])
+
+
+# ---------------------------------------------------------------------- duplicate names (macOS CI churn)
+# Regression: the writer died with "UNIQUE constraint failed: entries.dir_id, entries.name".
+# Every listing is diffed against the *committed* children of its folder, so two diffs of
+# one folder in one commit window (or a walk task queued as "new" running after another
+# walk had filled its folder) inserted the same names twice.
+
+def _small_tree(root):
+    (root / "a" / "b").mkdir(parents=True)
+    (root / "a" / "b" / "x.txt").write_text("x")
+    (root / "a" / "Docs").mkdir()
+    (root / "a" / "Docs" / "keep.txt").write_text("k")
+
+
+def _alive_and_exact(h, root):
+    h.settle()
+    assert not h.of(P.Fatal), h.of(P.Fatal)[0].text
+    assert not h.engine.dead.is_set()
+    assert h.index_paths() == walk_truth(root)
+
+
+def test_overlapping_subtree_walks_insert_each_name_once(core, tmp_path):
+    """Two rescans of one subtree (e.g. RECURSIVE events in two batches) both list the same
+    folders before either commits; the second must see the inserts of the first."""
+    root = tmp_path / "tree"
+    _small_tree(root)
+    h, _ = start(tmp_path, [root], live_monitoring=False)
+    try:
+        h.settle()
+        (root / "a" / "b" / "new.txt").write_text("n")
+        (root / "a" / "b" / "newdir" / "deeper").mkdir(parents=True)
+        (root / "a" / "b" / "newdir" / "deeper" / "leaf.md").write_text("l")
+        e = h.engine
+
+        def go():
+            did, rid = e.store.dir_lookup(str(root / "a"))
+            e._sub_scan(rid, did, str(root / "a"))
+            e._sub_scan(rid, did, str(root / "a"))
+        h.call(go)
+        _alive_and_exact(h, root)
+        assert e.stats.conflicts == 0 and e.stats.recoveries == 0     # avoided, not repaired
+    finally:
+        h.stop()
+
+
+def test_new_folder_task_after_another_walk_filled_it(core, tmp_path):
+    """A watcher re-list finds a new folder and queues its walk as "new" (every entry an
+    INS); a subtree rescan of the parent reaches the same folder through the store. Only
+    one of them may insert its children."""
+    from fast_file_search.engine.watcher import DIR as B_DIR, Batch
+    root = tmp_path / "tree"
+    _small_tree(root)
+    h, _ = start(tmp_path, [root], live_monitoring=False)
+    try:
+        h.settle()
+        n = root / "a" / "N"
+        (n / "deep").mkdir(parents=True)
+        for i in range(5):
+            (n / f"f{i}.txt").write_text("f")
+        (n / "deep" / "d.txt").write_text("d")
+        e = h.engine
+
+        def go():
+            e._apply_batch(Batch({str(root / "a"): B_DIR}, [], False))
+            did, rid = e.store.dir_lookup(str(root / "a"))
+            e._sub_scan(rid, did, str(root / "a"))
+        h.call(go)
+        _alive_and_exact(h, root)
+        assert e.stats.conflicts == 0 and e.stats.recoveries == 0
+    finally:
+        h.stop()
+
+
+def test_two_moves_onto_one_name_in_one_batch(core, tmp_path):
+    """mv one x; mv two x (the second replaces the first) in one watcher batch: the
+    second REN must see the target of the first."""
+    from fast_file_search.engine.watcher import Batch
+    root = tmp_path / "tree"
+    _small_tree(root)
+    d = root / "a" / "b"
+    (d / "one.txt").write_text("1")
+    (d / "two.txt").write_text("22")
+    h, _ = start(tmp_path, [root], live_monitoring=False)
+    try:
+        h.settle()
+        os.replace(d / "one.txt", d / "x2.txt")
+        os.replace(d / "two.txt", d / "x2.txt")
+        h.call(lambda: h.engine._apply_batch(Batch(
+            {}, [(str(d / "one.txt"), str(d / "x2.txt"), False),
+                 (str(d / "two.txt"), str(d / "x2.txt"), False)], False)))
+        _alive_and_exact(h, root)
+        assert h.entries()[str(d / "x2.txt")][1] == 2
+    finally:
+        h.stop()
+
+
+def test_commit_with_duplicate_names_is_resolved_in_store_and_memindex(core, tmp_path):
+    """Safety net: ops that still claim an existing name (a file, a folder with a child
+    below the duplicate id, a REN onto a taken name) are rewritten at the commit and
+    applied identically to the Store and the MemIndex; later walk tasks for the dropped
+    folder id follow the surviving one."""
+    root = tmp_path / "tree"
+    _small_tree(root)
+    h, _ = start(tmp_path, [root], live_monitoring=False)
+    try:
+        h.settle()
+        e = h.engine
+        a = str(root / "a")
+        (root / "a" / "b" / "y.txt").write_text("yy")
+
+        def go():
+            O = e.core.ops
+            st = e.store
+            ad, _rid = st.dir_lookup(a)
+            bd, rid = st.dir_lookup(os.path.join(a, "b"))
+            x = st.entry_lookup(bd, "x.txt")
+            b = st.entry_lookup(ad, "b")
+            i_file, i_dir, i_child, i_y = st.allocate_ids(4)
+            e._ops += [
+                (O.INS, i_file, bd, "x.txt", 7, x[2], x[3], 0),          # file already there
+                (O.INS, i_dir, ad, "b", 0, b[2], b[3], P.FOLDER),        # folder already there ...
+                (O.DIR, i_dir, ad, rid, os.path.join(a, "b"), b[2]),
+                (O.INS, i_child, i_dir, "y.txt", 2, x[2], x[3], 0),      # ... with a child below it
+                (O.INS, i_y, bd, "z.txt", 1, x[2], x[3], 0),
+                (O.REN, i_y, bd, "y.txt"),                               # REN onto the child's name
+            ]
+            e._commit()
+            return i_dir
+        i_dir = h.call(go)
+        assert e.stats.conflicts == 1
+        assert not h.of(P.Fatal)
+        ents = h.entries()
+        assert ents[os.path.join(a, "b", "x.txt")][1] == 7                    # INS became an UPD
+        assert ents[os.path.join(a, "b", "y.txt")][1] == 1                    # the REN replaced the child
+        assert len([p for p in ents if os.path.basename(p) == "b"]) == 1
+        h.index_paths()                                                       # Store == MemIndex
+        # a later walk corrects the sizes from the disk
+        did, rid = h.call(lambda: e.store.dir_lookup(a))
+        h.call(lambda: e._sub_scan(rid, did, a))
+        _alive_and_exact(h, root)
+        assert i_dir not in h.call(lambda: [r[0] for r in e.store.children(did)])
+    finally:
+        h.stop()
+
+
+def test_writer_error_resyncs_instead_of_killing_the_engine(core, tmp_path, monkeypatch):
+    """An unexpected exception in the writer drops the half-built batch, voids the walks
+    in flight and rescans the roots; the engine keeps serving and converges on the disk."""
+    from fast_file_search.engine.watcher import FILE, Batch
+    root = tmp_path / "tree"
+    _small_tree(root)
+    h, _ = start(tmp_path, [root], live_monitoring=False)
+    try:
+        h.settle()
+        e = h.engine
+        (root / "a" / "b" / "after.txt").write_text("a")
+        orig = S.Engine._apply_batch
+        calls = []
+
+        def boom(self, batch):
+            calls.append(batch)
+            if len(calls) == 1:
+                orig(self, batch)                # ops pending, then the batch fails half-way
+                self._ops.append((self.core.ops.INS, 10 ** 9, 10 ** 9 + 1, "ghost", 0, 0, 0, 0))
+                raise RuntimeError("injected writer failure")
+            return orig(self, batch)
+        monkeypatch.setattr(S.Engine, "_apply_batch", boom)
+        e._wq.put(("batch", Batch({str(root / "a" / "b" / "after.txt"): FILE}, [], False)))
+        _alive_and_exact(h, root)
+        assert e.stats.recoveries == 1
+        assert h.search("after").total == 1
+    finally:
+        h.stop()
+
+
+def test_repeated_writer_errors_are_fatal(core, tmp_path, monkeypatch):
+    root = tmp_path / "tree"
+    _small_tree(root)
+    h, _ = start(tmp_path, [root], live_monitoring=False)
+    try:
+        h.settle()
+
+        def boom(self, batch):
+            raise RuntimeError("always failing")
+        monkeypatch.setattr(S.Engine, "_apply_batch", boom)
+        for _ in range(S.MAX_RECOVERIES + 1):
+            h.engine._wq.put(("batch", None))
+        h.wait(lambda m: isinstance(m, P.Fatal), 30)
+    finally:
+        h.stop()
+
+
+def test_name_key_follows_the_platform():
+    nfc, nfd = "Café", "Café"
+    assert S.name_key(nfc, "darwin") == S.name_key(nfd, "darwin") == S.name_key("CAFÉ", "darwin")
+    assert S.name_key("README.md", "win32") == S.name_key("readme.MD", "win32")
+    assert S.name_key(nfc, "win32") != S.name_key(nfd, "win32")              # NTFS keeps both
+    assert S.name_key("A", "linux") != S.name_key("a", "linux")
+
+
+def test_folder_lookup_under_another_spelling_on_macos(core, tmp_path):
+    """FSEvents may spell a folder differently from the walk that stored it (NFD vs NFC,
+    case): the writer finds the stored folder instead of treating the path as unknown."""
+    root = tmp_path / "tree"
+    (root / "Café" / "Sub").mkdir(parents=True)
+    h, _ = start(tmp_path, [root], live_monitoring=False)
+    try:
+        h.settle()
+        e = h.engine
+
+        def look(path):
+            def go():
+                saved = e.platform, e._folds
+                e.platform, e._folds = "darwin", True
+                try:
+                    return e._dir_lookup(path)
+                finally:
+                    e.platform, e._folds = saved
+            return h.call(go)
+        stored = str(root / "Café" / "Sub")
+        did, rid = h.call(lambda: e.store.dir_lookup(stored))
+        assert look(str(root / "Café" / "sub")) == (did, rid, stored)
+        assert look(str(root / "CAFÉ" / "SUB"))[0] == did
+        assert look(str(root / "Cafe" / "Sub")) is None
+    finally:
+        h.stop()
+
+
+@pytest.mark.skipif(sys.platform not in ("win32", "darwin"), reason="case-insensitive file systems")
+def test_watcher_names_spelled_differently_from_the_index(core, tmp_path):
+    """Case-insensitive file systems: a file event under a folder spelled in another case
+    updates the stored folder, and the unpaired events of a case-only rename leave one
+    entry under the name on disk (no ghost of the old spelling)."""
+    from fast_file_search.engine.watcher import FILE, Batch
+    root = tmp_path / "tree"
+    _small_tree(root)
+    (root / "a" / "Docs" / "note.txt").write_text("n")
+    h, _ = start(tmp_path, [root], live_monitoring=False)
+    try:
+        h.settle()
+        docs = root / "a" / "Docs"
+        (docs / "new.txt").write_text("new")
+        h.call(lambda: h.engine._apply_batch(Batch({str(root / "a" / "docs" / "new.txt"): FILE}, [], False)))
+        _alive_and_exact(h, root)
+        os.rename(docs / "note.txt", docs / "NOTE.txt")
+        h.call(lambda: h.engine._apply_batch(Batch({str(docs / "note.txt"): FILE, str(docs / "NOTE.txt"): FILE},
+                                                   [], False)))
+        _alive_and_exact(h, root)
+    finally:
+        h.stop()
