@@ -171,18 +171,39 @@ def keystroke_phases(events, words):
 
 
 # --------------------------------------------------------------------------- stall sampler
-def _fmt_stack(frame, depth=14):
-    out = []
-    while frame is not None and len(out) < depth:
-        co = frame.f_code
-        fn = co.co_filename.replace("\\", "/")
-        for marker in ("/site-packages/", "/src/", "/benchmarks/", "/lib/python3"):
-            i = fn.rfind(marker)
-            if i >= 0:
-                fn = fn[i + len(marker):]
-                break
-        out.append(f"{fn}:{frame.f_lineno} {co.co_name}")
-        frame = frame.f_back
+_FH_LINE = re.compile(r'\s*File "(.*)", line (\d+) in (.*)')
+
+
+def _short(fn):
+    fn = fn.replace("\\", "/")
+    for marker in ("/site-packages/", "/src/", "/benchmarks/", "/lib/python3"):
+        i = fn.rfind(marker)
+        if i >= 0:
+            return fn[i + len(marker):]
+    return fn
+
+
+def gui_stack(fh, ident, depth=14):
+    """The Python stack of thread ``ident``, read with ``faulthandler.dump_traceback``.
+
+    Not ``sys._current_frames()``: holding a frame object of the GUI thread keeps that frame's
+    locals alive after it returns, so a paintEvent's QPainter outlived the paint event
+    ("QBackingStore::endPaint() called with active painter") and Qt crashed on macOS."""
+    import faulthandler
+    fh.seek(0)
+    fh.truncate()
+    faulthandler.dump_traceback(fh, all_threads=True)
+    fh.seek(0)
+    text = fh.read().decode("utf-8", "replace")
+    out, inside = [], False
+    for line in text.splitlines():
+        if line.startswith(("Thread 0x", "Current thread 0x")):
+            inside = int(line.split("0x", 1)[1].split()[0], 16) == ident
+            continue
+        if inside:
+            m = _FH_LINE.match(line)
+            if m and len(out) < depth:
+                out.append(f"{_short(m.group(1))}:{m.group(2)} {m.group(3)}")
     return tuple(out)
 
 
@@ -204,18 +225,19 @@ class StallSampler(threading.Thread):
         self._stop.set()
 
     def run(self):
+        import tempfile
         threshold = (HEARTBEAT_MS + LATE_MS) / 1000
         seen_last = None
+        fh = tempfile.TemporaryFile()
         while not self._stop.wait(self.period):
             if self.paused:
                 continue
             last = self.hb.last_pc
             if not last or time.perf_counter() - last <= threshold:
                 continue
-            frame = sys._current_frames().get(self.gui_ident)
-            if frame is None:
+            stack = gui_stack(fh, self.gui_ident)
+            if not stack:
                 continue
-            stack = _fmt_stack(frame)
             phase = self.probe.phase
             self.samples[phase][stack] += 1
             self.innermost[phase][stack[0] if stack else "?"] += 1
